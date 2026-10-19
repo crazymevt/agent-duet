@@ -278,7 +278,10 @@
 (defclass fake-agent (ai:agent)
   ((replies :initarg :replies :accessor fake-replies
             :documentation "Functions of the prompt that return the reply, used in turn")
-   (prompts :initform '() :accessor fake-prompts)))
+   (prompts :initform '() :accessor fake-prompts)
+   (handle :initform "conversation-1" :accessor fake-handle)))
+
+(defmethod ai::agent-conversation-handle ((agent fake-agent)) (fake-handle agent))
 
 (defmethod ai:agent-begin-turn ((agent fake-agent) prompt)
   (push prompt (fake-prompts agent))
@@ -332,6 +335,45 @@
       (is eq :finished (ai:workflow-state workflow))
       (is eq :unresolved (ai::loop-state (first (ai:workflow-loops workflow))))
       (is = 2 (ai::loop-round (first (ai:workflow-loops workflow)))))))
+
+(define-test review-continues-past-last-round
+    :parent agent-duet
+  (let ((no (says (format nil "Still wrong: ~a~%VERDICT: CHANGES REQUESTED" "needs tests"))))
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :review (list (says "v1") (says "v2") (says "v3"))
+                  (list no no (says (format nil "Good.~%VERDICT: APPROVED")))
+                  :rounds 2)
+      (declare (ignore messages codex))
+      (true (ai:workflow-continuable-p workflow))
+      (true (ai:continue-workflow workflow 2))
+      (is eq :finished (ai:workflow-state workflow))
+      (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+      (is = 3 (ai::loop-round (first (ai:workflow-loops workflow))))
+      ;; The author picked up from the last review.
+      (true (search "needs tests" (first (fake-prompts claude))))
+      (false (ai:workflow-continuable-p workflow))
+      (false (ai:continue-workflow workflow 1)))))
+
+(define-test review-continues-only-in-same-context
+    :parent agent-duet
+  (let ((no (says (format nil "Still wrong~%VERDICT: CHANGES REQUESTED"))))
+    ;; The folder changed since it finished.
+    (multiple-value-bind (workflow messages claude)
+        (run-fake :review (list (says "v1") (says "v2")) (list no) :rounds 1)
+      (declare (ignore messages))
+      (true (ai:workflow-continuable-p workflow))
+      (setf (ai:agent-directory claude) #p"/elsewhere/")
+      (false (ai:workflow-continuable-p workflow))
+      (false (ai:continue-workflow workflow 1))
+      (is eq :finished (ai:workflow-state workflow))
+      (is = 1 (length (fake-prompts claude))))
+    ;; One agent's conversation was reset (or another one opened).
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :review (list (says "v1") (says "v2")) (list no) :rounds 1)
+      (declare (ignore messages))
+      (setf (fake-handle codex) nil)
+      (false (ai:continue-workflow workflow 1))
+      (is = 1 (length (fake-prompts claude))))))
 
 (defun responder (&rest pairs)
   "A reply function: the reply after the first of PAIRS' strings the prompt

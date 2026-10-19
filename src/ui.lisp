@@ -993,6 +993,46 @@ usage after the turn) brings the Wait button."
                              buttons))))
     (update-controls)))
 
+;;; A workflow stopped at its last round, unapproved
+
+(defun workflow-finished (workflow)
+  (clear-pause-timers)
+  (when (workflow-continuable-p workflow)
+    (show-continue-card workflow))
+  (update-controls))
+
+(defun show-continue-card (workflow)
+  "A card offering to carry WORKFLOW on for more rounds, where it stopped."
+  (let ((buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+        (rounds (gtk:spin-button-new-with-range 1d0 10d0 1d0)))
+    (gtk:spin-button-set-value rounds (coerce (gtk:spin-button-get-value-as-int (control :rounds)) 'double-float))
+    (gtk:widget-set-tooltip-text rounds "Most further review rounds")
+    (labels ((settled (text)
+               (clear-box buttons)
+               (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label"))))
+             (carry-on ()
+               (cond ((not (eq workflow *workflow*))
+                      (settled "A newer task has started"))
+                     ((or (agent-busy *claude*) (agent-busy *codex*))
+                      (pane-note *middle* "Wait for both agents to finish, or stop them, before continuing." "error"))
+                     ((continue-workflow workflow (gtk:spin-button-get-value-as-int rounds))
+                      (settled "Continued")
+                      (update-controls))
+                     (t (settled "Can't continue: the folder or a conversation has changed since")))))
+      (gtk:box-append buttons (make-instance 'gtk:label :label "More rounds" :css-classes '("dim-label")))
+      (gtk:box-append buttons rounds)
+      (let ((b (make-instance 'gtk:button :label "Continue" :css-classes '("suggested-action")
+                                          :tooltip-text "The author addresses the last review, and the reviewing goes on")))
+        (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (carry-on)))
+        (gtk:box-append buttons b))
+      (pane-append *middle*
+                   (gtk:build
+                    (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                             (gtk:label :label "Not approved yet" :xalign 0.0 :css-classes '("heading"))
+                             (gtk:label :label "The rounds ran out before the review was approved. Continue to carry on from the last review."
+                                        :xalign 0.0 :wrap t)
+                             buttons))))))
+
 (defun start-request ()
   (if (workflow-running-p)
       (stop-workflow *workflow*)
@@ -1009,9 +1049,7 @@ usage after the turn) brings the Wait button."
                                                 :max-rounds (gtk:spin-button-get-value-as-int (control :rounds))
                                                 :on-message #'middle-message
                                                 :on-pause #'show-paused-step
-                                                :on-finish (lambda (w) (declare (ignore w))
-                                                             (clear-pause-timers)
-                                                             (update-controls))))
+                                                :on-finish #'workflow-finished))
                 (start-workflow *workflow*)
                 (update-controls)))))))
 

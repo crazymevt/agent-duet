@@ -21,6 +21,12 @@
 ;;;; whether to RESUME-STEP (once the usage resets), HAND-OFF-STEP to the
 ;;;; other agent, or STOP-WORKFLOW. Work handed off goes unreviewed when the
 ;;;; one that ran out was to review it, and says so.
+;;;;
+;;;; A workflow that finished with a loop still unapproved after MAX-ROUNDS
+;;;; can be carried on for more rounds (CONTINUE-WORKFLOW): the author
+;;;; addresses the last review, as it would have in another round. Only
+;;;; while both agents are still in the folder and conversations it
+;;;; finished in: elsewhere, the review would be out of context.
 
 (in-package #:agent-duet)
 
@@ -31,12 +37,14 @@
    (lead :initarg :lead :reader workflow-lead)
    (partner :initarg :partner :reader workflow-partner)
    (request :initarg :request :reader workflow-request)
-   (max-rounds :initarg :max-rounds :initform *default-max-rounds* :reader workflow-max-rounds)
+   (max-rounds :initarg :max-rounds :initform *default-max-rounds* :accessor workflow-max-rounds)
    (on-message :initarg :on-message :initform nil :accessor workflow-on-message)
    (on-finish :initarg :on-finish :initform nil :accessor workflow-on-finish)
    (on-pause :initarg :on-pause :initform nil :accessor workflow-on-pause)
    (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
    (loops :initform '() :accessor workflow-loops)
+   (context :initform nil :accessor workflow-context
+            :documentation "Each agent's folder and conversation when it finished (WORKING-CONTEXT)")
    (state :initform :new :accessor workflow-state :documentation ":new :running :finished :stopped")))
 
 (defstruct (review-loop (:conc-name loop-))
@@ -44,6 +52,7 @@
   task                                  ; what the author was asked to do
   label                                 ; how to name it in notes: nil, or "Claude's part"
   (summary "")                          ; the author's latest report
+  (last-review nil)                     ; the reviewer's latest review
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
   (state :working))                     ; :working :reviewing :approved :unresolved :unreviewed :failed
@@ -78,6 +87,39 @@ instead (PAUSE-STEP); another failed turn ends the workflow's part in it."
                     (if (eq error :out-of-usage)
                         (pause-step workflow step)
                         (funcall (step-then step) text error))))))
+
+;;; Carrying on past the last round
+
+(defun working-context (workflow)
+  "Each agent's folder and conversation, to tell whether they've moved on."
+  (loop for agent in (list (workflow-lead workflow) (workflow-partner workflow))
+        collect (list (agent-directory agent) (agent-conversation-handle agent))))
+
+(defun workflow-continuable-p (workflow)
+  "Whether WORKFLOW finished with a loop stopped at its last round, unapproved,
+and the agents are still where it finished."
+  (and (eq (workflow-state workflow) :finished)
+       (equal (workflow-context workflow) (working-context workflow))
+       (some (lambda (l) (and (eq (loop-state l) :unresolved) (loop-last-review l)))
+             (workflow-loops workflow))))
+
+(defun continue-workflow (workflow rounds)
+  "Carry WORKFLOW on for up to ROUNDS more review rounds: each loop stopped
+unapproved has its author address the last review. True if it carried on."
+  (when (workflow-continuable-p workflow)
+    (let ((loops (remove-if-not (lambda (l) (and (eq (loop-state l) :unresolved) (loop-last-review l)))
+                                (workflow-loops workflow))))
+      (setf (workflow-state workflow) :running)
+      (incf (workflow-max-rounds workflow) rounds)
+      (note workflow "Carrying on for up to ~d more round~:p." rounds)
+      ;; All are set working before any starts, so the first to finish
+      ;; doesn't find every loop done.
+      (dolist (l loops) (setf (loop-state l) :working))
+      (dolist (l loops)
+        (note workflow "Round ~d~@[ (~a)~]: ~a addresses the review."
+              (1+ (loop-round l)) (loop-label l) (agent-name (loop-author l)))
+        (loop-work workflow l (fix-prompt l (loop-last-review l))))
+      t)))
 
 ;;; Running out of usage
 
@@ -310,6 +352,7 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                 (loop-failed workflow loop (format nil "~a's review failed: ~a" (agent-name (loop-reviewer loop)) text))
                 (progn
                   (incf (loop-round loop))
+                  (setf (loop-last-review loop) text)
                   (post workflow (loop-reviewer loop) (loop-author loop) text :review)
                   (cond ((eq (review-verdict text) :approved)
                          (setf (loop-state loop) :approved)
@@ -338,7 +381,8 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
 (defun check-finished (workflow)
   (when (and (workflow-live-p workflow) (null (workflow-paused workflow))
              (every #'loop-done-p (workflow-loops workflow)))
-    (setf (workflow-state workflow) :finished)
+    (setf (workflow-state workflow) :finished
+          (workflow-context workflow) (working-context workflow))
     (note workflow "Done: ~{~a~^; ~}."
           (loop for l in (workflow-loops workflow)
                 collect (format nil "~@[~a ~]~(~a~)" (loop-label l)

@@ -27,7 +27,9 @@ Type a request in the middle and press Return. Choose how they work:
 - **Write & review.** The lead does the work. The other reviews it, reading the
   files and `git diff`, and ends with `VERDICT: APPROVED` or
   `VERDICT: CHANGES REQUESTED`. The lead addresses the review, and so on, until
-  it's approved or *Rounds* reviews have been done.
+  it's approved or *Rounds* reviews have been done. If the rounds run out
+  first, a card offers **Continue** for more rounds: the author picks up
+  from the last review.
 - **Split the work.** The lead splits the request into its part and the
   other's (parts that don't touch the same files). Both work at once; then each
   reviews the other's part, and each part goes round its own review loop.
