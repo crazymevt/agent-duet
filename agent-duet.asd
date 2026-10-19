@@ -16,6 +16,8 @@
                (:file "usage")
                (:file "settings")
                (:file "history")
+               (:file "notify")
+               (:file "worktree")
                (:file "agents")
                (:file "workflow")))
 
@@ -42,5 +44,7 @@
   :components ((:module "tests"
                 :serial t
                 :components ((:file "main")
-                             (:file "history"))))
+                             (:file "history")
+                             (:file "notify")
+                             (:file "worktree"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))

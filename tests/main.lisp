@@ -273,6 +273,47 @@
     (false partner))
   (false (nth-value 1 (ai:parse-plan "Just do it."))))
 
+(define-test findings
+    :parent agent-duet
+  (let ((f (ai::parse-finding-line "- F2 [fixed] `src/a.lisp:42` — Off by one")))
+    (is eql 2 (getf f :id))
+    (is eq :fixed (getf f :status))
+    (is string= "src/a.lisp:42" (getf f :location))
+    (is string= "Off by one" (getf f :text)))
+  ;; Emphasis, a numbered list, no location, no number.
+  (let ((f (ai::parse-finding-line "1. **F3** [Dismissed]: Rename it")))
+    (is eql 3 (getf f :id))
+    (is eq :dismissed (getf f :status))
+    (false (getf f :location))
+    (is string= "Rename it" (getf f :text)))
+  (let ((f (ai::parse-finding-line "* [open] `b.lisp` No test")))
+    (false (getf f :id))
+    (is eq :open (getf f :status)))
+  (false (ai::parse-finding-line "- Just a remark"))
+  (false (ai::parse-finding-line "Some prose about F1"))
+  ;; The last FINDINGS section, up to the verdict.
+  (multiple-value-bind (parsed found)
+      (ai::parse-findings (format nil "Use FINDINGS: like this~%~%FINDINGS:~%- F1 [open] `a.lisp:1` Bug~%~
+- F2 [open] Style~%~%VERDICT: CHANGES REQUESTED~%- F9 [open] not one"))
+    (true found)
+    (is equal '(1 2) (mapcar (lambda (p) (getf p :id)) parsed)))
+  (multiple-value-bind (parsed found) (ai::parse-findings (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))
+    (true found)
+    (false parsed))
+  (false (nth-value 1 (ai::parse-findings "No section")))
+  ;; Merging: named ones are updated, the rest added, the left-out kept.
+  (let* ((one (ai::merge-findings '() (ai::parse-findings (format nil "FINDINGS:~%- F1 [open] `a.lisp:1` Bug~%- F2 [open] Style")) 1))
+         (two (ai::merge-findings one (ai::parse-findings (format nil "FINDINGS:~%- F1 [fixed] Bug~%- [open] New one~%- F7 [open] Numbered")) 2)))
+    (is equal '(:open :open) (mapcar #'ai::finding-status one))
+    (is equal '(1 2 3 7) (mapcar #'ai::finding-id two))
+    (is equal '(:fixed :open :open :open) (mapcar #'ai::finding-status two))
+    (is string= "a.lisp:1" (ai::finding-location (first two)))
+    (is eql 2 (ai::finding-round (third two)))
+    ;; The first list wasn't changed.
+    (is eq :open (ai::finding-status (first one)))
+    (is = 8 (ai::next-finding-id two))
+    (true (search "- F1 [fixed] `a.lisp:1` Bug" (ai::findings-lines two)))))
+
 ;;; Workflows, with agents that answer from a script
 
 (defclass fake-agent (ai:agent)
@@ -289,19 +330,21 @@
                     (fake-replies agent)
                     (pop (fake-replies agent))))
          (text (if reply (funcall reply prompt) "out of replies")))
-    ;; A reply of :out-of-usage plays the account running out.
-    (if (eq text :out-of-usage)
-        (ai:agent-turn-finished agent "You've hit your limit" :out-of-usage)
-        (ai:agent-turn-finished agent text (null reply)))))
+    ;; A reply of :out-of-usage plays the account running out; (:error
+    ;; text), a turn that fails.
+    (cond ((eq text :out-of-usage) (ai:agent-turn-finished agent "You've hit your limit" :out-of-usage))
+          ((consp text) (ai:agent-turn-finished agent (second text) t))
+          (t (ai:agent-turn-finished agent text (null reply))))))
 
 (defun says (text) (lambda (prompt) (declare (ignore prompt)) text))
 
-(defun run-fake (mode claude-replies codex-replies &key (rounds 3))
+(defun run-fake (mode claude-replies codex-replies &key (rounds 3) on-plan (approve-plan (and on-plan t)))
   (let* ((claude (make-instance 'fake-agent :id :claude :name "Claude" :replies claude-replies))
          (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies codex-replies))
          (messages '())
          (workflow (make-instance 'ai:workflow :mode mode :lead claude :partner codex
                                   :request "Add a frobnicate function" :max-rounds rounds
+                                  :approve-plan approve-plan :on-plan on-plan
                                   :on-message (lambda (from to text kind)
                                                 (declare (ignore to))
                                                 (push (list (if (symbolp from) from (ai:agent-name from))
@@ -414,6 +457,225 @@ contains; the last of PAIRS (unpaired) otherwise."
                               (list ok))))
       (is eq :finished (ai:workflow-state workflow))
       (is = 1 (length (ai:workflow-loops workflow))))))
+
+(define-test review-checklist
+    :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review
+                (list (says "v1") (says "v2") (says "v3"))
+                (list (says (format nil "FINDINGS:~%- F1 [open] `a.lisp:3` Off by one~%- F2 [open] Name~%~
+VERDICT: CHANGES REQUESTED"))
+                      (says (format nil "FINDINGS:~%- F1 [fixed] Off by one~%- F3 [open] `b.lisp` No test~%~
+VERDICT: CHANGES REQUESTED"))
+                      (says (format nil "FINDINGS:~%- F2 [dismissed] Name~%- F3 [open] No test~%~
+VERDICT: CHANGES REQUESTED"))))
+    (declare (ignore claude))
+    (let ((loop (first (ai:workflow-loops workflow))))
+      (is equal '(:fixed :dismissed :open) (mapcar #'ai::finding-status (ai::loop-findings loop))))
+    ;; A checklist after each review; the open one still shows in the last.
+    (let ((lists (remove :findings messages :key #'second :test-not #'eq)))
+      (is = 3 (length lists))
+      (true (search "1 open, 1 fixed, 1 dismissed" (third (third lists)))))
+    ;; The reviewer was shown its earlier findings, and where to number from.
+    (let ((third-review (third (reverse (fake-prompts codex)))))
+      (false (search "Your earlier findings" (first (last (fake-prompts codex)))))
+      (true (search "- F2 [open] Name" (second (reverse (fake-prompts codex)))))
+      (true (search "F4 [open]" third-review)))
+    (true (search "1 finding open" (third (find "Done:" messages :key #'third :test #'search))))))
+
+(define-test approval-with-findings-open
+    :parent agent-duet
+  (let ((changes (says (format nil "FINDINGS:~%- F1 [open] `a.lisp:1` Bug~%VERDICT: CHANGES REQUESTED")))
+        (loose (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    ;; Approved with F1 left open: asked once to settle it, which it does.
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :review (list (says "v1") (says "v2"))
+                  (list changes loose (says (format nil "FINDINGS:~%- F1 [fixed] Bug~%VERDICT: APPROVED"))))
+      (declare (ignore messages claude))
+      (let ((loop (first (ai:workflow-loops workflow))))
+        (is eq :approved (ai::loop-state loop))
+        (is = 2 (ai::loop-round loop))
+        (is equal '(:fixed) (mapcar #'ai::finding-status (ai::loop-findings loop))))
+      (true (search "still open" (first (fake-prompts codex))))
+      (true (search "- F1 [open]" (first (fake-prompts codex)))))
+    ;; Asked, it approves again with it open: not approved, and it can be
+    ;; continued, the author told what's still open.
+    (multiple-value-bind (workflow messages claude)
+        (run-fake :review (list (says "v1") (says "v2") (says "v3"))
+                  (list changes loose loose (says (format nil "FINDINGS:~%- F1 [fixed] Bug~%VERDICT: APPROVED"))))
+      (is eq :unresolved (ai::loop-state (first (ai:workflow-loops workflow))))
+      (true (find "left 1 finding open" messages :key #'third :test #'search))
+      (true (ai:workflow-continuable-p workflow))
+      (true (ai:continue-workflow workflow 1))
+      (let ((fix (first (fake-prompts claude))))
+        (true (search "reviewed your work:" fix))
+        (true (search "still open:" fix))
+        (true (search "- F1 [open]" fix)))
+      (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow)))))
+    ;; Asked, it requests changes after all: another round.
+    (multiple-value-bind (workflow messages claude)
+        (run-fake :review (list (says "v1") (says "v2") (says "v3"))
+                  (list changes loose changes (says (format nil "FINDINGS:~%- F1 [fixed] Bug~%VERDICT: APPROVED"))))
+      (declare (ignore messages))
+      (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+      (is = 3 (length (fake-prompts claude))))))
+
+(define-test plan-approval
+    :parent agent-duet
+  (let* ((ok (format nil "Fine.~%VERDICT: APPROVED"))
+         (offered nil)
+         (plan (format nil "LEAD TASK:~%The function~%~%PARTNER TASK:~%The tests")))
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :divide
+                  (responder "Split the work" plan "Review the work" ok "Wrote the function")
+                  (responder "Review the work" ok "Wrote the tests")
+                  :on-plan (lambda (workflow lead partner) (declare (ignore workflow)) (setf offered (list lead partner))))
+      (declare (ignore messages))
+      ;; It waits, with nothing started.
+      (is equal '("The function" "The tests") offered)
+      (is eq :running (ai:workflow-state workflow))
+      (true (ai:workflow-pending-plan workflow))
+      (is = 1 (length (fake-prompts claude)))
+      (false (fake-prompts codex))
+      (false (ai:approve-plan workflow "  " ""))
+      ;; Edited: each is given its part as the user left it.
+      (true (ai:approve-plan workflow "The function, documented" "The tests"))
+      (false (ai:approve-plan workflow "Again" nil))
+      (is eq :finished (ai:workflow-state workflow))
+      (true (find (format nil "The user edited the plan. Your part is now:~%~%The function, documented")
+                  (fake-prompts claude) :test #'search))
+      (true (find "The function, documented" (fake-prompts codex) :test #'search))))
+  ;; The partner's part cleared: the lead does its part alone.
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :divide
+                (responder "Split the work" (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B") "Did A")
+                (responder "Review the work" (format nil "VERDICT: APPROVED"))
+                :on-plan (lambda (&rest args) (declare (ignore args))))
+    (declare (ignore messages codex))
+    (true (ai:approve-plan workflow "A and B" nil))
+    (is = 1 (length (ai:workflow-loops workflow)))
+    (true (search "do this yourself" (first (fake-prompts claude))))
+    (is eq :finished (ai:workflow-state workflow)))
+  ;; The lead's cleared: the partner does its part, the lead reviews.
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :divide
+                (responder "Split the work" (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B") (format nil "VERDICT: APPROVED"))
+                (says "Did B")
+                :on-plan (lambda (&rest args) (declare (ignore args))))
+    (declare (ignore messages claude))
+    (true (ai:approve-plan workflow "" "B"))
+    (let ((loop (first (ai:workflow-loops workflow))))
+      (is eq codex (ai::loop-author loop))
+      (is eq :approved (ai::loop-state loop)))
+    (true (search "No one else is working on it" (first (fake-prompts codex))))))
+
+(define-test plan-approval-without-callback
+    :parent agent-duet
+  ;; Asked to wait for approval, it waits even with no one told.
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :divide (list (says (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B"))) '() :approve-plan t)
+    (declare (ignore messages))
+    (true (ai:workflow-pending-plan workflow))
+    (is = 1 (length (fake-prompts claude)))
+    (false (fake-prompts codex))))
+
+(define-test stop-while-plan-waits
+    :parent agent-duet
+  (multiple-value-bind (workflow messages claude)
+      (run-fake :divide (list (says (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B"))) '()
+                :on-plan (lambda (&rest args) (declare (ignore args))))
+    (declare (ignore messages))
+    (ai:stop-workflow workflow)
+    (false (ai:approve-plan workflow "A" "B"))
+    (is = 1 (length (fake-prompts claude)))))
+
+(define-test compare-proposals
+    :parent agent-duet
+  (let ((ok (format nil "Fine.~%VERDICT: APPROVED")))
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :compare
+                  (responder "propose your approach" "Claude: a macro"
+                             "proposed an approach, independently" (format nil "We differ on macros.~%LEAD TASK:~%The function~%~%PARTNER TASK:~%The tests")
+                             "Review the work" ok
+                             "Wrote the function")
+                  (responder "propose your approach" "ChatGPT: a function"
+                             "Review the work" ok
+                             "Wrote the tests"))
+      (is eq :finished (ai:workflow-state workflow))
+      (is = 2 (length (ai:workflow-loops workflow)))
+      (is = 2 (count :proposal messages :key #'second))
+      ;; Each proposed without seeing the other's; then the lead saw ChatGPT's.
+      (false (search "a macro" (first (last (fake-prompts codex)))))
+      (let ((reconcile (find "independently:" (fake-prompts claude) :test #'search)))
+        (true (search "ChatGPT: a function" reconcile))
+        (true (search "Compare it with yours" reconcile))
+        (true (search "PARTNER TASK:" reconcile)))
+      (true (find "The tests" (fake-prompts codex) :test #'search)))))
+
+(define-test compare-without-one-proposal
+    :parent agent-duet
+  ;; ChatGPT's proposal fails: Claude plans from its own.
+  (multiple-value-bind (workflow messages claude)
+      (run-fake :compare
+                (responder "propose your approach" "Mine"
+                           "couldn't make a proposal" (format nil "LEAD TASK:~%All~%~%PARTNER TASK:~%NONE")
+                           "Did it")
+                (list nil (says (format nil "VERDICT: APPROVED"))))
+    (declare (ignore messages))
+    (is eq :finished (ai:workflow-state workflow))
+    (true (find "go with yours" (fake-prompts claude) :test #'search)))
+  ;; Neither: the workflow ends.
+  (let ((workflow (run-fake :compare '() '())))
+    (is eq :finished (ai:workflow-state workflow))
+    (false (ai:workflow-loops workflow))))
+
+(define-test lead-proposal-out-then-handed-off
+    :parent agent-duet
+  ;; The lead runs out proposing: going without its proposal, the partner
+  ;; carries out its own, unreviewed, rather than waiting on the lead.
+  (multiple-value-bind (workflow paused claude codex)
+      (run-pausing :compare (list (says :out-of-usage)) (list (says "Theirs") (says "Did it all")))
+    (is eq claude (ai::step-agent (first paused)))
+    (ai::agent-ran-out claude nil)
+    (ai::hand-off-step workflow (first paused))
+    (is = 1 (length (fake-prompts claude)))
+    (true (search "carry out yours yourself" (first (fake-prompts codex))))
+    (is eq :finished (ai:workflow-state workflow))
+    (let ((loop (first (ai:workflow-loops workflow))))
+      (is eq codex (ai::loop-author loop))
+      (is eq :unreviewed (ai::loop-state loop)))))
+
+(define-test lead-proposal-out-with-plan-approval
+    :parent agent-duet
+  ;; With plan approval, the partner's takeover waits for the user too.
+  (let* ((claude (make-instance 'fake-agent :id :claude :name "Claude" :replies (list (says :out-of-usage))))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies (list (says "Theirs") (says "Did it"))))
+         (paused '())
+         (workflow (make-instance 'ai:workflow :mode :compare :lead claude :partner codex :request "Add frobnicate"
+                                  :approve-plan t
+                                  :on-pause (lambda (w step) (declare (ignore w)) (push step paused)))))
+    (ai:start-workflow workflow)
+    (ai::agent-ran-out claude nil)
+    (ai::hand-off-step workflow (first paused))
+    (true (ai:workflow-pending-plan workflow))
+    (is = 1 (length (fake-prompts codex)))
+    (true (ai:approve-plan workflow nil "Add frobnicate, documented"))
+    (true (search "Add frobnicate, documented" (first (fake-prompts codex))))
+    (true (search "carry out yours yourself" (first (fake-prompts codex))))
+    (is eq :unreviewed (ai::loop-state (first (ai:workflow-loops workflow))))
+    (is = 1 (length (fake-prompts claude)))))
+
+(define-test proposal-out-then-handed-off
+    :parent agent-duet
+  (multiple-value-bind (workflow paused)
+      (run-pausing :compare
+                   (list (says "Mine") (says (format nil "LEAD TASK:~%All~%PARTNER TASK:~%NONE")) (says "Did it"))
+                   (list (says :out-of-usage)))
+    (is eq :propose (ai::step-role (first paused)))
+    (ai::hand-off-step workflow (first paused))
+    ;; Claude planned from its own, and did it.
+    (is = 1 (length (ai:workflow-loops workflow)))
+    (is equal "Did it" (ai::loop-summary (first (ai:workflow-loops workflow))))))
 
 (define-test failed-turn
     :parent agent-duet
@@ -872,3 +1134,239 @@ tests/fake-claude, its notes pushed onto NOTES."
           (is equal '(("hi" nil)) results)
           (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
           (is equal "thread-1" (ai::agent-conversation-handle agent))))))
+
+;;; Separate worktrees, in a real repository
+
+(defmacro with-git-folder ((repo) &body body)
+  "A temporary git repository with one commit (shared.txt), for BODY."
+  `(let ((,repo (merge-pathnames (format nil "duet-folder-~a/" (ai::make-uuid)) (uiop:temporary-directory))))
+     (ensure-directories-exist ,repo)
+     (unwind-protect
+          (progn
+            (dolist (args '(("init") ("config" "user.name" "Duet Test") ("config" "user.email" "duet@example.invalid")
+                            ("config" "commit.gpgsign" "false")))
+              (apply #'ai::worktree-git ,repo args))
+            (write-file-text ,repo "shared.txt" "base")
+            (ai::worktree-git ,repo "add" "-A")
+            (ai::worktree-git ,repo "commit" "-m" "initial")
+            ,@body)
+       ;; Worktrees kept by a test, then the folder.
+       (dolist (line (uiop:split-string (ignore-errors (ai::worktree-git ,repo "worktree" "list" "--porcelain"))
+                                        :separator '(#\Newline)))
+         (when (uiop:string-prefix-p "worktree " line)
+           (let ((tree (uiop:ensure-directory-pathname (subseq line 9))))
+             (unless (equal (truename tree) (truename ,repo))
+               (ignore-errors (ai::worktree-git ,repo "worktree" "remove" "--force" (namestring tree)))
+               (uiop:delete-directory-tree tree :validate t :if-does-not-exist :ignore)))))
+       (uiop:delete-directory-tree ,repo :validate t :if-does-not-exist :ignore))))
+
+(defun write-file-text (directory name text)
+  (with-open-file (out (merge-pathnames name directory) :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+    (write-string text out)))
+
+(defun read-file-text (directory name)
+  (string-trim '(#\Newline) (uiop:read-file-string (merge-pathnames name directory))))
+
+(defun worktree-agents (repo claude-reply codex-reply &key (codex-class 'fake-agent))
+  "Claude and ChatGPT in REPO, each answering with its function of (agent prompt)."
+  (let ((claude (make-instance 'fake-agent :id :claude :name "Claude" :directory repo))
+        (codex (make-instance codex-class :id :codex :name "ChatGPT" :directory repo)))
+    (setf (fake-replies claude) (lambda (prompt) (funcall claude-reply claude prompt))
+          (fake-replies codex) (lambda (prompt) (funcall codex-reply codex prompt)))
+    (values claude codex)))
+
+(defun run-worktrees (claude codex)
+  (let* ((messages '())
+         (workflow (make-instance 'ai:workflow :mode :divide :lead claude :partner codex :worktrees t
+                                  :request "Add frobnicate"
+                                  :on-message (lambda (from to text kind)
+                                                (declare (ignore to))
+                                                (push (list (if (symbolp from) from (ai:agent-name from)) kind text)
+                                                      messages)))))
+    (ai:start-workflow workflow)
+    (values workflow (reverse messages))))
+
+(defparameter *split-plan* (format nil "LEAD TASK:~%The function~%~%PARTNER TASK:~%The tests"))
+(defparameter *approve* (format nil "Fine.~%VERDICT: APPROVED"))
+
+(define-test worktree-parts-merged
+    :parent agent-duet
+  (with-git-folder (repo)
+    (multiple-value-bind (claude codex)
+        (worktree-agents repo
+                         (lambda (agent prompt)
+                           (cond ((search "Split the work" prompt) *split-plan*)
+                                 ((search "Review the work" prompt) *approve*)
+                                 (t (write-file-text (ai:agent-directory agent) "a.txt" "from Claude") "Wrote a.txt")))
+                         (lambda (agent prompt)
+                           (cond ((search "Review the work" prompt) *approve*)
+                                 (t (write-file-text (ai:agent-directory agent) "b.txt" "from ChatGPT") "Wrote b.txt"))))
+      (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+        (is eq :finished (ai:workflow-state workflow))
+        ;; Each worked in its own worktree, told so, in a new conversation there.
+        (let ((part (find "Your part" (fake-prompts claude) :test #'search)))
+          (true (search "own git worktree" part))
+          (true (search "agent-duet/claude-" part)))
+        ;; Each reviewer was shown the other's diff.
+        (true (find "from ChatGPT" (fake-prompts claude) :test #'search))
+        (true (find "from Claude" (fake-prompts codex) :test #'search))
+        ;; Both parts are in the folder, merged; the worktrees are gone.
+        (is string= "from Claude" (read-file-text repo "a.txt"))
+        (is string= "from ChatGPT" (read-file-text repo "b.txt"))
+        (is = 1 (count-if (lambda (l) (uiop:string-prefix-p "worktree " l))
+                          (uiop:split-string (ai::worktree-git repo "worktree" "list" "--porcelain")
+                                             :separator '(#\Newline))))
+        (is string= "" (ai::worktree-git repo "branch" "--list" "agent-duet/*"))
+        (is equal repo (ai:agent-directory claude))
+        (is equal repo (ai:agent-directory codex))
+        ;; Then the merged result was reviewed.
+        (is equal '("Claude's part" "ChatGPT's part" "the merged result")
+            (mapcar #'ai::loop-label (ai:workflow-loops workflow)))
+        (true (every (lambda (l) (eq :approved (ai::loop-state l))) (ai:workflow-loops workflow)))
+        (true (search "git diff" (first (fake-prompts codex))))
+        (true (find "Merged agent-duet/codex-" messages :key #'third :test #'search))))))
+
+(define-test worktree-conflict-resolved
+    :parent agent-duet
+  (with-git-folder (repo)
+    (multiple-value-bind (claude codex)
+        (worktree-agents repo
+                         (lambda (agent prompt)
+                           (let ((here (ai:agent-directory agent)))
+                             (cond ((search "Split the work" prompt) *split-plan*)
+                                   ((search "Review the work" prompt) *approve*)
+                                   ((search "conflicted in" prompt)
+                                    (true (search "shared.txt" prompt))
+                                    (write-file-text here "shared.txt" "both")
+                                    (ai::worktree-git here "add" "-A")
+                                    (ai::worktree-git here "commit" "--no-edit")
+                                    "Kept both")
+                                   (t (write-file-text here "shared.txt" "Claude's") "Changed shared.txt"))))
+                         (lambda (agent prompt)
+                           (cond ((search "Review the work" prompt) *approve*)
+                                 (t (write-file-text (ai:agent-directory agent) "shared.txt" "ChatGPT's")
+                                    "Changed shared.txt"))))
+      (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+        (is eq :finished (ai:workflow-state workflow))
+        (true (find "conflicts in shared.txt" messages :key #'third :test #'search))
+        (true (find "Kept both" messages :key #'third :test #'search))
+        (is string= "both" (read-file-text repo "shared.txt"))
+        (false (ai::merge-in-progress-p repo))
+        (is eq :approved (ai::loop-state (third (ai:workflow-loops workflow))))))))
+
+(define-test worktree-conflict-unresolved
+    :parent agent-duet
+  ;; The lead doesn't conclude the merge: it ends there, saying so.
+  (with-git-folder (repo)
+    (multiple-value-bind (claude codex)
+        (worktree-agents repo
+                         (lambda (agent prompt)
+                           (cond ((search "Split the work" prompt) *split-plan*)
+                                 ((search "Review the work" prompt) *approve*)
+                                 ((search "conflicted in" prompt) "I looked")
+                                 (t (write-file-text (ai:agent-directory agent) "shared.txt" "Claude's") "Done")))
+                         (lambda (agent prompt)
+                           (cond ((search "Review the work" prompt) *approve*)
+                                 (t (write-file-text (ai:agent-directory agent) "shared.txt" "ChatGPT's") "Done"))))
+      (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+        (is eq :finished (ai:workflow-state workflow))
+        (true (find "the merge is still unresolved" messages :key #'third :test #'search))
+        (is = 2 (length (ai:workflow-loops workflow)))
+        (false (ai:workflow-continuable-p workflow))))))
+
+(define-test worktree-needs-clean-folder
+    :parent agent-duet
+  (with-git-folder (repo)
+    (write-file-text repo "stray.txt" "uncommitted")
+    (multiple-value-bind (claude codex)
+        (worktree-agents repo (lambda (a p) (declare (ignore a p)) *split-plan*)
+                         (lambda (a p) (declare (ignore a p)) "no"))
+      (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+        (is eq :finished (ai:workflow-state workflow))
+        (true (find "uncommitted changes" messages :key #'third :test #'search))
+        (false (fake-prompts claude)))))
+  (let ((folder (merge-pathnames (format nil "duet-plain-~a/" (ai::make-uuid)) (uiop:temporary-directory))))
+    (ensure-directories-exist folder)
+    (unwind-protect
+         (is string= "the folder isn't a git repository" (ai::worktrees-problem folder))
+      (uiop:delete-directory-tree folder :validate t :if-does-not-exist :ignore))))
+
+(define-test worktree-stopped-keeps-work
+    :parent agent-duet
+  ;; Stopped while ChatGPT works: both go back to the folder; the worktrees stay.
+  (with-git-folder (repo)
+    (multiple-value-bind (claude codex)
+        (worktree-agents repo
+                         (lambda (agent prompt)
+                           (cond ((search "Split the work" prompt) *split-plan*)
+                                 (t (write-file-text (ai:agent-directory agent) "a.txt" "kept") "Wrote a.txt")))
+                         (lambda (a p) (declare (ignore a p)) "never")
+                         :codex-class 'hanging-agent)
+      (let* ((workflow (run-worktrees claude codex))
+             (trees (mapcar #'cdr (ai::workflow-trees workflow))))
+        (is = 2 (length trees))
+        (ai:stop-workflow workflow)
+        (is equal repo (ai:agent-directory claude))
+        (is equal repo (ai:agent-directory codex))
+        (true (every #'probe-file trees))
+        (true (some (lambda (tree) (probe-file (merge-pathnames "a.txt" tree))) trees))
+        (false (probe-file (merge-pathnames "a.txt" repo)))))))
+
+(define-test worktree-merge-aborted
+    :parent agent-duet
+  ;; The lead aborts the merge instead of concluding it: nothing is taken
+  ;; as merged, and the branches stay.
+  (with-git-folder (repo)
+    (multiple-value-bind (claude codex)
+        (worktree-agents repo
+                         (lambda (agent prompt)
+                           (let ((here (ai:agent-directory agent)))
+                             (cond ((search "Split the work" prompt) *split-plan*)
+                                   ((search "Review the work" prompt) *approve*)
+                                   ((search "conflicted in" prompt) (ai::worktree-git here "merge" "--abort") "Aborted")
+                                   (t (write-file-text here "shared.txt" "Claude's") "Done"))))
+                         (lambda (agent prompt)
+                           (cond ((search "Review the work" prompt) *approve*)
+                                 (t (write-file-text (ai:agent-directory agent) "shared.txt" "ChatGPT's") "Done"))))
+      (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+        (is eq :finished (ai:workflow-state workflow))
+        (true (find "wasn't merged" messages :key #'third :test #'search))
+        (is = 2 (length (ai:workflow-loops workflow)))
+        (is = 2 (length (uiop:split-string (string-trim '(#\Newline) (ai::worktree-git repo "branch" "--list" "agent-duet/*"))
+                                           :separator '(#\Newline))))))))
+
+(define-test worktree-failed-part-not-merged
+    :parent agent-duet
+  ;; A part whose turn fails after changing files, or whose review fails:
+  ;; nothing is committed or merged, the worktrees are kept, and the
+  ;; agents are back in the folder.
+  (dolist (failing '(:work :review))
+    (with-git-folder (repo)
+      (multiple-value-bind (claude codex)
+          (worktree-agents repo
+                           (lambda (agent prompt)
+                             (cond ((search "Split the work" prompt) *split-plan*)
+                                   ((search "Review the work" prompt) *approve*)
+                                   (t (write-file-text (ai:agent-directory agent) "a.txt" "half done")
+                                      (if (eq failing :work) '(:error "It broke") "Wrote a.txt"))))
+                           (lambda (agent prompt)
+                             (cond ((search "Review the work" prompt)
+                                    (if (eq failing :review) '(:error "Review broke") *approve*))
+                                   (t (write-file-text (ai:agent-directory agent) "b.txt" "done") "Wrote b.txt"))))
+        (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+          (is eq :finished (ai:workflow-state workflow))
+          (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))
+          (true (find "so the parts aren't merged" messages :key #'third :test #'search))
+          (is = 2 (length (ai:workflow-loops workflow)))
+          (false (probe-file (merge-pathnames "a.txt" repo)))
+          (false (probe-file (merge-pathnames "b.txt" repo)))
+          (is string= "" (ai::worktree-git repo "status" "--porcelain"))
+          (let ((trees (mapcar #'cdr (ai::workflow-trees workflow))))
+            (true (every #'probe-file trees))
+            (true (some (lambda (tree) (probe-file (merge-pathnames "a.txt" tree))) trees)))
+          ;; Nothing was committed in them either.
+          (true (every (lambda (e) (plusp (length (ai::worktree-git (cdr e) "status" "--porcelain"))))
+                       (ai::workflow-trees workflow)))
+          (is equal repo (ai:agent-directory claude))
+          (is equal repo (ai:agent-directory codex)))))))

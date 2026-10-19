@@ -1,0 +1,71 @@
+;;;; worktree.lisp — isolated git integration
+
+(in-package #:agent-duet/tests)
+
+(defun write-worktree-file (directory name text)
+  (with-open-file (out (merge-pathnames name directory) :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+    (write-line text out)))
+
+(defmacro with-worktree-repository ((repo trees) &body body)
+  `(let ((,repo (merge-pathnames (format nil "duet-test-~a/" (ai::make-uuid))
+                                 (uiop:temporary-directory)))
+         (,trees nil))
+     (ensure-directories-exist ,repo)
+     (unwind-protect
+          (progn
+            (ai::worktree-git ,repo "init")
+            (ai::worktree-git ,repo "config" "user.name" "Duet Test")
+            (ai::worktree-git ,repo "config" "user.email" "duet@example.invalid")
+            (ai::worktree-git ,repo "config" "commit.gpgsign" "false")
+            (write-worktree-file ,repo "shared.txt" "base")
+            (ai::commit-worktree ,repo "initial")
+            ,@body)
+       (dolist (tree ,trees)
+         (ignore-errors (ai::worktree-git ,repo "worktree" "remove" "--force" (namestring tree)))
+         (uiop:delete-directory-tree tree :validate t :if-does-not-exist :ignore))
+       (uiop:delete-directory-tree ,repo :validate t :if-does-not-exist :ignore))))
+
+(define-test worktree-clean-lifecycle
+    :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (true (ai::git-repository-p repo))
+    (false (ai::git-repository-p (merge-pathnames "missing/" repo)))
+    (let* ((tree (ai::create-worktree repo "clean"))
+           (base (ai::worktree-git-line repo "rev-parse" "HEAD")))
+      (push tree trees)
+      (true (pathnamep tree))
+      (is string= "agent-duet/clean" (ai::worktree-branch tree))
+      (is string= "" (ai::worktree-diff tree))
+      (false (ai::commit-worktree tree "no changes"))
+      (write-worktree-file tree "new file.txt" "new content")
+      (write-worktree-file tree "shared.txt" "changed")
+      (let ((diff (ai::worktree-diff tree)))
+        (true (search "new content" diff))
+        (true (search "+changed" diff)))
+      (true (ai::commit-worktree tree "changes"))
+      (false (ai::commit-worktree tree "still unchanged"))
+      (true (search "new content" (ai::worktree-diff tree)))
+      (is string= base (ai::worktree-git-line tree "config" "branch.agent-duet/clean.agentDuetBase"))
+      (is eq :merged (ai::merge-worktree repo tree))
+      (true (probe-file (merge-pathnames "new file.txt" repo)))
+      (true (ai::remove-worktree repo tree :delete-branch t))
+      (false (probe-file tree))
+      (is string= "" (ai::worktree-git repo "branch" "--list" "agent-duet/clean")))))
+
+(define-test worktree-conflicting-merge
+    :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let ((tree (ai::create-worktree repo "conflict")))
+      (push tree trees)
+      (write-worktree-file tree "shared.txt" "agent version")
+      (ai::commit-worktree tree "agent change")
+      (write-worktree-file repo "shared.txt" "main version")
+      (ai::commit-worktree repo "main change")
+      (multiple-value-bind (status files) (ai::merge-worktree repo tree)
+        (is eq :conflict status)
+        (is equal '("shared.txt") files))
+      (true (search "<<<<<<<" (uiop:read-file-string (merge-pathnames "shared.txt" repo))))
+      (ai::worktree-git repo "merge" "--abort")
+      (true (ai::remove-worktree repo tree))
+      (true (search "agent-duet/conflict" (ai::worktree-git repo "branch" "--list"))))))

@@ -22,6 +22,11 @@
 (defun deliver (thunk)
   (glib:call-in-main-thread thunk))
 
+(defun attention (title body &key sound)
+  "Tell the user, with a desktop notification (notify.lisp), unless they're looking at the window."
+  (unless (and *window* (gtk:window-is-active *window*))
+    (notify-user title body :sound sound)))
+
 (defun split-lines (string)
   "STRING's lines, without newlines. A final newline doesn't add an empty line."
   (let ((lines (uiop:split-string string :separator '(#\Newline))))
@@ -165,12 +170,24 @@
         (gtk:viewport-set-scroll-to-focus viewport nil)))
     ;; Layout updates the range after idle callbacks may already have run.
     ;; Follow that range too, so streamed and rendered replies stay in view.
-    (gobject:connect (gtk:scrolled-window-get-vadjustment scroller) :changed
-                     (lambda (adjustment)
-                       (gtk:adjustment-set-value adjustment
-                                                 (max 0d0 (- (gtk:adjustment-get-upper adjustment)
-                                                             (gtk:adjustment-get-page-size adjustment))))))
+    ;; Not at once: the range changes while the viewport lays out its
+    ;; content, and a new value then moves the scrollbar but not the
+    ;; content, which stays where it was until the next scroll.
+    (let ((pending nil))
+      (gobject:connect (gtk:scrolled-window-get-vadjustment scroller) :changed
+                       (lambda (adjustment)
+                         (unless pending
+                           (setf pending t)
+                           (glib:idle-add glib:+priority-default-idle+
+                                          (lambda ()
+                                            (setf pending nil)
+                                            (scroll-adjustment-to-end adjustment)
+                                            nil))))))
     (values messages scroller)))
+
+(defun scroll-adjustment-to-end (adjustment)
+  (gtk:adjustment-set-value adjustment (max 0d0 (- (gtk:adjustment-get-upper adjustment)
+                                                   (gtk:adjustment-get-page-size adjustment)))))
 
 (defun pane-scroll-to-end (pane)
   (unless (pane-scroll-pending pane)
@@ -178,9 +195,7 @@
     (glib:idle-add glib:+priority-default-idle+
                    (lambda ()
                      (setf (pane-scroll-pending pane) nil)
-                     (let ((adj (gtk:scrolled-window-get-vadjustment (pane-scroller pane))))
-                       (gtk:adjustment-set-value adj (- (gtk:adjustment-get-upper adj)
-                                                        (gtk:adjustment-get-page-size adj))))
+                     (scroll-adjustment-to-end (gtk:scrolled-window-get-vadjustment (pane-scroller pane)))
                      nil))))
 
 (defun pane-append (pane widget)
@@ -434,6 +449,7 @@ for Codex, the one marked as the default)."
                                            :css-classes '("dim-label"))
                                 buttons)))
     (pane-update-status pane)
+    (attention (format nil "~a needs your approval" (agent-name agent)) title :sound t)
     (when (workflow-running-p)
       (pane-note *middle* (format nil "~a is waiting for you to approve a command (~a pane)." (agent-name agent)
                                   (if (eq (agent-id agent) :claude) "left" "right"))
@@ -525,6 +541,7 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
     (setf (gethash id (agent-pane-approvals pane)) buttons)
     (pane-append pane card)
     (pane-update-status pane)
+    (attention (format nil "~a has a question" (agent-name agent)) "It's waiting for your answer." :sound t)
     (when (workflow-running-p)
       (pane-note *middle* (format nil "~a is waiting for you to answer a question (~a pane)." (agent-name agent)
                                   (if (eq (agent-id agent) :claude) "left" "right"))
@@ -817,6 +834,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun kind-label (kind)
   (case kind
     (:request "request")
+    (:proposal "proposal")
     (:plan "plan")
     (:work "work done")
     (:review "review")
@@ -836,9 +854,16 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                          (markdown-box text)))))
 
 (defun middle-message (from to text kind)
-  (if (eq from :system)
-      (progn (pane-note *middle* text "dim-label" "duet-note")
-        (record :middle :note text))
+  (cond
+    ((eq kind :findings)
+     ;; The review checklist: kept as a message, so it comes back with its header.
+     (pane-append *middle* (markdown-box text "duet-checklist"))
+     (record :middle :text (format nil "Review checklist~%~%~a" text))
+     (save-current-history))
+    ((eq from :system)
+     (pane-note *middle* text "dim-label" "duet-note")
+     (record :middle :note text))
+    (t
       (let ((header (format nil "~a → ~a~@[  ·  ~a~]" (participant-name from) (participant-name to)
                             (let ((label (kind-label kind)))
                               (if (eq kind :review)
@@ -850,7 +875,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
         (if (eq from :user)
             (record :user :prompt text)
             (record :middle :text (format nil "~a~%~%~a" header text)))
-        (save-current-history))))
+        (save-current-history)))))
 
 (defun control (name) (getf *controls* name))
 
@@ -858,7 +883,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
   (if (= 1 (gtk:drop-down-get-selected (control :lead))) *codex* *claude*))
 
 (defun selected-mode ()
-  (if (= 1 (gtk:drop-down-get-selected (control :mode))) :divide :review))
+  (case (gtk:drop-down-get-selected (control :mode))
+    (1 :divide)
+    (2 :compare)
+    (t :review)))
 
 (defun workflow-running-p ()
   (and *workflow* (eq (workflow-state *workflow*) :running)))
@@ -870,8 +898,12 @@ comes without one (a turn stopped as the folder changes) isn't kept."
       (gtk:widget-set-css-classes (control :send) (if running '("destructive-action") '("suggested-action")))
       (dolist (name '(:mode :lead :rounds :folder :permission))
         (gtk:widget-set-sensitive (control name) (not running)))
+      ;; Only the modes that make a plan wait for one.
+      (dolist (name '(:approve-plan :worktrees))
+        (gtk:widget-set-sensitive (control name) (and (not running) (not (eq (selected-mode) :review)))))
       (gtk:label-set-text (pane-status *middle*)
                           (cond ((not running) "")
+                                ((workflow-pending-plan *workflow*) "Waiting for you to approve the plan")
                                 ((workflow-paused *workflow*)
                                  (format nil "Paused: ~a out of usage"
                                          (format nil "~{~a~^ and ~}"
@@ -928,6 +960,8 @@ usage after the turn) brings the Wait button."
          (status (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("dim-label") :visible nil))
          (wait-button nil)
          (waiting-for nil))                     ; the reset being waited for, once Wait is chosen
+    (attention (format nil "~a is out of usage" (agent-name agent))
+               (format nil "~a is paused." (string-capitalize (step-description step) :end 1)))
     (labels ((reset () (and (integerp (agent-out-until agent)) (agent-out-until agent)))
              (settled (text)
                (setf *pause-cards* (remove step *pause-cards* :key #'car))
@@ -963,19 +997,23 @@ usage after the turn) brings the Wait button."
                      (wait))))))
       (choice "Stop" "Stop the whole task here" '("destructive-action")
               (lambda () (stop-workflow workflow) (settled "Stopped")))
-      (let ((hand-off (choice (if (eq (step-role step) :review)
-                                  "Finish unreviewed"
-                                  (format nil "Let ~a take over" (agent-name other)))
-                              (if (eq (step-role step) :review)
-                                  "Finish this part without a review, and say so"
-                                  (format nil "~a carries on from where ~a stopped; its work won't be reviewed"
-                                          (agent-name other) (agent-name agent)))
+      (let ((hand-off (choice (case (step-role step)
+                                (:review "Finish unreviewed")
+                                (:propose "Go without it")
+                                (t (format nil "Let ~a take over" (agent-name other))))
+                              (case (step-role step)
+                                (:review "Finish this part without a review, and say so")
+                                (:propose (format nil "Carry on with ~a's proposal alone" (agent-name other)))
+                                (t (format nil "~a carries on from where ~a stopped; its work won't be reviewed"
+                                           (agent-name other) (agent-name agent))))
                               '()
-                              (lambda () (settled (if (eq (step-role step) :review)
-                                                      "Finished unreviewed"
-                                                      (format nil "Handed to ~a" (agent-name other))))
+                              (lambda () (settled (case (step-role step)
+                                                    (:review "Finished unreviewed")
+                                                    (:propose "Went without it")
+                                                    (t (format nil "Handed to ~a" (agent-name other)))))
                                 (hand-off-step workflow step)))))
-        (unless (or (eq (step-role step) :review) (can-hand-off-p workflow step))
+        ;; Only taking work over needs the other agent's usage.
+        (unless (or (member (step-role step) '(:review :propose)) (can-hand-off-p workflow step))
           (gtk:widget-set-sensitive hand-off nil)
           (gtk:widget-set-tooltip-text hand-off (format nil "~a is out of usage too" (agent-name other)))))
       (choice "Try again" (format nil "Send it to ~a again now" (agent-name agent)) '()
@@ -997,9 +1035,62 @@ usage after the turn) brings the Wait button."
 
 (defun workflow-finished (workflow)
   (clear-pause-timers)
+  (when (eq (workflow-state workflow) :finished)
+    (attention "Both agents have finished"
+               (format nil "~{~a~^; ~}"
+                       (or (loop for l in (workflow-loops workflow)
+                                 collect (format nil "~@[~a: ~]~a" (loop-label l) (loop-outcome l)))
+                           '("It stopped before any work was done")))))
   (when (workflow-continuable-p workflow)
     (show-continue-card workflow))
   (update-controls))
+
+;;; A plan waiting for the user's approval
+
+(defun show-plan-card (workflow lead-task partner-task)
+  "A card with the plan's two parts, to edit, and Start or Stop."
+  (let ((buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+        (lead (workflow-lead workflow))
+        (partner (workflow-partner workflow)))
+    (flet ((part (text)
+             (let ((view (make-input)))
+               (gtk:text-buffer-set-text (gtk:text-view-get-buffer view) (or text "") -1)
+               view))
+           (heading (text)
+             (make-instance 'gtk:label :label text :xalign 0.0 :css-classes '("caption-heading"))))
+      (let ((lead-view (part lead-task))
+            (partner-view (part partner-task)))
+        (labels ((settled (text)
+                   (clear-box buttons)
+                   (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label")))
+                   (gtk:widget-set-sensitive lead-view nil)
+                   (gtk:widget-set-sensitive partner-view nil)
+                   (update-controls))
+                 (start ()
+                   (cond ((not (workflow-live-p workflow)) (settled "Stopped"))
+                         ((approve-plan workflow (text-view-text lead-view) (text-view-text partner-view))
+                          (settled "Started"))
+                         (t (pane-note *middle* "Give at least one of them a part." "error"))))
+                 (button (label classes tooltip action)
+                   (let ((b (make-instance 'gtk:button :label label :css-classes classes :tooltip-text tooltip)))
+                     (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (funcall action)))
+                     (gtk:box-append buttons b))))
+          (button "Stop" '("destructive-action") "Stop the whole task here"
+                  (lambda () (stop-workflow workflow) (settled "Stopped")))
+          (button "Start" '("suggested-action") "Start the work on the plan, as it is here" #'start)
+          (pane-append *middle*
+                       (gtk:build
+                        (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                                 (gtk:label :label "Approve the plan" :xalign 0.0 :css-classes '("heading"))
+                                 (gtk:label :label "Edit either part if you like, then start. Leave a part empty to have the other agent do its part alone."
+                                            :xalign 0.0 :wrap t)
+                                 (heading (format nil "~a's part" (agent-name lead)))
+                                 (gtk:frame lead-view)
+                                 (heading (format nil "~a's part" (agent-name partner)))
+                                 (gtk:frame partner-view)
+                                 buttons)))
+          (attention "The plan is ready" "It's waiting for your approval before the work starts.")
+          (update-controls))))))
 
 (defun show-continue-card (workflow)
   "A card offering to carry WORKFLOW on for more rounds, where it stopped."
@@ -1029,44 +1120,66 @@ usage after the turn) brings the Wait button."
                    (gtk:build
                     (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
                              (gtk:label :label "Not approved yet" :xalign 0.0 :css-classes '("heading"))
-                             (gtk:label :label "The rounds ran out before the review was approved. Continue to carry on from the last review."
+                             (gtk:label :label "The review wasn't approved: the rounds ran out, or findings were left open. Continue to carry on from the last review."
                                         :xalign 0.0 :wrap t)
                              buttons))))))
 
 (defun start-request ()
   (if (workflow-running-p)
       (stop-workflow *workflow*)
-      (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input)))))
+      (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input))))
+            (problem nil))
         (when (plusp (length text))
-          (if (or (agent-busy *claude*) (agent-busy *codex*))
-              (pane-note *middle* "Wait for both agents to finish, or stop them, before starting." "error")
-              (let* ((lead (selected-lead))
-                     (partner (if (eq lead *claude*) *codex* *claude*)))
-                (clear-text-view (control :input))
-                (setf *workflow* (make-instance 'workflow
-                                                :mode (selected-mode) :lead lead :partner partner
-                                                :request text
-                                                :max-rounds (gtk:spin-button-get-value-as-int (control :rounds))
-                                                :on-message #'middle-message
-                                                :on-pause #'show-paused-step
-                                                :on-finish #'workflow-finished))
-                (start-workflow *workflow*)
-                (update-controls)))))))
+          (cond
+            ((or (agent-busy *claude*) (agent-busy *codex*))
+             (pane-note *middle* "Wait for both agents to finish, or stop them, before starting." "error"))
+            ((and (worktrees-wanted-p) (setf problem (worktrees-problem *directory*)))
+             (pane-note *middle* (format nil "Can't give each part its own worktree: ~a." problem) "error"))
+            (t
+             (let* ((lead (selected-lead))
+                    (partner (if (eq lead *claude*) *codex* *claude*)))
+               (clear-text-view (control :input))
+               (setf *workflow* (make-instance 'workflow
+                                               :mode (selected-mode) :lead lead :partner partner
+                                               :request text
+                                               :max-rounds (gtk:spin-button-get-value-as-int (control :rounds))
+                                               :on-message #'middle-message
+                                               :on-pause #'show-paused-step
+                                               :approve-plan (and (not (eq (selected-mode) :review))
+                                                                  (gtk:check-button-get-active (control :approve-plan)))
+                                               :on-plan #'show-plan-card
+                                               :worktrees (worktrees-wanted-p)
+                                               :on-finish #'workflow-finished))
+               (start-workflow *workflow*)
+               (update-controls))))))))
+
+(defun worktrees-wanted-p ()
+  (and (not (eq (selected-mode) :review)) (gtk:check-button-get-active (control :worktrees))))
 
 (defun make-middle-pane ()
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 1.0 :hexpand t :ellipsize :end :css-classes '("dim-label")))
            (input (make-input))
            (send (make-instance 'gtk:button :label "Start" :valign :end :css-classes '("suggested-action")))
-           (mode (gtk:drop-down-new-from-strings '("Write & review" "Split the work")))
+           (mode (gtk:drop-down-new-from-strings '("Write & review" "Split the work" "Compare proposals")))
+           (approve-plan (make-instance 'gtk:check-button :label "Approve plan" :active (setting :approve-plan nil)))
+           (worktrees (make-instance 'gtk:check-button :label "Own worktrees" :active (setting :worktrees nil)))
            (lead (gtk:drop-down-new-from-strings '("Claude leads" "ChatGPT leads")))
            (rounds (gtk:spin-button-new-with-range 1d0 10d0 1d0)))
       (setf *middle* (make-pane :messages messages :scroller scroller :status status :input input :send send))
       (gtk:spin-button-set-value rounds (coerce *default-max-rounds* 'double-float))
-      (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part.")
+      (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part. Compare proposals: both propose an approach on their own, the lead reconciles them into a plan, and then the work is split.")
+      (gtk:widget-set-tooltip-text approve-plan "Wait for you to look over (and edit) the plan before any work starts")
+      (gobject:connect mode "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
+      (gobject:connect approve-plan :toggled
+                       (lambda (b) (setf (setting :approve-plan) (gtk:check-button-get-active b))))
+      (gtk:widget-set-tooltip-text worktrees "Each agent does its part in its own git worktree, in a new conversation; then the parts are committed, merged into the current branch, and the merged result reviewed. Needs a git repository with nothing uncommitted.")
+      (gobject:connect worktrees :toggled
+                       (lambda (b) (setf (setting :worktrees) (gtk:check-button-get-active b))))
       (gtk:widget-set-tooltip-text lead "Who does the work (or splits it)")
       (gtk:widget-set-tooltip-text rounds "Most review rounds before stopping")
-      (setf *controls* (list* :input input :send send :mode mode :lead lead :rounds rounds *controls*))
+      (setf *controls* (list* :input input :send send :mode mode :lead lead :rounds rounds
+                              :approve-plan approve-plan :worktrees worktrees *controls*))
       (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (start-request)))
       (on-return input (lambda () (unless (workflow-running-p) (start-request))))
       (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; each side shows that agent's own work in full.~%~%Return starts; Shift+Return starts a new line."))
@@ -1081,7 +1194,7 @@ usage after the turn) brings the Wait button."
                 (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6
                          mode lead
                          (gtk:label :label "Rounds" :css-classes '("dim-label") :margin-start 6)
-                         rounds)
+                         rounds approve-plan worktrees)
                 (composer input send))))))
 
 ;;; The folder, what the agents may do, and the look
@@ -1306,6 +1419,7 @@ usage after the turn) brings the Wait button."
     (".duet-claude" :color "#e08a6a")
     (".duet-codex" :color "#19b98f")
     (".duet-note" :font-size "smaller")
+    (".duet-checklist" :background-color "alpha(@view_fg_color, 0.05)" :border-radius "8px" :padding ("8px" "12px"))
     (".duet-terminal-panel" :background-color "@view_bg_color")
     (".duet-terminal" :padding ("2px" "6px") :font-family "Menlo, Monaco, monospace")))
 

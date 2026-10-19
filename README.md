@@ -33,9 +33,49 @@ Type a request in the middle and press Return. Choose how they work:
 - **Split the work.** The lead splits the request into its part and the
   other's (parts that don't touch the same files). Both work at once; then each
   reviews the other's part, and each part goes round its own review loop.
+- **Compare proposals.** Both propose an approach on their own, without
+  seeing each other's. The lead compares the two, settles on one (saying
+  where they differed and what it chose), and splits the work as in *Split
+  the work*.
 
 *Claude leads* / *ChatGPT leads* picks the lead. Start becomes Stop while they
 work.
+
+**Approve plan** (for *Split the work* and *Compare proposals*) holds the
+lead's plan for you before any work starts. A card shows each agent's part:
+edit either one, then **Start**, or **Stop**. Leave a part empty and the other
+agent does its own part alone.
+
+**Own worktrees** (also for those two modes) gives each agent its own git
+worktree for its part, so the parts can't get in each other's way:
+
+- It needs a git repository with nothing uncommitted (the worktrees start
+  from the last commit); otherwise Start says why and doesn't begin.
+- Each agent works on its part in a new conversation in its worktree, on
+  a branch `agent-duet/claude-…` or `agent-duet/codex-…`. The reviewer is
+  shown the other's diff and where its worktree is.
+- When both parts are done, each is committed on its branch, both agents
+  come back to the folder (in new conversations), and the branches are
+  merged into your current branch. If they conflict, the lead resolves the
+  conflicts and concludes the merge. Then the other reviews the merged
+  result, as another review loop, and the worktrees and branches go.
+- If the task is stopped, a part fails, or the merge can't be finished (or
+  is aborted), nothing more is merged: the worktrees and their branches are
+  kept, and the conversation says where.
+
+Each review lists its findings in a checklist, `F1`, `F2`, … with the file
+and line where there is one. The next review marks each finding fixed,
+dismissed (the author's reasons convinced the reviewer) or still open, so an
+unresolved finding stays in view from one round to the next. A reviewer that
+approves with findings still open is asked once to settle them; if it
+leaves them open again, the part isn't approved, and **Continue** has the
+author pick them up. The checklist
+shows in the conversation after each review, and when the task finishes it
+says how many findings are still open.
+
+If the window isn't in front, a desktop notification tells you when both
+agents finish, when one is waiting for your approval or an answer, when one
+runs out of usage, and when a plan is waiting for you.
 
 ## Running out of usage
 
@@ -48,7 +88,10 @@ instead of failing, and a card in the middle pane offers:
 - **Let ChatGPT take over** (or Claude): the other agent picks up the work
   where it stopped. It won't be reviewed, since the reviewer is the one out,
   and the conversation says so. If it was a review that paused, this button is
-  **Finish unreviewed**: that part is done, marked as not reviewed.
+  **Finish unreviewed**: that part is done, marked as not reviewed. If it was
+  a proposal, it's **Go without it**: the lead plans from the other proposal,
+  or, if the lead is the one out, the other carries out its own, unreviewed
+  (after you approve that, with *Approve plan*).
 - **Stop**.
 
 Nothing done so far is lost. While an agent is out, with a known reset time,

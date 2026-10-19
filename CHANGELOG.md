@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- The panes no longer leave a new message, card or question just below the
+  visible area until you scroll: following the end now waits until the
+  content has been laid out.
+- Review checklist: each review lists its findings (`F1`, `F2`, … with file
+  locations), and the next marks each one fixed, dismissed or still open.
+  The checklist shows after every review; approving with findings still
+  open asks the reviewer once to settle them, and leaves the part not
+  approved (to continue) if it doesn't; the end of a task says how many
+  are still open.
+- *Approve plan*: the plan in *Split the work* or *Compare proposals* waits
+  for you, so you can edit either agent's part before work starts.
+- *Compare proposals* mode: both agents propose an approach on their own,
+  then the lead reconciles the two into a plan and splits the work.
+- *Own worktrees* for split tasks: each agent does its part in its own git
+  worktree; the parts are then committed, merged into the current branch
+  (the lead resolving any conflicts), and the merged result reviewed.
+- Desktop notifications, when the window isn't in front: both agents
+  finished, an approval or question is waiting, an agent ran out of usage,
+  a plan is waiting for approval.
 - A task that runs out of review rounds without approval can be continued:
   a card offers *Continue* for more rounds, and the author picks up from the
   last review.

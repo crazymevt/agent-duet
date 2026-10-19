@@ -1,20 +1,41 @@
 ;;;; workflow.lisp — the two agents working on one request together
 ;;;;
-;;;; Two modes:
+;;;; Three modes:
 ;;;;
-;;;;   :review  The lead does the work; the partner reviews it; the lead
-;;;;            addresses the review; and so on until the partner approves
-;;;;            or MAX-ROUNDS reviews have been done.
+;;;;   :review   The lead does the work; the partner reviews it; the lead
+;;;;             addresses the review; and so on until the partner approves
+;;;;             or MAX-ROUNDS reviews have been done.
 ;;;;
-;;;;   :divide  The lead splits the request into its part and the partner's.
-;;;;            Both work at once; then each reviews the other's part, and
-;;;;            each part goes round its own review loop, as in :review.
+;;;;   :divide   The lead splits the request into its part and the partner's.
+;;;;             Both work at once; then each reviews the other's part, and
+;;;;             each part goes round its own review loop, as in :review.
+;;;;
+;;;;   :compare  Both propose an approach without seeing the other's; the
+;;;;             lead reconciles the two into a plan, split as in :divide.
+;;;;
+;;;; With APPROVE-PLAN, a plan (:divide, :compare) waits for the user, who
+;;;; may edit either part, before the work starts: ON-PLAN is told, and
+;;;; APPROVE-PLAN starts it.
+;;;;
+;;;; With WORKTREES, a plan split in two has each part done in its own git
+;;;; worktree (worktree.lisp), each agent in a new conversation there, so
+;;;; the parts can't get in each other's way. Once both are done, each is
+;;;; committed on its branch and the branches are merged into the folder's
+;;;; current branch; the lead resolves any conflicts; then the partner
+;;;; reviews the merged result, as another review loop. A part that failed
+;;;; stops it before anything is merged. It needs a git
+;;;; repository with nothing uncommitted: the worktrees start from HEAD.
+;;;;
+;;;; Each review lists its findings in a FINDINGS section; the loop keeps
+;;;; them as a checklist (FINDING), open, fixed or dismissed, and the next
+;;;; review brings each one's status up to date, so none is lost between
+;;;; rounds.
 ;;;;
 ;;;; A REVIEW-LOOP is one piece of work with its author and reviewer. The
 ;;;; workflow's ON-MESSAGE is told of each message passed between them, for
 ;;;; the conversation view: (on-message from to text kind), FROM and TO
-;;;; being agents, :user or :system, and KIND one of :request :plan :work
-;;;; :review :note.
+;;;; being agents, :user or :system, and KIND one of :request :proposal
+;;;; :plan :work :review :findings :note.
 ;;;;
 ;;;; When an agent's account runs out of usage, the step it was given (a
 ;;;; STEP) pauses rather than fails, and ON-PAUSE is told: the user decides
@@ -41,6 +62,17 @@
    (on-message :initarg :on-message :initform nil :accessor workflow-on-message)
    (on-finish :initarg :on-finish :initform nil :accessor workflow-on-finish)
    (on-pause :initarg :on-pause :initform nil :accessor workflow-on-pause)
+   (on-plan :initarg :on-plan :initform nil :accessor workflow-on-plan
+            :documentation "Told (workflow lead-task partner-task) when a plan waits for approval")
+   (approve-plan :initarg :approve-plan :initform nil :reader workflow-approve-plan-p)
+   (pending-plan :initform nil :accessor workflow-pending-plan
+                 :documentation "The plan waiting for approval: (:lead task :partner task :takeover out-agent)")
+   (proposals :initform '() :accessor workflow-proposals :documentation "(agent . text or nil), as they come in")
+   (worktrees :initarg :worktrees :initform nil :reader workflow-worktrees-p)
+   (home :initform nil :accessor workflow-home :documentation "The folder, while the agents are in worktrees")
+   (base :initform nil :accessor workflow-base :documentation "The commit the worktrees started from")
+   (trees :initform '() :accessor workflow-trees :documentation "(agent . worktree directory)s")
+   (integrated :initform nil :accessor workflow-integrated :documentation "True once merging has begun")
    (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
    (loops :initform '() :accessor workflow-loops)
    (context :initform nil :accessor workflow-context
@@ -53,6 +85,8 @@
   label                                 ; how to name it in notes: nil, or "Claude's part"
   (summary "")                          ; the author's latest report
   (last-review nil)                     ; the reviewer's latest review
+  (findings '())                        ; the review checklist: FINDINGs, by id
+  (tree nil)                            ; the worktree it's done in, or nil for the folder
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
   (state :working))                     ; :working :reviewing :approved :unresolved :unreviewed :failed
@@ -61,7 +95,7 @@
   "A prompt given to an agent for the workflow, kept so it can be given
 again, or to the other agent, after the first ran out of usage."
   agent prompt then
-  role                                  ; :plan, :work or :review
+  role                                  ; :propose, :plan, :work, :review or :resolve
   loop)                                 ; the review loop it belongs to (not for :plan)
 
 (defun post (workflow from to text kind)
@@ -95,20 +129,22 @@ instead (PAUSE-STEP); another failed turn ends the workflow's part in it."
   (loop for agent in (list (workflow-lead workflow) (workflow-partner workflow))
         collect (list (agent-directory agent) (agent-conversation-handle agent))))
 
+(defun continuable-loop-p (loop)
+  "Stopped unapproved after a review, and not in a worktree (gone by then)."
+  (and (eq (loop-state loop) :unresolved) (loop-last-review loop) (null (loop-tree loop))))
+
 (defun workflow-continuable-p (workflow)
   "Whether WORKFLOW finished with a loop stopped at its last round, unapproved,
 and the agents are still where it finished."
   (and (eq (workflow-state workflow) :finished)
        (equal (workflow-context workflow) (working-context workflow))
-       (some (lambda (l) (and (eq (loop-state l) :unresolved) (loop-last-review l)))
-             (workflow-loops workflow))))
+       (some #'continuable-loop-p (workflow-loops workflow))))
 
 (defun continue-workflow (workflow rounds)
   "Carry WORKFLOW on for up to ROUNDS more review rounds: each loop stopped
 unapproved has its author address the last review. True if it carried on."
   (when (workflow-continuable-p workflow)
-    (let ((loops (remove-if-not (lambda (l) (and (eq (loop-state l) :unresolved) (loop-last-review l)))
-                                (workflow-loops workflow))))
+    (let ((loops (remove-if-not #'continuable-loop-p (workflow-loops workflow))))
       (setf (workflow-state workflow) :running)
       (incf (workflow-max-rounds workflow) rounds)
       (note workflow "Carrying on for up to ~d more round~:p." rounds)
@@ -131,6 +167,8 @@ unapproved has its author address the last review. True if it carried on."
   (let ((name (agent-name (step-agent step)))
         (loop (step-loop step)))
     (ecase (step-role step)
+      (:propose (format nil "~a's proposal" name))
+      (:resolve (format nil "~a's resolving of the merge conflicts" name))
       (:plan (format nil "~a's plan for splitting the work" name))
       (:work (format nil "~a's work~@[ on ~a~]" name (and loop (loop-label loop))))
       (:review (format nil "~a's review of ~a" name
@@ -161,13 +199,19 @@ unapproved has its author address the last review. True if it carried on."
 
 (defun hand-off-step (workflow step)
   "Have the other agent take STEP over. A review isn't handed off: the work
-finishes unreviewed. Work or a plan goes to the other agent, and what it
+finishes unreviewed. Nor is a proposal: the other's goes on alone. Work or a plan goes to the other agent, and what it
 does then goes unreviewed, since the one that would review it is out."
   (when (and (workflow-live-p workflow) (unpause workflow step))
     (let* ((out (step-agent step))
            (other (other-agent workflow out))
            (loop (step-loop step)))
       (ecase (step-role step)
+        (:propose
+         (proposal-in workflow out nil (format nil "~a ran out of usage" (agent-name out))))
+        (:resolve
+         (note workflow "~a resolves the conflicts instead." (agent-name other))
+         (submit-step workflow (make-step :agent other :prompt (step-prompt step) :then (step-then step)
+                                          :role :resolve)))
         (:review
          (setf (loop-state loop) :unreviewed)
          (note workflow "~@[~a ~]finished without a review: ~a ran out of usage."
@@ -178,7 +222,7 @@ does then goes unreviewed, since the one that would review it is out."
                (agent-name other) (step-description step) (agent-name out))
          (setf (loop-author loop) other
                (loop-skip-review loop) t)
-         (loop-work workflow loop (takeover-prompt out (step-prompt step))))
+         (loop-work workflow loop (takeover-prompt out (step-prompt step) (loop-tree loop))))
         (:plan
          (note workflow "~a does the whole task. It won't be reviewed: ~a is out of usage."
                (agent-name other) (agent-name out))
@@ -192,49 +236,145 @@ does then goes unreviewed, since the one that would review it is out."
   (format nil "~a~%~%(When you finish, ~a will review your work.)" task (agent-name reviewer)))
 
 (defun review-prompt (loop)
-  (let ((author (agent-name (loop-author loop))))
+  (let ((author (agent-name (loop-author loop)))
+        (findings (loop-findings loop)))
     (format nil "~a was asked to do this:~%~%~a~%~%~a reports:~%~%~a~%~%~
+~@[~a~]~
 Review the work: read the changed files (and `git diff`, if this is a git repository) rather than ~
 relying on the report. Don't change any files yourself. Look for bugs, missed requirements, and ~
-anything risky or needlessly complicated, and list concrete issues, most important first.~%~%~
+anything risky or needlessly complicated.~%~%~
+~:[~*~;Your earlier findings:~%~%~a~%~%Repeat each of them in your FINDINGS, its status brought up to date: ~
+[fixed] once it has been dealt with, [dismissed] if the reasons given for leaving it convince you, ~
+[open] if it still stands. ~]~
+Explain what you found as fully as you need, then list ~:[~;any new ~]issues in a FINDINGS section, ~
+most important first, one line each, in this form (the location is optional):~%~%~
+FINDINGS:~%~
+- F~d [open] `path/to/file:line` What is wrong, and what to do about it~%~%~
+Write FINDINGS: NONE if there are none.~%~%~
 End your reply with one line on its own, exactly one of:~%~
 VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
-            author (loop-task loop) author (loop-summary loop))))
+            author (loop-task loop) author (loop-summary loop)
+            (and (loop-tree loop) (worktree-note loop))
+            findings (findings-lines findings) findings
+            (next-finding-id findings))))
+
+(defun confirm-prompt (loop)
+  (format nil "You approved, but these findings of yours are still open:~%~%~a~%~%~
+Settle each of them in a FINDINGS section: [fixed] if it has been dealt with, [dismissed] if it needn't be. ~
+If any still stands, keep it [open] and request changes instead.~%~%~
+End your reply with one line on its own, exactly one of:~%~
+VERDICT: APPROVED~%~
+VERDICT: CHANGES REQUESTED"
+          (findings-lines (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq))))
+
+(defparameter *review-diff-limit* 60000 "The most of a worktree's diff put in a review prompt, in characters.")
+
+(defun worktree-note (loop)
+  "For the reviewer of LOOP's part, done in a worktree: where it is, and its diff."
+  (let* ((tree (loop-tree loop))
+         (diff (handler-case (worktree-diff tree)
+                 (error (e) (format nil "(The diff couldn't be read: ~a)" e)))))
+    (format nil "~a worked in its own git worktree, ~a, so its changes aren't in your folder. ~
+Read the files there; here is everything it changed, against where it started~:[~;, cut short~]:~%~%~
+```diff~%~a~%```~%~%"
+            (agent-name (loop-author loop)) (namestring tree)
+            (> (length diff) *review-diff-limit*) (subseq diff 0 (min (length diff) *review-diff-limit*)))))
 
 (defun fix-prompt (loop review)
-  (format nil "~a reviewed your work and requested changes:~%~%~a~%~%~
+  (let ((open (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq)))
+    (format nil "~a reviewed your work~:[ and requested changes~;~]:~%~%~a~%~%~
+~@[These findings are still open:~%~%~a~%~%~]~
 Address the points you agree with, and say briefly why for any you don't. Then summarize what you changed."
-          (agent-name (loop-reviewer loop)) review))
+            (agent-name (loop-reviewer loop)) (eq (review-verdict review) :approved) review
+            (and open (findings-lines open)))))
 
-(defun plan-prompt (partner request)
+(defun plan-form (partner)
+  "How the lead is to set out a plan split with PARTNER."
   (let ((p (agent-name partner)))
-    (format nil "~a~%~%You are leading this task with ~a, another coding agent working in the same ~
-directory at the same time. Don't change anything yet. Split the work into two parts that can be done ~
-in parallel without editing the same files: one for you and one for ~a. Reply in exactly this form:~%~%~
+    (format nil "Split the work into two parts that can be done in parallel without editing the same files: ~
+one for you and one for ~a. Reply in exactly this form:~%~%~
 LEAD TASK:~%<your part>~%~%~
 PARTNER TASK:~%<~a's part, complete in itself: ~a won't see this conversation>~%~%~
 If the task is too small to split, write NONE under PARTNER TASK."
-            request p p p p)))
+            p p p)))
 
-(defun lead-go-prompt (partner partner-task)
-  (format nil "Go ahead with your part (LEAD TASK). ~a is doing this part at the same time, so leave ~
+(defun plan-prompt (partner request)
+  (format nil "~a~%~%You are leading this task with ~a, another coding agent working in the same ~
+directory at the same time. Don't change anything yet. ~a"
+          request (agent-name partner) (plan-form partner)))
+
+(defun proposal-prompt (other request)
+  (format nil "~a~%~%Before anyone changes anything, you and ~a, another coding agent, are each ~
+proposing how to do this, without seeing the other's proposal; the two will then be reconciled. ~
+Don't change any files. Read what you need to, then propose your approach: what you would change ~
+and how, in which files, and any risks or open questions. Keep it concise."
+          request (agent-name other)))
+
+(defun reconcile-prompt (partner lead-proposal partner-proposal)
+  "The lead's prompt to settle on one approach, from the proposals it has (either may be nil)."
+  (let ((p (agent-name partner)))
+    (format nil "~:[You couldn't make a proposal, but ~a~;~a also~] proposed an approach, independently:~%~%~a~%~%~
+~:[Look it over~;Compare it with yours~]. Settle on one approach: say briefly where the proposals differ, and ~
+what you chose and why, taking the better ideas from each. Don't change anything yet. Then, with ~a, ~
+another coding agent working in the same directory at the same time: ~a"
+            lead-proposal p partner-proposal lead-proposal p (plan-form partner))))
+
+(defun lone-plan-prompt (partner)
+  "The lead's prompt to plan from its proposal alone: PARTNER had none."
+  (format nil "~a couldn't make a proposal, so go with yours. Don't change anything yet. Then, with ~a, ~
+another coding agent working in the same directory at the same time: ~a"
+          (agent-name partner) (agent-name partner) (plan-form partner)))
+
+(defun lead-go-prompt (partner lead-task partner-task edited)
+  (format nil "~:[~*~;The user edited the plan. Your part is now:~%~%~a~%~%~]~
+Go ahead with your part~:[ (LEAD TASK)~;~]. ~a is doing this part at the same time, so leave ~
 its files alone:~%~%~a~%~%When you finish, ~a will review your part."
-          (agent-name partner) partner-task (agent-name partner)))
+          edited lead-task edited (agent-name partner) partner-task (agent-name partner)))
+
+(defun lead-alone-prompt (partner lead-task edited)
+  (format nil "~:[Then do the whole task yourself.~*~;The user edited the plan: do this yourself.~%~%~a~]~%~%~
+(When you finish, ~a will review your work.)"
+          edited lead-task (agent-name partner)))
 
 (defun partner-task-prompt (lead request lead-task partner-task)
   (let ((l (agent-name lead)))
     (format nil "~a is sharing a task with you. The overall request:~%~%~a~%~%Your part:~%~%~a~%~%~
-~a is doing this part at the same time, so leave its files alone:~%~%~a~%~%~
+~:[~2*No one else is working on it.~;~a is doing this part at the same time, so leave its files alone:~%~%~a~]~%~%~
 When you finish, ~a will review your part."
-            l request partner-task l lead-task l)))
+            l request partner-task (and lead-task t) l lead-task l)))
 
-(defun takeover-prompt (out prompt)
+(defun takeover-prompt (out prompt &optional tree)
   (format nil "~a ran out of usage partway through a task, so you're taking it over. Some of its work ~
-may already be in the files: look before you continue, and don't redo what's done. Here is what ~a was ~
+may already be in the files: look before you continue, and don't redo what's done.~@[ Its work is in ~
+its own git worktree, ~a: make your changes there, not in your own folder.~] Here is what ~a was ~
 asked (\"you\" there meant ~a):~%~%~a~%~%~
 No one will review your work this time, since ~a is out of usage. Finish with a summary of what you changed."
-          (agent-name out) (agent-name out) (agent-name out) prompt (agent-name out)))
+          (agent-name out) (and tree (namestring tree)) (agent-name out) (agent-name out) prompt (agent-name out)))
+
+(defun proposal-takeover-prompt (out request)
+  (format nil "~a ran out of usage before your proposals could be reconciled, so carry out yours yourself, ~
+all of the task:~%~%~a~%~%~
+No one will review your work this time, since ~a is out of usage. Finish with a summary of what you changed."
+          (agent-name out) request (agent-name out)))
+
+(defun worktree-part-prompt (other request task other-task tree)
+  "An agent's part, TASK, to do in its worktree TREE, for a new conversation there."
+  (format nil "You're sharing a task with ~a, another coding agent. The overall request:~%~%~a~%~%~
+Your part:~%~%~a~%~%~a is doing this part at the same time:~%~%~a~%~%~
+You each have your own git worktree. Yours is ~a, on branch ~a: make your changes there, and only your part. ~
+Don't commit: once both parts are done, each is committed and merged.~%~%~
+When you finish, ~a will review your part."
+          (agent-name other) request task (agent-name other) other-task
+          (namestring tree) (worktree-branch tree) (agent-name other)))
+
+(defun resolve-prompt (request branch files)
+  (format nil "Two agents did the parts of this task each in its own git worktree, and their branches are ~
+being merged into this folder. The overall request:~%~%~a~%~%~
+Merging ~a conflicted in:~%~%~{- ~a~%~}~%~
+Resolve the conflicts, keeping what each part meant to do. Then stage the files and conclude the merge with ~
+`git commit --no-edit`. Finish with a summary of how you resolved them."
+          request branch files))
 
 (defun takeover-plan-prompt (out request)
   (format nil "~a ran out of usage before it could plan this task with you, so do all of it yourself:~%~%~a~%~%~
@@ -276,6 +416,109 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                               (and (>= (length partner) 4) (string-equal "NONE" partner :end2 4)))
                     partner))))))
 
+;;; The review checklist
+
+(defstruct (finding (:conc-name finding-))
+  id                                    ; its number: F3 is 3
+  (status :open)                        ; :open :fixed :dismissed
+  location                              ; "src/a.lisp:42", or nil
+  (text "")
+  round)                                ; the review round that raised it
+
+(defparameter *finding-statuses*
+  '(("open" . :open) ("still open" . :open) ("fixed" . :fixed) ("addressed" . :fixed) ("resolved" . :fixed)
+    ("dismissed" . :dismissed) ("wontfix" . :dismissed) ("won't fix" . :dismissed)))
+
+(defun parse-finding-line (line)
+  "A finding from one LINE of a FINDINGS section, \"- F2 [open] `a.lisp:4` What's wrong\",
+as a plist (:id :status :location :text); nil for a line that isn't one.
+It needs an F number or a [status]; the location is optional."
+  (let* ((line (string-trim '(#\Space #\Tab #\Return) line))
+         (start (cond ((and (plusp (length line)) (find (char line 0) "-*+")) 1)
+                      ((let ((dot (position #\. line)))
+                         (and dot (plusp dot) (every #'digit-char-p (subseq line 0 dot)) (1+ dot))))
+                      (t nil))))
+    (when start
+      (let ((rest (string-left-trim " *_" (subseq line start)))
+            id status location)
+        (when (and (> (length rest) 1) (char-equal (char rest 0) #\F) (digit-char-p (char rest 1)))
+          (multiple-value-bind (n end) (parse-integer rest :start 1 :junk-allowed t)
+            (setf id n rest (string-left-trim " *_:." (subseq rest end)))))
+        (when (and (plusp (length rest)) (char= (char rest 0) #\[))
+          (let ((close (position #\] rest)))
+            (when close
+              (setf status (cdr (assoc (string-trim " " (subseq rest 1 close)) *finding-statuses* :test #'string-equal))
+                    rest (string-left-trim " *_:" (subseq rest (1+ close)))))))
+        (when (and (plusp (length rest)) (char= (char rest 0) #\`))
+          (let ((close (position #\` rest :start 1)))
+            (when close
+              (setf location (subseq rest 1 close)
+                    rest (subseq rest (1+ close))))))
+        (when (or id status)
+          (list :id id :status (or status :open) :location location
+                :text (string-trim '(#\Space #\Tab #\— #\– #\- #\: #\*) rest)))))))
+
+(defun parse-findings (text)
+  "The findings in TEXT's last FINDINGS section, as plists (PARSE-FINDING-LINE);
+the second value is true if there was a section (FINDINGS: NONE is an empty one)."
+  (let ((at (search "FINDINGS:" text :from-end t :test #'char-equal)))
+    (if (null at)
+        (values '() nil)
+        (values (loop for line in (rest (uiop:split-string (subseq text at) :separator '(#\Newline)))
+                      until (search "VERDICT:" line :test #'char-equal)
+                      for finding = (parse-finding-line line)
+                      when finding collect finding)
+                t))))
+
+(defun next-finding-id (findings)
+  (1+ (reduce #'max findings :key #'finding-id :initial-value 0)))
+
+(defun merge-findings (findings parsed round)
+  "FINDINGS brought up to date by a review's PARSED findings: those it names
+take its status (and location, if it gives one); the rest are new, raised in
+ROUND. Those it leaves out stay as they were. A fresh list, by id."
+  (let ((findings (mapcar #'copy-finding findings)))
+    (dolist (p parsed)
+      (let ((old (and (getf p :id) (find (getf p :id) findings :key #'finding-id))))
+        (if old
+            (progn (setf (finding-status old) (getf p :status))
+              (when (getf p :location) (setf (finding-location old) (getf p :location)))
+              (when (zerop (length (finding-text old))) (setf (finding-text old) (getf p :text))))
+            (push (make-finding :id (or (getf p :id) (next-finding-id findings))
+                                :status (getf p :status) :location (getf p :location)
+                                :text (getf p :text) :round round)
+                  findings))))
+    (sort findings #'< :key #'finding-id)))
+
+(defun findings-lines (findings)
+  "FINDINGS in the form a review lists them."
+  (format nil "~{~a~^~%~}"
+          (loop for f in findings
+                collect (format nil "- F~d [~(~a~)] ~@[`~a` ~]~a"
+                                (finding-id f) (finding-status f) (finding-location f) (finding-text f)))))
+
+(defun count-findings (findings status)
+  (count status findings :key #'finding-status))
+
+(defun checklist-text (loop)
+  "LOOP's checklist, in Markdown, for the conversation."
+  (let ((findings (loop-findings loop)))
+    (format nil "**Review checklist~@[, ~a~]** · ~d open, ~d fixed, ~d dismissed~%~%~{~a~^~%~}"
+            (loop-label loop)
+            (count-findings findings :open) (count-findings findings :fixed) (count-findings findings :dismissed)
+            (loop for f in findings
+                  collect (format nil "- ~a **F~d** ~(~a~)~@[ · `~a`~] — ~a"
+                                  (ecase (finding-status f) (:open "○") (:fixed "✓") (:dismissed "✕"))
+                                  (finding-id f) (finding-status f) (finding-location f) (finding-text f))))))
+
+(defun take-findings (workflow loop review)
+  "Bring LOOP's checklist up to date from REVIEW, and show it when there is one."
+  (multiple-value-bind (parsed found) (parse-findings review)
+    (when found
+      (setf (loop-findings loop) (merge-findings (loop-findings loop) parsed (loop-round loop))))
+    (when (loop-findings loop)
+      (post workflow :system (loop-author loop) (checklist-text loop) :findings))))
+
 ;;; Running
 
 (defun start-workflow (workflow)
@@ -284,6 +527,11 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
         (partner (workflow-partner workflow))
         (request (workflow-request workflow)))
     (post workflow :user lead request :request)
+    (let ((problem (and (workflow-worktrees-p workflow) (not (eq (workflow-mode workflow) :review))
+                        (worktrees-problem (agent-directory lead)))))
+      (when problem
+        (fail workflow "Can't give each part its own worktree: ~a." problem)
+        (return-from start-workflow workflow)))
     (ecase (workflow-mode workflow)
       (:review
        (note workflow "~a writes, ~a reviews (up to ~d rounds)." (agent-name lead) (agent-name partner)
@@ -292,35 +540,134 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                  (work-prompt partner request)))
       (:divide
        (note workflow "~a splits the work with ~a." (agent-name lead) (agent-name partner))
-       (submit workflow lead (plan-prompt partner request)
-               (lambda (text error)
-                 (if error
-                     (fail workflow "~a couldn't make a plan: ~a" (agent-name lead) text)
-                     (start-parts workflow text)))
-               :role :plan)))
+       (submit-plan workflow (plan-prompt partner request)))
+      (:compare
+       (note workflow "~a and ~a each propose an approach; then ~a reconciles them."
+             (agent-name lead) (agent-name partner) (agent-name lead))
+       (dolist (agent (list lead partner))
+         (let ((agent agent))
+           (submit workflow agent (proposal-prompt (other-agent workflow agent) request)
+                   (lambda (text error)
+                     (if error
+                         (proposal-in workflow agent nil (format nil "its turn failed: ~a" text))
+                         (proposal-in workflow agent text)))
+                   :role :propose)))))
     workflow))
 
-(defun start-parts (workflow plan)
+(defun submit-plan (workflow prompt)
+  "Have the lead make a plan from PROMPT, and then go on with it (PLAN-READY)."
+  (let ((lead (workflow-lead workflow)))
+    (submit workflow lead prompt
+            (lambda (text error)
+              (if error
+                  (fail workflow "~a couldn't make a plan: ~a" (agent-name lead) text)
+                  (plan-ready workflow text)))
+            :role :plan)))
+
+(defun proposal-in (workflow agent text &optional why)
+  "AGENT's proposal is in: TEXT, or nil for none (WHY not). Once both are,
+the lead reconciles them into a plan."
+  (let ((lead (workflow-lead workflow))
+        (partner (workflow-partner workflow)))
+    (if text
+        ;; Only the lead sees the partner's; the lead's is for the user.
+        (post workflow agent (if (eq agent lead) :user lead) text :proposal)
+        (note workflow "~a has no proposal: ~a." (agent-name agent) why))
+    (push (cons agent text) (workflow-proposals workflow))
+    (when (= 2 (length (workflow-proposals workflow)))
+      (let ((mine (cdr (assoc lead (workflow-proposals workflow))))
+            (theirs (cdr (assoc partner (workflow-proposals workflow)))))
+        (cond ((not (or mine theirs))
+               (fail workflow "Neither could propose an approach."))
+              ((and (null mine) (agent-out-until lead))
+               ;; The lead ran out: planning with it would only pause again.
+               (note workflow "~a is to do the whole task from its proposal. It won't be reviewed: ~a is out of usage."
+                     (agent-name partner) (agent-name lead))
+               (if (workflow-approve-plan-p workflow)
+                   (await-plan workflow nil (workflow-request workflow) :takeover lead)
+                   (start-takeover workflow lead (workflow-request workflow))))
+              (theirs
+               (note workflow "~a reconciles the proposals." (agent-name lead))
+               (submit-plan workflow (reconcile-prompt partner mine theirs)))
+              (t
+               (note workflow "~a plans from its own proposal." (agent-name lead))
+               (submit-plan workflow (lone-plan-prompt partner))))))))
+
+(defun plan-ready (workflow plan)
+  "The lead's PLAN is in: wait for the user to approve it, if asked to, or start on it."
+  (post workflow (workflow-lead workflow) (workflow-partner workflow) plan :plan)
+  (multiple-value-bind (lead-task partner-task) (parse-plan plan)
+    (if (workflow-approve-plan-p workflow)
+        (await-plan workflow lead-task partner-task)
+        (start-parts workflow lead-task partner-task))))
+
+(defun await-plan (workflow lead-task partner-task &key takeover)
+  "Hold the plan for the user's approval (APPROVE-PLAN). TAKEOVER: the
+partner is to do it all, as that agent, the lead, is out of usage."
+  (setf (workflow-pending-plan workflow) (list :lead lead-task :partner partner-task :takeover takeover))
+  (note workflow "Waiting for you to approve the plan.")
+  (when (workflow-on-plan workflow)
+    (funcall (workflow-on-plan workflow) workflow lead-task partner-task)))
+
+(defun start-takeover (workflow out task)
+  "The partner does TASK alone from its proposal, unreviewed: OUT, the lead, is out of usage."
+  (run-loop workflow (make-review-loop :author (workflow-partner workflow) :reviewer out :task task :skip-review t)
+            (proposal-takeover-prompt out task)))
+
+(defun blank-to-nil (text)
+  (let ((text (and text (string-trim '(#\Space #\Tab #\Newline #\Return) text))))
+    (and text (plusp (length text)) text)))
+
+(defun approve-plan (workflow lead-task partner-task)
+  "Start on WORKFLOW's pending plan with the tasks as the user left them; a
+blank one is no part for that agent. True if it started: false when nothing
+is pending, or both are blank."
+  (let ((lead-task (blank-to-nil lead-task))
+        (partner-task (blank-to-nil partner-task)))
+    (when (and (workflow-live-p workflow) (workflow-pending-plan workflow) (or lead-task partner-task))
+      (destructuring-bind (&key lead partner takeover) (workflow-pending-plan workflow)
+        (let ((edited (not (and (equal lead-task lead) (equal partner-task partner)))))
+          (setf (workflow-pending-plan workflow) nil)
+          (note workflow (if edited "You edited the plan." "You approved the plan."))
+          ;; Given a part after all, the lead takes its chances with its usage.
+          (if (and takeover (null lead-task))
+              (start-takeover workflow takeover partner-task)
+              (start-parts workflow lead-task partner-task :edited edited))
+          t)))))
+
+(defun start-parts (workflow lead-task partner-task &key edited)
+  "Start the work on a plan: a loop for each agent with a part (LEAD-TASK,
+PARTNER-TASK, nil for none). EDITED: the user changed the plan, so the
+lead, who made it, is told its part again."
   (let ((lead (workflow-lead workflow))
         (partner (workflow-partner workflow))
         (request (workflow-request workflow)))
-    (multiple-value-bind (lead-task partner-task) (parse-plan plan)
-      (post workflow lead partner plan :plan)
-      (if (null partner-task)
-          (progn
-            (note workflow "~a is doing it alone; ~a will review." (agent-name lead) (agent-name partner))
-            (run-loop workflow (make-review-loop :author lead :reviewer partner :task request)
-                      (format nil "Then do the whole task yourself.~%~%(When you finish, ~a will review your work.)"
-                              (agent-name partner))))
-          (let ((mine (make-review-loop :author lead :reviewer partner :task lead-task
-                                        :label (format nil "~a's part" (agent-name lead))))
-                (theirs (make-review-loop :author partner :reviewer lead :task partner-task
-                                          :label (format nil "~a's part" (agent-name partner)))))
-            ;; Both are registered before either starts, so the first to
-            ;; finish doesn't find every loop done.
-            (setf (workflow-loops workflow) (list mine theirs))
-            (loop-work workflow mine (lead-go-prompt partner partner-task))
-            (loop-work workflow theirs (partner-task-prompt lead request lead-task partner-task)))))))
+    (cond ((null partner-task)
+           (note workflow "~a is doing it alone; ~a will review." (agent-name lead) (agent-name partner))
+           (run-loop workflow (make-review-loop :author lead :reviewer partner :task (if edited lead-task request))
+                     (lead-alone-prompt partner lead-task edited)))
+          ((null lead-task)
+           (note workflow "~a is doing it alone; ~a will review." (agent-name partner) (agent-name lead))
+           (run-loop workflow (make-review-loop :author partner :reviewer lead :task partner-task)
+                     (partner-task-prompt lead request nil partner-task)))
+          (t
+           (let ((mine (make-review-loop :author lead :reviewer partner :task lead-task
+                                         :label (format nil "~a's part" (agent-name lead))))
+                 (theirs (make-review-loop :author partner :reviewer lead :task partner-task
+                                           :label (format nil "~a's part" (agent-name partner)))))
+             ;; Both are registered before either starts, so the first to
+             ;; finish doesn't find every loop done.
+             (setf (workflow-loops workflow) (list mine theirs))
+             (cond ((not (workflow-worktrees-p workflow))
+                    (loop-work workflow mine (lead-go-prompt partner lead-task partner-task edited))
+                    (loop-work workflow theirs (partner-task-prompt lead request lead-task partner-task)))
+                   ((open-worktrees workflow)
+                    (setf (loop-tree mine) (cdr (assoc lead (workflow-trees workflow)))
+                          (loop-tree theirs) (cdr (assoc partner (workflow-trees workflow))))
+                    (loop-work workflow mine (worktree-part-prompt partner request lead-task partner-task
+                                                                   (loop-tree mine)))
+                    (loop-work workflow theirs (worktree-part-prompt lead request partner-task lead-task
+                                                                     (loop-tree theirs))))))))))
 
 (defun run-loop (workflow loop prompt)
   "Start LOOP: its author works on PROMPT, and then the reviewing begins."
@@ -344,36 +691,60 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                        (loop-review workflow loop)))))
           :role :work :loop loop))
 
-(defun loop-review (workflow loop)
+(defun loop-review (workflow loop &optional confirming)
+  "Have LOOP's reviewer review the work; CONFIRMING: it approved with findings
+still open, and is asked once to settle them (that's no new round)."
   (setf (loop-state loop) :reviewing)
-  (submit workflow (loop-reviewer loop) (review-prompt loop)
+  (submit workflow (loop-reviewer loop) (if confirming (confirm-prompt loop) (review-prompt loop))
           (lambda (text error)
             (if error
                 (loop-failed workflow loop (format nil "~a's review failed: ~a" (agent-name (loop-reviewer loop)) text))
-                (progn
-                  (incf (loop-round loop))
-                  (setf (loop-last-review loop) text)
-                  (post workflow (loop-reviewer loop) (loop-author loop) text :review)
-                  (cond ((eq (review-verdict text) :approved)
-                         (setf (loop-state loop) :approved)
-                         (note workflow "~a approved ~a." (agent-name (loop-reviewer loop))
-                               (or (loop-label loop) "the work"))
-                         (check-finished workflow))
-                        ((>= (loop-round loop) (workflow-max-rounds workflow))
-                         (setf (loop-state loop) :unresolved)
-                         (note workflow "Stopping ~a after ~d review round~:p without approval."
-                               (or (loop-label loop) "the review") (loop-round loop))
-                         (check-finished workflow))
-                        (t
-                         (note workflow "Round ~d~@[ (~a)~]: ~a addresses the review."
-                               (1+ (loop-round loop)) (loop-label loop) (agent-name (loop-author loop)))
-                         (loop-work workflow loop (fix-prompt loop text)))))))
+                (review-in workflow loop text confirming)))
           :role :review :loop loop))
+
+(defun review-in (workflow loop text confirming)
+  (unless confirming (incf (loop-round loop)))
+  (setf (loop-last-review loop) text)
+  (post workflow (loop-reviewer loop) (loop-author loop) text :review)
+  (take-findings workflow loop text)
+  (let ((open (count-findings (loop-findings loop) :open)))
+    (cond ((and (eq (review-verdict text) :approved) (plusp open) (not confirming))
+           (note workflow "~a approved with ~d finding~:p still open; asking it to settle them."
+                 (agent-name (loop-reviewer loop)) open)
+           (loop-review workflow loop t))
+          ((and (eq (review-verdict text) :approved) (plusp open))
+           ;; Asked once already: not approved, but no more asking either.
+           ;; The user can continue it (CONTINUE-WORKFLOW).
+           (setf (loop-state loop) :unresolved)
+           (note workflow "~a approved ~a but left ~d finding~:p open, so it isn't approved."
+                 (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work") open)
+           (check-finished workflow))
+          ((eq (review-verdict text) :approved)
+           (setf (loop-state loop) :approved)
+           (note workflow "~a approved ~a." (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work"))
+           (check-finished workflow))
+          ((>= (loop-round loop) (workflow-max-rounds workflow))
+           (setf (loop-state loop) :unresolved)
+           (note workflow "Stopping ~a after ~d review round~:p without approval."
+                 (or (loop-label loop) "the review") (loop-round loop))
+           (check-finished workflow))
+          (t
+           (note workflow "Round ~d~@[ (~a)~]: ~a addresses the review."
+                 (1+ (loop-round loop)) (loop-label loop) (agent-name (loop-author loop)))
+           (loop-work workflow loop (fix-prompt loop text))))))
 
 (defun loop-failed (workflow loop why)
   (setf (loop-state loop) :failed)
   (note workflow "~a" why)
   (check-finished workflow))
+
+(defun loop-outcome (loop)
+  "How LOOP ended, in words: \"approved\", \"not approved\"..."
+  (case (loop-state loop)
+    (:approved "approved")
+    (:unresolved "not approved")
+    (:unreviewed "not reviewed")
+    (t "failed")))
 
 (defun loop-done-p (loop)
   (member (loop-state loop) '(:approved :unresolved :unreviewed :failed)))
@@ -381,21 +752,27 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
 (defun check-finished (workflow)
   (when (and (workflow-live-p workflow) (null (workflow-paused workflow))
              (every #'loop-done-p (workflow-loops workflow)))
-    (setf (workflow-state workflow) :finished
-          (workflow-context workflow) (working-context workflow))
-    (note workflow "Done: ~{~a~^; ~}."
-          (loop for l in (workflow-loops workflow)
-                collect (format nil "~@[~a ~]~(~a~)" (loop-label l)
-                                (case (loop-state l)
-                                  (:approved "approved")
-                                  (:unresolved "not approved")
-                                  (:unreviewed "not reviewed")
-                                  (t "failed")))))
-    (when (workflow-on-finish workflow)
-      (funcall (workflow-on-finish workflow) workflow))))
+    (let ((failed (find :failed (workflow-loops workflow) :key #'loop-state)))
+      (cond ((or (null (workflow-trees workflow)) (workflow-integrated workflow))
+             (finish-workflow workflow))
+            ;; Its work may be half done: keep it out of the folder.
+            (failed
+             (fail workflow "~a failed, so the parts aren't merged." (string-capitalize (loop-label failed) :end 1)))
+            (t (integrate workflow))))))
+
+(defun finish-workflow (workflow)
+  (setf (workflow-state workflow) :finished
+        (workflow-context workflow) (working-context workflow))
+  (note workflow "Done: ~{~a~^; ~}."
+        (loop for l in (workflow-loops workflow)
+              collect (format nil "~@[~a ~]~a~[~:;, ~:*~d finding~:p open~]" (loop-label l)
+                              (loop-outcome l) (count-findings (loop-findings l) :open))))
+  (when (workflow-on-finish workflow)
+    (funcall (workflow-on-finish workflow) workflow)))
 
 (defun fail (workflow fmt &rest args)
   (apply #'note workflow fmt args)
+  (leave-worktrees workflow)
   (setf (workflow-state workflow) :finished)
   (when (workflow-on-finish workflow)
     (funcall (workflow-on-finish workflow) workflow)))
@@ -404,9 +781,138 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
   "Stop WORKFLOW and both agents' work on it."
   (when (workflow-live-p workflow)
     (setf (workflow-state workflow) :stopped
-          (workflow-paused workflow) '())
+          (workflow-paused workflow) '()
+          (workflow-pending-plan workflow) nil)
     (agent-cancel (workflow-lead workflow))
     (agent-cancel (workflow-partner workflow))
     (note workflow "Stopped.")
+    (leave-worktrees workflow)
     (when (workflow-on-finish workflow)
       (funcall (workflow-on-finish workflow) workflow))))
+;;; Separate worktrees
+
+(defun worktrees-problem (directory)
+  "Why the parts can't each have a worktree of DIRECTORY, or nil."
+  (cond ((not (and directory (git-repository-p directory)))
+         "the folder isn't a git repository")
+        ((not (ignore-errors (worktree-git-line directory "rev-parse" "HEAD")))
+         "the repository has no commits yet")
+        ((plusp (length (ignore-errors (worktree-git directory "status" "--porcelain"))))
+         "the folder has uncommitted changes, which the worktrees wouldn't have: commit or stash them first")))
+
+(defun move-agent (agent directory)
+  "AGENT, in a new conversation, working in DIRECTORY."
+  (agent-new-conversation agent)
+  (setf (agent-directory agent) directory))
+
+(defun open-worktrees (workflow)
+  "A worktree for each agent, each in a new conversation there. True if
+made; otherwise the workflow fails."
+  (let ((home (agent-directory (workflow-lead workflow))))
+    (setf (workflow-home workflow) home)
+    (handler-case
+        (progn
+          (setf (workflow-base workflow) (worktree-git-line home "rev-parse" "HEAD"))
+          (dolist (agent (list (workflow-lead workflow) (workflow-partner workflow)))
+            (let ((tree (create-worktree home (format nil "~(~a~)-~a" (agent-id agent) (subseq (make-uuid) 0 8)))))
+              (push (cons agent tree) (workflow-trees workflow))
+              (move-agent agent tree)
+              (note workflow "~a works in its own worktree, ~a (branch ~a), in a new conversation."
+                    (agent-name agent) (namestring tree) (worktree-branch tree))))
+          t)
+      (error (e)
+        (fail workflow "Couldn't make the worktrees: ~a" e)
+        nil))))
+
+(defun leave-worktrees (workflow)
+  "Ending before the parts are merged: the agents go back to the folder,
+and the worktrees are kept, with the work done in them."
+  (when (and (workflow-trees workflow) (not (workflow-integrated workflow)))
+    (setf (workflow-integrated workflow) t)
+    (dolist (entry (workflow-trees workflow))
+      (move-agent (car entry) (workflow-home workflow)))
+    (note workflow "The worktrees are kept, with their work: ~{~a~^, ~}."
+          (mapcar (lambda (e) (namestring (cdr e))) (reverse (workflow-trees workflow))))))
+
+(defun integrate (workflow)
+  "Both parts are done: commit each on its branch, bring the agents back
+to the folder, and merge the branches into it."
+  (setf (workflow-integrated workflow) t)
+  (let ((home (workflow-home workflow))
+        (trees (mapcar #'cdr (reverse (workflow-trees workflow)))))
+    (dolist (entry (workflow-trees workflow))
+      (move-agent (car entry) home))
+    (handler-case
+        (progn
+          (dolist (l (workflow-loops workflow))
+            (when (loop-tree l)
+              (commit-worktree (loop-tree l) (format nil "~a~%~%~a" (string-capitalize (loop-label l) :end 1)
+                                                     (loop-task l)))))
+          (note workflow "Both parts are committed on their branches; merging them into the folder.")
+          (merge-parts workflow trees))
+      (error (e) (integration-failed workflow (princ-to-string e) trees)))))
+
+(defun merge-in-progress-p (directory)
+  (or (ignore-errors (worktree-git directory "rev-parse" "-q" "--verify" "MERGE_HEAD") t)
+      (plusp (length (ignore-errors (worktree-git directory "diff" "--name-only" "--diff-filter=U"))))))
+
+(defun branch-merged-p (directory branch)
+  "Whether BRANCH's commits are all in DIRECTORY's HEAD."
+  (ignore-errors (worktree-git directory "merge-base" "--is-ancestor" branch "HEAD") t))
+
+(defun merge-parts (workflow trees)
+  "Merge TREES' branches into the folder one by one, the lead resolving any
+conflicts; then the merged result is reviewed."
+  (let ((home (workflow-home workflow)))
+    (if (null trees)
+        (merged workflow)
+        (let ((branch (worktree-branch (first trees))))
+          (multiple-value-bind (status files)
+              (handler-case (merge-worktree home (first trees))
+                (error (e) (values :error (princ-to-string e))))
+            (case status
+              (:merged
+               (note workflow "Merged ~a." branch)
+               (merge-parts workflow (rest trees)))
+              (:conflict
+               (note workflow "Merging ~a conflicts in ~{~a~^, ~}; ~a resolves them."
+                     branch files (agent-name (workflow-lead workflow)))
+               (submit workflow (workflow-lead workflow) (resolve-prompt (workflow-request workflow) branch files)
+                       (lambda (text error)
+                         (cond (error (integration-failed workflow (format nil "resolving the conflicts failed: ~a" text) trees))
+                               ((merge-in-progress-p home)
+                                (integration-failed workflow "the merge is still unresolved" trees))
+                               ;; Aborted, say, rather than concluded.
+                               ((not (branch-merged-p home branch))
+                                (integration-failed workflow (format nil "~a wasn't merged" branch) trees))
+                               (t
+                                (post workflow (workflow-lead workflow) :user text :work)
+                                (note workflow "Merged ~a." branch)
+                                (merge-parts workflow (rest trees)))))
+                       :role :resolve))
+              (t (integration-failed workflow files trees))))))))
+
+(defun merged (workflow)
+  "Both branches are in: the worktrees go, and the partner reviews the merged result."
+  (let ((home (workflow-home workflow))
+        (base (workflow-base workflow))
+        (lead (workflow-lead workflow)))
+    (dolist (entry (workflow-trees workflow))
+      (handler-case (remove-worktree home (cdr entry) :delete-branch t)
+        (error (e) (note workflow "Couldn't remove the worktree ~a: ~a" (namestring (cdr entry)) e))))
+    (let ((l (make-review-loop :author lead :reviewer (workflow-partner workflow) :label "the merged result"
+                               :task (format nil "Merge the two parts of this task, each done in its own git ~
+worktree, into this folder. The overall request:~%~%~a" (workflow-request workflow))
+                               :summary (format nil "Both parts are merged. The changes are the commits since ~a: ~
+`git diff ~a` shows all of them." (subseq base 0 (min 12 (length base))) base))))
+      (setf (workflow-loops workflow) (append (workflow-loops workflow) (list l)))
+      (note workflow "~a reviews the merged result." (agent-name (workflow-partner workflow)))
+      (loop-review workflow l))))
+
+(defun integration-failed (workflow why trees)
+  "Merging stopped at TREES (the first not merged): say so, and end. The
+worktrees are kept, with their branches."
+  (fail workflow "Merging the parts stopped: ~a. The folder is as the merge left it~@[, with ~a not merged yet~]; ~
+the worktrees are kept: ~{~a~^, ~}."
+        why (and trees (ignore-errors (worktree-branch (first trees))))
+        (mapcar (lambda (e) (namestring (cdr e))) (reverse (workflow-trees workflow)))))
