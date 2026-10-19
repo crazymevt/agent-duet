@@ -5,7 +5,7 @@
 ;;;; it prints is an event, turned here into a CLAUDE-EVENT. Lines are read
 ;;;; on a thread and handed to DELIVER (the GTK main loop, in the app).
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defvar *claude-program* nil
   "The Claude Code CLI. Nil: `claude` on PATH, then ~/.local/bin/claude,
@@ -35,23 +35,23 @@ then the copy inside the Claude desktop app.")
         (models nil)
         (cp nil))
     (unwind-protect
-         (progn
-           (setf cp (start-claude
-                     (append (claude-arguments) '("--safe-mode" "--strict-mcp-config"))
-                     :program program :directory (uiop:temporary-directory)
-                     :on-event
-                     (lambda (event)
-                       (let ((object (event-data event)))
-                         (when (and (equal (jget object "type") "control_response")
-                                    (equal (jget object "response" "request_id") "models"))
-                           (setf models (remove-if-not #'claude-model-id
+        (progn
+          (setf cp (start-claude
+                    (append (claude-arguments) '("--safe-mode" "--strict-mcp-config"))
+                    :program program :directory (uiop:temporary-directory)
+                    :on-event
+                    (lambda (event)
+                      (let ((object (event-data event)))
+                        (when (and (equal (jget object "type") "control_response")
+                                   (equal (jget object "response" "request_id") "models"))
+                          (setf models (remove-if-not #'claude-model-id
                                                       (jlist (jget object "response" "response" "models"))))
-                           (sb-thread:signal-semaphore ready))))
-                     :on-exit (lambda (code) (declare (ignore code)) (sb-thread:signal-semaphore ready))))
-           (claude-write-line cp (json-string (jobj "type" "control_request" "request_id" "models"
-                                                    "request" (jobj "subtype" "initialize"))))
-           (sb-thread:wait-on-semaphore ready :timeout 10)
-           models)
+                          (sb-thread:signal-semaphore ready))))
+                    :on-exit (lambda (code) (declare (ignore code)) (sb-thread:signal-semaphore ready))))
+          (claude-write-line cp (json-string (jobj "type" "control_request" "request_id" "models"
+                                                   "request" (jobj "subtype" "initialize"))))
+          (sb-thread:wait-on-semaphore ready :timeout 10)
+          models)
       (when cp (stop-claude cp)))))
 
 ;;; Random identifiers
@@ -112,10 +112,10 @@ then the copy inside the Claude desktop app.")
         (handler-case
             (let* ((version (string-trim '(#\Newline #\Space)
                                          (uiop:run-program (list program "--version") :output :string
-                                                                                     :ignore-error-status t)))
+                                                           :ignore-error-status t)))
                    (output (uiop:run-program (list program "auth" "status") :output :string
-                                                                            :error-output :output
-                                                                            :ignore-error-status t))
+                                             :error-output :output
+                                             :ignore-error-status t))
                    ;; From the first brace: stderr notices can come first.
                    (auth (let ((start (position #\{ output)))
                            (and start (ignore-errors (parse-json (subseq output start))))))
@@ -178,7 +178,7 @@ then the copy inside the Claude desktop app.")
   (cond ((stringp content) content)
         ((vectorp content)
          (format nil "~{~a~^~%~}" (loop for block across content
-                                       when (equal (jget block "type") "text") collect (jget block "text"))))
+                                        when (equal (jget block "type") "text") collect (jget block "text"))))
         (t "")))
 
 (defun parse-claude-event (line)
@@ -190,50 +190,50 @@ since a message can hold several blocks. Nil for lines that are not JSON."
             (subagent (jtrue-p (jget json "parent_tool_use_id"))))
         (flet ((event (&rest args) (apply #'make-claude-event :subagent subagent args)))
           (cond
-            ((and (equal type "system") (equal (jget json "subtype") "init"))
-             (list (event :kind :init :session-id (jget json "session_id") :model (jget json "model")
-                          :data (loop for server in (jlist (jget json "mcp_servers"))
-                                      collect (cons (jget server "name") (jget server "status"))))))
-            ((equal type "stream_event")
-             (let* ((e (jget json "event")) (etype (jget e "type")))
-               (cond ((equal etype "message_start") (list (event :kind :message-start)))
-                     ((and (equal etype "content_block_delta") (equal (jget e "delta" "type") "text_delta"))
-                      (list (event :kind :text-delta :text (jget e "delta" "text"))))
-                     ((and (equal etype "content_block_start") (equal (jget e "content_block" "type") "tool_use"))
-                      (list (event :kind :tool-start :name (jget e "content_block" "name")
-                                   :id (jget e "content_block" "id")))))))
-            ((equal type "assistant")
-             (loop for block in (jlist (jget json "message" "content"))
-                   for btype = (jget block "type")
-                   when (equal btype "text") collect (event :kind :text :text (jget block "text"))
-                   when (equal btype "thinking") collect (event :kind :thinking :text (jget block "thinking"))
-                   when (equal btype "tool_use")
-                     collect (event :kind :tool-use :name (jget block "name") :id (jget block "id")
-                                    :input (jget block "input"))))
-            ((equal type "user")
-             (loop for block in (jlist (jget json "message" "content"))
-                   when (equal (jget block "type") "tool_result")
-                     collect (event :kind :tool-result :id (jget block "tool_use_id")
-                                    :text (content-text (jget block "content"))
-                                    :error (jtrue-p (jget block "is_error")))))
-            ((equal type "result")
-             (list (event :kind :result :text (let ((r (jget json "result"))) (if (stringp r) r ""))
-                          :error (or (jtrue-p (jget json "is_error"))
-                                     (not (equal (jget json "subtype") "success")))
-                          :cost (jget json "total_cost_usd") :duration (jget json "duration_ms")
-                          :session-id (jget json "session_id") :data (jget json "usage"))))
-            ((equal type "rate_limit_event")
-             (list (event :kind :rate-limit :data (jget json "rate_limit_info"))))
-            ;; With --permission-prompt-tool stdio, a tool that needs
-            ;; permission asks here; CLAUDE-ANSWER-PERMISSION answers.
-            ((and (equal type "control_request") (equal (jget json "request" "subtype") "can_use_tool"))
-             (list (event :kind :permission :id (jget json "request_id")
-                          :name (jget json "request" "tool_name") :input (jget json "request" "input")
-                          :text (let ((d (or (jget json "request" "description")
-                                             (jget json "request" "decision_reason"))))
-                                  (and (stringp d) d))
-                          :data (jget json "request"))))
-            (t (list (event :kind :other :data json)))))))))
+           ((and (equal type "system") (equal (jget json "subtype") "init"))
+            (list (event :kind :init :session-id (jget json "session_id") :model (jget json "model")
+                         :data (loop for server in (jlist (jget json "mcp_servers"))
+                                     collect (cons (jget server "name") (jget server "status"))))))
+           ((equal type "stream_event")
+            (let* ((e (jget json "event")) (etype (jget e "type")))
+              (cond ((equal etype "message_start") (list (event :kind :message-start)))
+                    ((and (equal etype "content_block_delta") (equal (jget e "delta" "type") "text_delta"))
+                     (list (event :kind :text-delta :text (jget e "delta" "text"))))
+                    ((and (equal etype "content_block_start") (equal (jget e "content_block" "type") "tool_use"))
+                     (list (event :kind :tool-start :name (jget e "content_block" "name")
+                                  :id (jget e "content_block" "id")))))))
+           ((equal type "assistant")
+            (loop for block in (jlist (jget json "message" "content"))
+                  for btype = (jget block "type")
+                  when (equal btype "text") collect (event :kind :text :text (jget block "text"))
+                  when (equal btype "thinking") collect (event :kind :thinking :text (jget block "thinking"))
+                  when (equal btype "tool_use")
+                  collect (event :kind :tool-use :name (jget block "name") :id (jget block "id")
+                                 :input (jget block "input"))))
+           ((equal type "user")
+            (loop for block in (jlist (jget json "message" "content"))
+                  when (equal (jget block "type") "tool_result")
+                  collect (event :kind :tool-result :id (jget block "tool_use_id")
+                                 :text (content-text (jget block "content"))
+                                 :error (jtrue-p (jget block "is_error")))))
+           ((equal type "result")
+            (list (event :kind :result :text (let ((r (jget json "result"))) (if (stringp r) r ""))
+                         :error (or (jtrue-p (jget json "is_error"))
+                                    (not (equal (jget json "subtype") "success")))
+                         :cost (jget json "total_cost_usd") :duration (jget json "duration_ms")
+                         :session-id (jget json "session_id") :data (jget json "usage"))))
+           ((equal type "rate_limit_event")
+            (list (event :kind :rate-limit :data (jget json "rate_limit_info"))))
+           ;; With --permission-prompt-tool stdio, a tool that needs
+           ;; permission asks here; CLAUDE-ANSWER-PERMISSION answers.
+           ((and (equal type "control_request") (equal (jget json "request" "subtype") "can_use_tool"))
+            (list (event :kind :permission :id (jget json "request_id")
+                         :name (jget json "request" "tool_name") :input (jget json "request" "input")
+                         :text (let ((d (or (jget json "request" "description")
+                                            (jget json "request" "decision_reason"))))
+                                 (and (stringp d) d))
+                         :data (jget json "request"))))
+           (t (list (event :kind :other :data json)))))))))
 
 ;;; The process
 
@@ -241,7 +241,7 @@ since a message can hold several blocks. Nil for lines that are not JSON."
   process session-id (stopped nil) (lock (sb-thread:make-mutex :name "claude stdin")))
 
 (defun start-claude (arguments &key program directory (deliver #'funcall) on-event on-stderr on-exit
-                                     environment)
+                               environment)
   "Start the CLI with ARGUMENTS in DIRECTORY. Through DELIVER, calls ON-EVENT
 with each CLAUDE-EVENT, ON-STDERR with each line of standard error, and
 ON-EXIT with the exit code."

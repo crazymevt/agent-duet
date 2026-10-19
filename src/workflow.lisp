@@ -22,7 +22,7 @@
 ;;;; other agent, or STOP-WORKFLOW. Work handed off goes unreviewed when the
 ;;;; one that ran out was to review it, and says so.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defparameter *default-max-rounds* 3)
 
@@ -296,9 +296,9 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                    (post workflow (loop-author loop) (loop-reviewer loop) text :work)
                    (if (loop-skip-review loop)
                        (progn (setf (loop-state loop) :unreviewed)
-                              (note workflow "~@[~a ~]done, not reviewed."
-                                    (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)))
-                              (check-finished workflow))
+                         (note workflow "~@[~a ~]done, not reviewed."
+                               (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)))
+                         (check-finished workflow))
                        (loop-review workflow loop)))))
           :role :work :loop loop))
 

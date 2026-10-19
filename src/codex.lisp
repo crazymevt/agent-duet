@@ -7,7 +7,7 @@
 ;;;; Unlike Cadre, which gives Codex its own reviewed tools, here Codex uses
 ;;;; its native ones (shell commands, file changes) inside its sandbox.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defvar *codex-program* nil
   "The Codex CLI. Nil: `codex` on PATH, then the copy bundled with ChatGPT.app.")
@@ -20,10 +20,10 @@
   (if *codex-program*
       (and (probe-file *codex-program*) *codex-program*)
       (or (ignore-errors
-            (let ((path (string-trim '(#\Newline #\Return #\Space #\Tab)
-                                     (uiop:run-program '("/bin/sh" "-c" "command -v codex")
-                                                       :output :string :error-output nil))))
-              (and (plusp (length path)) path)))
+           (let ((path (string-trim '(#\Newline #\Return #\Space #\Tab)
+                                    (uiop:run-program '("/bin/sh" "-c" "command -v codex")
+                                                      :output :string :error-output nil))))
+             (and (plusp (length path)) path)))
           (some (lambda (path)
                   (and (probe-file path) (namestring path)))
                 (list #P"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
@@ -109,23 +109,23 @@ call it off the GUI thread."
         (codex-send-json server (jobj "jsonrpc" "2.0" "id" id "method" method
                                       "params" (or params (jobj))))
       (error (e)
-        (sb-thread:with-mutex ((codex-lock server))
-          (remhash id (codex-pending server))
-          (setf (codex-pending-error pending) e (codex-pending-done pending) t))))
+             (sb-thread:with-mutex ((codex-lock server))
+               (remhash id (codex-pending server))
+               (setf (codex-pending-error pending) e (codex-pending-done pending) t))))
     ;; Poll briefly instead of waiting on a condition queue with a timeout:
     ;; SBCL may return from a timed condition-wait without holding the mutex.
     (loop
-      (when (sb-thread:with-mutex ((codex-lock server)) (codex-pending-done pending))
-        (return))
-      (when (>= (get-internal-real-time) deadline)
-        (sb-thread:with-mutex ((codex-lock server))
-          (unless (codex-pending-done pending)
-            (remhash id (codex-pending server))
-            (setf (codex-pending-error pending)
-                  (format nil "request timed out after ~d seconds" *codex-request-timeout*)
-                  (codex-pending-done pending) t)))
-        (return))
-      (sleep 0.01))
+     (when (sb-thread:with-mutex ((codex-lock server)) (codex-pending-done pending))
+       (return))
+     (when (>= (get-internal-real-time) deadline)
+       (sb-thread:with-mutex ((codex-lock server))
+         (unless (codex-pending-done pending)
+           (remhash id (codex-pending server))
+           (setf (codex-pending-error pending)
+                 (format nil "request timed out after ~d seconds" *codex-request-timeout*)
+                 (codex-pending-done pending) t)))
+       (return))
+     (sleep 0.01))
     (sb-thread:with-mutex ((codex-lock server))
       (when (codex-pending-error pending) (error "Codex app-server: ~a" (codex-pending-error pending)))
       (when (jget (codex-pending-result pending) "error")
@@ -219,52 +219,52 @@ the rest of the session) or :deny."
          (thread-id (jget params "threadId"))
          (turn-id (jget params "turnId")))
     (cond
-      ((equal method "turn/started")
-       (setf (codex-turn-id server) (jget params "turn" "id")))
-      ((equal method "item/agentMessage/delta")
-       (codex-deliver-event server (make-codex-event :kind :text-delta :text (jget params "delta")
-                                                     :thread-id thread-id :turn-id turn-id)))
-      ((equal method "item/started")
-       (let ((item (jget params "item")))
-         (when (member (jget item "type") *codex-activity-types* :test #'equal)
-           (codex-deliver-event server (make-codex-event :kind :activity :name (jget item "type")
-                                                         :id (jget item "id") :data item
-                                                         :text (codex-item-summary item)
-                                                         :thread-id thread-id :turn-id turn-id)))))
-      ((equal method "item/completed")
-       (let* ((item (jget params "item"))
-              (type (jget item "type")))
-         (cond ((equal type "agentMessage")
-                (codex-deliver-event server (make-codex-event :kind :text :text (or (jget item "text") "")
-                                                              :id (jget item "id")
-                                                              :thread-id thread-id :turn-id turn-id)))
-               ((member type *codex-activity-types* :test #'equal)
-                (codex-deliver-event server (make-codex-event :kind :activity-completed
-                                                              :id (jget item "id") :data item
-                                                              :name (codex-item-summary item)
-                                                              :text (codex-item-output item)
-                                                              :error (member (jget item "status")
-                                                                             '("failed" "declined" "cancelled")
-                                                                             :test #'equal)
-                                                              :thread-id thread-id :turn-id turn-id))))))
-      ((equal method "turn/completed")
-       (let* ((turn (jget params "turn"))
-              (status (jget turn "status")))
-         (setf (codex-turn-id server) nil)
-         (codex-deliver-event server (make-codex-event :kind :result :error (not (equal status "completed"))
-                                                       :text (let ((m (jget turn "error" "message")))
-                                                               (if (stringp m) m
-                                                                   (and (not (equal status "completed"))
-                                                                        (format nil "Turn ~a" status))))
-                                                       :turn-id (jget turn "id") :thread-id thread-id
-                                                       :data turn))))
-      ((equal method "account/rateLimits/updated")
-       (codex-deliver-event server (make-codex-event :kind :rate-limits :data (jget params "rateLimits"))))
-      ((equal method "error")
-       (codex-deliver-event server (make-codex-event :kind :stderr
-                                                     :text (format nil "~a" (or (jget params "error" "message")
-                                                                                (json-string params))))))
-      (t nil))))
+     ((equal method "turn/started")
+      (setf (codex-turn-id server) (jget params "turn" "id")))
+     ((equal method "item/agentMessage/delta")
+      (codex-deliver-event server (make-codex-event :kind :text-delta :text (jget params "delta")
+                                                    :thread-id thread-id :turn-id turn-id)))
+     ((equal method "item/started")
+      (let ((item (jget params "item")))
+        (when (member (jget item "type") *codex-activity-types* :test #'equal)
+          (codex-deliver-event server (make-codex-event :kind :activity :name (jget item "type")
+                                                        :id (jget item "id") :data item
+                                                        :text (codex-item-summary item)
+                                                        :thread-id thread-id :turn-id turn-id)))))
+     ((equal method "item/completed")
+      (let* ((item (jget params "item"))
+             (type (jget item "type")))
+        (cond ((equal type "agentMessage")
+               (codex-deliver-event server (make-codex-event :kind :text :text (or (jget item "text") "")
+                                                             :id (jget item "id")
+                                                             :thread-id thread-id :turn-id turn-id)))
+              ((member type *codex-activity-types* :test #'equal)
+               (codex-deliver-event server (make-codex-event :kind :activity-completed
+                                                             :id (jget item "id") :data item
+                                                             :name (codex-item-summary item)
+                                                             :text (codex-item-output item)
+                                                             :error (member (jget item "status")
+                                                                            '("failed" "declined" "cancelled")
+                                                                            :test #'equal)
+                                                             :thread-id thread-id :turn-id turn-id))))))
+     ((equal method "turn/completed")
+      (let* ((turn (jget params "turn"))
+             (status (jget turn "status")))
+        (setf (codex-turn-id server) nil)
+        (codex-deliver-event server (make-codex-event :kind :result :error (not (equal status "completed"))
+                                                      :text (let ((m (jget turn "error" "message")))
+                                                              (if (stringp m) m
+                                                                  (and (not (equal status "completed"))
+                                                                       (format nil "Turn ~a" status))))
+                                                      :turn-id (jget turn "id") :thread-id thread-id
+                                                      :data turn))))
+     ((equal method "account/rateLimits/updated")
+      (codex-deliver-event server (make-codex-event :kind :rate-limits :data (jget params "rateLimits"))))
+     ((equal method "error")
+      (codex-deliver-event server (make-codex-event :kind :stderr
+                                                    :text (format nil "~a" (or (jget params "error" "message")
+                                                                               (json-string params))))))
+     (t nil))))
 
 (defun codex-handle-line (server line)
   (let ((object (ignore-errors (parse-json line))))
@@ -311,16 +311,16 @@ the rest of the session) or :deny."
                      while line
                      do (handler-case (codex-handle-line server line)
                           (error (e)
-                            (codex-deliver-event server (make-codex-event :kind :protocol-error
-                                                                          :text (princ-to-string e)))))))
+                                 (codex-deliver-event server (make-codex-event :kind :protocol-error
+                                                                               :text (princ-to-string e)))))))
              (sb-ext:process-wait process)
              (codex-fail-pending server "the Codex app-server exited")
              (let ((exit-code (sb-ext:process-exit-code process)))
                (unwind-protect
-                    ;; Notify before draining stderr: descendants may still
-                    ;; hold that pipe open after the app-server has exited.
-                    (unless (codex-stopped server)
-                      (funcall deliver (lambda () (when on-exit (funcall on-exit exit-code)))))
+                   ;; Notify before draining stderr: descendants may still
+                   ;; hold that pipe open after the app-server has exited.
+                   (unless (codex-stopped server)
+                     (funcall deliver (lambda () (when on-exit (funcall on-exit exit-code)))))
                  (let ((stderr-thread (codex-stderr-thread server)))
                    (when (and stderr-thread (not (eq stderr-thread sb-thread:*current-thread*)))
                      (ignore-errors (sb-thread:join-thread stderr-thread :timeout 0.25 :default nil))
@@ -342,7 +342,7 @@ the rest of the session) or :deny."
   "Initialize SERVER once."
   (unless (codex-initialized server)
     (codex-request server "initialize"
-                   (jobj "clientInfo" (jobj "name" "agent-integration" "title" "Agent Duet" "version" "0.1")
+                   (jobj "clientInfo" (jobj "name" "agent-duet" "title" "Agent Duet" "version" "0.1")
                          ;; The extended surface: rate limits, among others.
                          "capabilities" (jobj "experimentalApi" t)))
     (codex-notify server "initialized")
@@ -426,7 +426,7 @@ the rest of the session) or :deny."
       (stop-codex-app-server server))))
 
 (defun codex-interrupt (server &key (thread-id (codex-thread-id server))
-                                   (turn-id (codex-turn-id server)))
+                               (turn-id (codex-turn-id server)))
   "Interrupt the given turn, by default the active one."
   (when (and thread-id turn-id)
     (codex-request server "turn/interrupt"

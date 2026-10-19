@@ -26,7 +26,7 @@
 ;;;; The model, effort and permission can change at any time; a turn uses
 ;;;; the ones in force when it starts.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defparameter *permissions* '(:ask :edits :full)
   ":ask — edit files in the directory; ask before running commands.
@@ -291,34 +291,34 @@ when it isn't running with the current settings."
       (:thinking (agent-emit agent :thinking :text (event-text event)))
       (:tool-start (agent-emit agent :tool :id (event-id event) :title (event-name event)))
       (:tool-use (agent-emit agent :tool :id (event-id event)
-                                         :title (claude-tool-title (event-name event) (event-input event))))
+                             :title (claude-tool-title (event-name event) (event-input event))))
       (:tool-result (agent-emit agent :tool-result :id (event-id event) :text (event-text event)
-                                                   :error (event-error event)))
+                                :error (event-error event)))
       (:permission
        (let ((id (event-id event)) (input (event-input event))
              (suggestions (jlist (jget (event-data event) "permission_suggestions"))))
          (cond
-           ((equal (event-name event) "AskUserQuestion")
-            (agent-ask-question agent id (jlist (jget input "questions"))
-                                (lambda (decision)
-                                  (when (claude-alive-p cp)
-                                    (if (consp decision)
-                                        (claude-answer-permission cp id t
-                                                                  :input (question-answer-input input (cdr decision)))
-                                        (claude-answer-permission cp id nil
-                                                                  :message "The user declined to answer."))))))
-           ;; The CLI asks here only so questions reach the user; outside Ask
-           ;; mode, anything else needing approval is refused as before.
-           ((not (eq (agent-permission agent) :ask))
-            (claude-answer-permission cp id nil :message "Permission to use this tool hasn't been granted."))
-           (t
-            (agent-ask-approval agent id (claude-approval-title (event-name event) input) (event-text event)
-                                (lambda (decision)
-                                  (when (claude-alive-p cp)
-                                    (claude-answer-permission cp id (not (eq decision :deny))
-                                                              :input input
-                                                              :always-rules (and (eq decision :always)
-                                                                                 suggestions)))))))))
+          ((equal (event-name event) "AskUserQuestion")
+           (agent-ask-question agent id (jlist (jget input "questions"))
+                               (lambda (decision)
+                                 (when (claude-alive-p cp)
+                                   (if (consp decision)
+                                       (claude-answer-permission cp id t
+                                                                 :input (question-answer-input input (cdr decision)))
+                                       (claude-answer-permission cp id nil
+                                                                 :message "The user declined to answer."))))))
+          ;; The CLI asks here only so questions reach the user; outside Ask
+          ;; mode, anything else needing approval is refused as before.
+          ((not (eq (agent-permission agent) :ask))
+           (claude-answer-permission cp id nil :message "Permission to use this tool hasn't been granted."))
+          (t
+           (agent-ask-approval agent id (claude-approval-title (event-name event) input) (event-text event)
+                               (lambda (decision)
+                                 (when (claude-alive-p cp)
+                                   (claude-answer-permission cp id (not (eq decision :deny))
+                                                             :input input
+                                                             :always-rules (and (eq decision :always)
+                                                                                suggestions)))))))))
       (:rate-limit
        (let ((info (event-data event)))
          (setf (claude-agent-limits agent) info)
@@ -419,9 +419,9 @@ server is stopped and forgotten, so the next turn starts again from scratch
 rather than using a server with no thread."
   (let ((ready nil))
     (unwind-protect
-         (progn
-           (codex-agent-setup-thread agent server)
-           (setf ready t))
+        (progn
+          (codex-agent-setup-thread agent server)
+          (setf ready t))
       (unless ready
         (when (eq server (codex-agent-server agent))
           (setf (codex-agent-server agent) nil))
@@ -429,20 +429,20 @@ rather than using a server with no thread."
 
 (defun codex-agent-setup-thread (agent server)
   (let ((instructions (collaboration-instructions agent)))
-          (if (codex-agent-thread-id agent)
-              (progn
-                (codex-initialize-app-server server)
-                (codex-request server "thread/resume"
-                               (jobj "threadId" (codex-agent-thread-id agent)
-                                     "cwd" (uiop:native-namestring (codex-directory server))
-                                     "sandbox" (codex-agent-sandbox agent)
-                                     "approvalPolicy" (codex-agent-approval-policy agent)
-                                     "developerInstructions" instructions))
-                (setf (codex-thread-id server) (codex-agent-thread-id agent)))
-              (setf (codex-agent-thread-id agent)
-                    (codex-start-thread server :model (agent-model agent) :instructions instructions
-                                               :sandbox (codex-agent-sandbox agent)
-                                               :approval-policy (codex-agent-approval-policy agent))))))
+    (if (codex-agent-thread-id agent)
+        (progn
+          (codex-initialize-app-server server)
+          (codex-request server "thread/resume"
+                         (jobj "threadId" (codex-agent-thread-id agent)
+                               "cwd" (uiop:native-namestring (codex-directory server))
+                               "sandbox" (codex-agent-sandbox agent)
+                               "approvalPolicy" (codex-agent-approval-policy agent)
+                               "developerInstructions" instructions))
+          (setf (codex-thread-id server) (codex-agent-thread-id agent)))
+        (setf (codex-agent-thread-id agent)
+              (codex-start-thread server :model (agent-model agent) :instructions instructions
+                                  :sandbox (codex-agent-sandbox agent)
+                                  :approval-policy (codex-agent-approval-policy agent))))))
 
 (defun codex-agent-event (agent server event)
   (when (eq server (codex-agent-server agent))
@@ -453,7 +453,7 @@ rather than using a server with no thread."
       (:activity (agent-emit agent :tool :id (codex-event-id event) :title (codex-event-text event)))
       (:activity-completed (agent-emit agent :tool :id (codex-event-id event) :title (codex-event-name event))
        (agent-emit agent :tool-result :id (codex-event-id event) :text (codex-event-text event)
-                                      :error (codex-event-error event)))
+                   :error (codex-event-error event)))
       (:approval
        (let ((id (codex-event-id event)) (params (codex-event-data event)))
          (agent-ask-approval agent id (codex-event-text event)
@@ -516,13 +516,13 @@ rather than using a server with no thread."
                (if (not (car token))
                    (stopped)
                    (let ((turn-id (jget (codex-start-turn server prompt :model model :effort effort
-                                                                        :approval-policy policy)
+                                                          :approval-policy policy)
                                         "turn" "id")))
                      (unless (car token)
                        (ignore-errors (codex-interrupt server :turn-id turn-id))))))
            (error (e)
-             (let ((why (princ-to-string e)))
-               (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
+                  (let ((why (princ-to-string e)))
+                    (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
        :name "codex turn"))))
 
 (defmethod agent-interrupt ((agent codex-agent))

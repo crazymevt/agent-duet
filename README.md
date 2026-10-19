@@ -1,4 +1,4 @@
-# agent-integration (Agent Duet)
+# agent-duet (Agent Duet)
 
 Claude and ChatGPT working on the same code, side by side, through their
 command-line tools: Claude Code (`claude -p`, stream-json) and Codex
@@ -107,10 +107,10 @@ starts it there and keeps the REPL. From a terminal:
 ```sh
 make run      # the agents work in the last folder used, or the current directory
 make dev      # with a Swank server on port 4005 for another editor's REPL
-make build    # bin/agent-integration
+make build    # bin/agent-duet
 ```
 
-Or `(agent-integration:main "/path/to/project/")` to choose the folder.
+Or `(agent-duet:main "/path/to/project/")` to choose the folder.
 
 ### As a Mac app
 

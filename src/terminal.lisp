@@ -9,7 +9,7 @@
 ;;;; The panel opens and closes with the Terminal button or Ctrl+`; closing
 ;;;; it keeps the shells running. New terminals start in the agents' folder.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defparameter *terminal-scrollback* 10000)
 
@@ -42,7 +42,7 @@
 (defmacro vte (name return-type &rest arguments)
   "Call the libvte (or GLib) function NAME: arguments as type, value pairs."
   `(gtk4.runtime:with-gtk-float-traps
-     (cffi:foreign-funcall-pointer (vte-symbol ,name) () ,@arguments ,return-type)))
+    (cffi:foreign-funcall-pointer (vte-symbol ,name) () ,@arguments ,return-type)))
 
 (defun vte-missing-message ()
   (format nil "The terminal needs VTE, GNOME's terminal widget~:[ (libvte for GTK 4, from your distribution)~; (brew install vte3)~]"
@@ -131,7 +131,7 @@ any variables of the same names."
       (loop for color in (cdr (assoc (if dark :dark :light) *terminal-palettes*)) for i from 0
             do (set-rgba colors i color))
       (vte "vte_terminal_set_colors" :void :pointer (term-pointer term) :pointer fg :pointer bg
-                                           :pointer colors :size 16)))
+           :pointer colors :size 16)))
   (vte "vte_terminal_set_scrollback_lines" :void :pointer (term-pointer term) :long *terminal-scrollback*))
 
 (defun restyle-terminals ()
@@ -148,15 +148,15 @@ any variables of the same names."
       (let ((argv (foreign-strv (term-command term)))
             (envp (foreign-strv (terminal-environment (sb-ext:posix-environ)))))
         (unwind-protect
-             (let ((ok (vte "g_spawn_async" :int
-                            :string (uiop:native-namestring (term-directory term))
-                            :pointer argv :pointer envp
-                            :int (logior 2 4) ; G_SPAWN_DO_NOT_REAP_CHILD, G_SPAWN_SEARCH_PATH
-                            :pointer (vte-symbol "vte_pty_child_setup") :pointer pty
-                            :pointer pid :pointer error)))
-               (when (zerop ok)
-                 (vte "g_object_unref" :void :pointer pty)
-                 (error "Couldn't start ~a: ~a" (first (term-command term)) (take-gerror error))))
+            (let ((ok (vte "g_spawn_async" :int
+                           :string (uiop:native-namestring (term-directory term))
+                           :pointer argv :pointer envp
+                           :int (logior 2 4) ; G_SPAWN_DO_NOT_REAP_CHILD, G_SPAWN_SEARCH_PATH
+                           :pointer (vte-symbol "vte_pty_child_setup") :pointer pty
+                           :pointer pid :pointer error)))
+              (when (zerop ok)
+                (vte "g_object_unref" :void :pointer pty)
+                (error "Couldn't start ~a: ~a" (first (term-command term)) (take-gerror error))))
           (free-strv argv)
           (free-strv envp)))
       ;; The terminal holds the pty now.
@@ -290,10 +290,10 @@ any variables of the same names."
 
 (defun add-terminal-tab (term)
   (let ((button (make-instance 'gtk:toggle-button :label (terminal-tab-label term)
-                                                  :css-classes '("flat")
-                                                  :tooltip-text (format nil "~{~a~^ ~}~%in ~a"
-                                                                        (term-command term)
-                                                                        (uiop:native-namestring (term-directory term))))))
+                               :css-classes '("flat")
+                               :tooltip-text (format nil "~{~a~^ ~}~%in ~a"
+                                                     (term-command term)
+                                                     (uiop:native-namestring (term-directory term))))))
     (let ((other (find-if #'term-button (remove term *terminals*))))
       (when other (gtk:toggle-button-set-group button (term-button other))))
     (gobject:connect button :toggled
@@ -333,32 +333,32 @@ any variables of the same names."
           *terminal-tabs* tabs)
     (gtk:stack-add-named stack
                          (gtk:build
-                           (gtk:box :orientation :vertical :valign :center :spacing 8
-                             (gtk:label :label "No terminal" :css-classes '("dim-label") :wrap t)
-                             (gtk:button :label "New Terminal" :halign :center :css-classes '("pill")
-                                         :on-clicked (lambda (b) (declare (ignore b)) (new-terminal)))))
+                          (gtk:box :orientation :vertical :valign :center :spacing 8
+                                   (gtk:label :label "No terminal" :css-classes '("dim-label") :wrap t)
+                                   (gtk:button :label "New Terminal" :halign :center :css-classes '("pill")
+                                               :on-clicked (lambda (b) (declare (ignore b)) (new-terminal)))))
                          "empty")
     (setf *terminal-panel*
           (gtk:build
-            (gtk:box :orientation :vertical :css-classes '("duet-terminal-panel") :visible nil
-              (gtk:box :spacing 4 :margin-start 8 :margin-end 6 :margin-top 2 :margin-bottom 2
-                (gtk:label :label "Terminal" :css-classes '("heading") :margin-end 6)
-                (gtk:scrolled-window :hscrollbar-policy :automatic :vscrollbar-policy :never
-                                     :hexpand t :child tabs)
-                (gtk:button :label "+ New" :css-classes '("flat")
-                            :tooltip-text "A new shell in the agents' folder"
-                            :on-clicked (lambda (b) (declare (ignore b)) (new-terminal)))
-                (gtk:button :label "Clear" :css-classes '("flat") :tooltip-text "Clear this terminal (⌘K)"
-                            :on-clicked (lambda (b) (declare (ignore b))
-                                          (let ((term *current-terminal*))
-                                            (when (and term (not (term-exited term))) (clear-terminal term)))))
-                (gtk:button :label "Kill" :css-classes '("flat") :tooltip-text "End this terminal's shell and close it"
-                            :on-clicked (lambda (b) (declare (ignore b))
-                                          (when *current-terminal* (kill-term *current-terminal*))))
-                (gtk:button :label "Hide" :css-classes '("flat") :tooltip-text "Hide the panel; the shells keep running (Ctrl+`)"
-                            :on-clicked (lambda (b) (declare (ignore b)) (set-terminal-visible nil))))
-              (gtk:separator)
-              stack)))))
+           (gtk:box :orientation :vertical :css-classes '("duet-terminal-panel") :visible nil
+                    (gtk:box :spacing 4 :margin-start 8 :margin-end 6 :margin-top 2 :margin-bottom 2
+                             (gtk:label :label "Terminal" :css-classes '("heading") :margin-end 6)
+                             (gtk:scrolled-window :hscrollbar-policy :automatic :vscrollbar-policy :never
+                                                  :hexpand t :child tabs)
+                             (gtk:button :label "+ New" :css-classes '("flat")
+                                         :tooltip-text "A new shell in the agents' folder"
+                                         :on-clicked (lambda (b) (declare (ignore b)) (new-terminal)))
+                             (gtk:button :label "Clear" :css-classes '("flat") :tooltip-text "Clear this terminal (⌘K)"
+                                         :on-clicked (lambda (b) (declare (ignore b))
+                                                       (let ((term *current-terminal*))
+                                                         (when (and term (not (term-exited term))) (clear-terminal term)))))
+                             (gtk:button :label "Kill" :css-classes '("flat") :tooltip-text "End this terminal's shell and close it"
+                                         :on-clicked (lambda (b) (declare (ignore b))
+                                                       (when *current-terminal* (kill-term *current-terminal*))))
+                             (gtk:button :label "Hide" :css-classes '("flat") :tooltip-text "Hide the panel; the shells keep running (Ctrl+`)"
+                                         :on-clicked (lambda (b) (declare (ignore b)) (set-terminal-visible nil))))
+                    (gtk:separator)
+                    stack)))))
 
 (defun terminal-visible-p ()
   (and *terminal-panel* (gtk:widget-get-visible *terminal-panel*)))

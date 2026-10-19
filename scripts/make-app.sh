@@ -17,7 +17,7 @@ sbcl=${SBCL:-sbcl}
 identity=${CODESIGN_IDENTITY:--}
 core=build/app/agent-duet.core
 app="build/Agent Duet.app"
-version=$(sed -n 's/.*:version "\([^"]*\)".*/\1/p' agent-integration.asd | head -1)
+version=$(sed -n 's/.*:version "\([^"]*\)".*/\1/p' agent-duet.asd | head -1)
 [ -f "$core" ] || { echo "No $core: run scripts/build-app.lisp first (make app does)" >&2; exit 1; }
 
 rm -rf "$app"

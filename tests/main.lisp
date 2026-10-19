@@ -1,17 +1,17 @@
 ;;;; tests/main.lisp
 
-(defpackage #:agent-integration/tests
+(defpackage #:agent-duet/tests
   (:use #:cl #:parachute)
-  (:local-nicknames (#:ai #:agent-integration)))
+  (:local-nicknames (#:ai #:agent-duet)))
 
-(in-package #:agent-integration/tests)
+(in-package #:agent-duet/tests)
 
-(define-test agent-integration)
+(define-test agent-duet)
 
 ;;; JSON and the CLIs' events
 
 (define-test json
-  :parent agent-integration
+    :parent agent-duet
   (let ((v (ai:parse-json "{\"a\": [1, 2.5, \"x\\n\"], \"b\": true, \"c\": null}")))
     (is equal 1 (ai:jget v "a" 0))
     (is = 2.5d0 (ai:jget v "a" 1))
@@ -21,7 +21,7 @@
   (is string= "{\"k\":\"v\",\"n\":[1,2]}" (ai:json-string (ai:jobj "k" "v" "n" #(1 2)))))
 
 (define-test claude-events
-  :parent agent-integration
+    :parent agent-duet
   (let ((events (ai::parse-claude-event
                  "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"Done.\",\"session_id\":\"s1\"}")))
     (is eq :result (ai::event-kind (first events)))
@@ -33,14 +33,14 @@
     (is string= "Hi" (ai::event-text (first events)))))
 
 (define-test claude-arguments
-  :parent agent-integration
+    :parent agent-duet
   (let ((args (ai::claude-arguments :session-id "s" :permission-mode "acceptEdits" :model "opus")))
     (true (search '("--permission-mode" "acceptEdits") args :test #'equal))
     (true (search '("--session-id" "s") args :test #'equal))
     (true (search '("--model" "opus") args :test #'equal))))
 
 (define-test codex-items
-  :parent agent-integration
+    :parent agent-duet
   (is string= "$ make test"
       (ai::codex-item-summary (ai:parse-json "{\"type\":\"commandExecution\",\"command\":\"make test\"}")))
   (is string= "Edit a.lisp, b.lisp"
@@ -50,7 +50,7 @@
 ;;; Approvals
 
 (define-test claude-permission
-  :parent agent-integration
+    :parent agent-duet
   (let ((event (first (ai::parse-claude-event
                        "{\"type\":\"control_request\",\"request_id\":\"r1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"make test\"},\"description\":\"Run the tests\",\"permission_suggestions\":[{\"type\":\"addRules\",\"rules\":[{\"toolName\":\"Bash\",\"ruleContent\":\"make test\"}],\"behavior\":\"allow\",\"destination\":\"localSettings\"}]}}"))))
     (is eq :permission (ai::event-kind event))
@@ -69,7 +69,7 @@
       (false (ai:jget answer "response" "response" "updatedPermissions")))))
 
 (define-test claude-question
-  :parent agent-integration
+    :parent agent-duet
   (let* ((event (first (ai::parse-claude-event
                         "{\"type\":\"control_request\",\"request_id\":\"q1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which database?\",\"header\":\"DB\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Relational\"},{\"label\":\"SQLite\",\"description\":\"Embedded\"}],\"multiSelect\":false}]}}}")))
          (input (ai::event-input event))
@@ -83,7 +83,7 @@
     (is string= "DB" (ai:jget answer "response" "response" "updatedInput" "questions" 0 "header"))))
 
 (define-test approvals
-  :parent agent-integration
+    :parent agent-duet
   (let* ((seen '())
          (answers '())
          (agent (make-instance 'fake-agent :id :claude :name "Claude" :replies '())))
@@ -103,7 +103,7 @@
 ;;; Codex models and usage
 
 (define-test codex-catalog
-  :parent agent-integration
+    :parent agent-duet
   (let ((model (ai:parse-json "{\"id\":\"gpt-x\",\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"high\"}]}")))
     (is equal '("low" "high") (ai::codex-model-efforts model)))
   (let ((buckets (ai::codex-rate-limits-from-response
@@ -116,21 +116,21 @@
 ;;; Settings
 
 (define-test settings
-  :parent agent-integration
+    :parent agent-duet
   (let ((file (merge-pathnames (format nil "duet-settings-~d.lisp" (random 1000000)) (uiop:temporary-directory)))
         (ai::*settings* '()))
     (unwind-protect
-         (progn
-           (setf (getf ai::*settings* :theme) :dark
-                 (getf ai::*settings* :recent-folders) '("/a/" "/b/"))
-           (setf (getf ai::*settings* :directory) (coerce "/c/" 'base-string))
-           (ai::save-settings file)
-           (false (search "#A" (uiop:read-file-string file)))
-           (setf ai::*settings* '())
-           (ai::load-settings file)
-           (is eq :dark (ai::setting :theme))
-           (is equal '("/a/" "/b/") (ai::setting :recent-folders))
-           (is equal "/c/" (ai::setting :directory)))
+        (progn
+          (setf (getf ai::*settings* :theme) :dark
+                (getf ai::*settings* :recent-folders) '("/a/" "/b/"))
+          (setf (getf ai::*settings* :directory) (coerce "/c/" 'base-string))
+          (ai::save-settings file)
+          (false (search "#A" (uiop:read-file-string file)))
+          (setf ai::*settings* '())
+          (ai::load-settings file)
+          (is eq :dark (ai::setting :theme))
+          (is equal '("/a/" "/b/") (ai::setting :recent-folders))
+          (is equal "/c/" (ai::setting :directory)))
       (ignore-errors (delete-file file)))
     ;; Unreadable settings are no settings, not an error.
     (with-open-file (out file :direction :output :if-exists :supersede) (write-string "(:theme #.(oops" out))
@@ -140,7 +140,7 @@
 ;;; Markdown
 
 (define-test markdown-blocks
-  :parent agent-integration
+    :parent agent-duet
   (let ((blocks (ai::markdown-blocks (format nil "# Title~%~%Some *text*.~%~%- [x] done~%- [ ] open~%~%| a | b |~%|:-:|--:|~%| 1 | 2 |~%~%```py~%x = 1~%```"))))
     (is equal '(:heading :paragraph :list :table :code) (mapcar #'first blocks))
     (is equal '(:done :open) (mapcar #'first (fourth (third blocks))))
@@ -156,27 +156,71 @@
     (is string= "one two" (car (second (first (second (first blocks)))))))
   ;; Not after a heading inside the quote.
   (is equal '(:quote :paragraph) (mapcar #'first (ai::markdown-blocks (format nil "> # Title~%text"))))
+  ;; Nor after other blocks that aren't paragraphs.
+  (dolist (text (list (format nil "> ```~%> x~%outside") (format nil ">     code~%outside")
+                      (format nil "> title~%> ===~%outside") (format nil "> one~%>~%outside")
+                      (format nil "> > one~%> >~%outside") (format nil "> | a |~%> |---|~%outside")))
+    (let ((blocks (ai::markdown-blocks text)))
+      (is equal '(:quote :paragraph) (mapcar #'first blocks))
+      (is string= "outside" (car (second (second blocks))))))
+  ;; A list item's paragraph inside the quote carries on too, over several lines.
+  (let* ((blocks (ai::markdown-blocks (format nil "> - one~%two~%three")))
+         (item (first (fourth (first (second (first blocks)))))))
+    (is equal '(:quote) (mapcar #'first blocks))
+    (is string= "one two three" (car (second (first (second item))))))
+  ;; Lazy lines carry on a nested quote's paragraph, and the outer quote's.
+  (let ((blocks (ai::markdown-blocks (format nil "> > one~%two~%> three~%four"))))
+    (is equal '(:quote) (mapcar #'first blocks))
+    (is equal '(:quote) (mapcar #'first (second (first blocks))))
+    (is string= "one two three four" (car (second (first (second (first (second (first blocks)))))))))
+  ;; Lines alternating with and without > make one paragraph.
+  (let ((blocks (ai::markdown-blocks (with-output-to-string (o) (dotimes (k 2000) (format o "> a~%b~%"))))))
+    (is = 1 (length blocks))
+    (is = 1 (length (second (first blocks)))))
   (is string= "risks-and-open-questions" (ai::heading-anchor "Risks and open questions?"))
   (is string= "  ab  " (ai::pad-cell "ab" 4 :center))
   (is string= " ab" (ai::pad-cell "ab" 1 :right))
   (is string= "ab " (ai::pad-cell "ab" 1 :left)))
 
+(define-test markdown-quote-linear-scanning :parent agent-duet
+  ;; Quotes that end early must not read the remaining document each time.
+  ;; Count source reads instead of elapsed time so the bound is deterministic.
+  (dolist (pattern '("> # heading~%outside~%" "> > one~%> >~%outside~%"
+                     "> ```~%> code~%outside~%"))
+    (let* ((count 2000)
+           (text (with-output-to-string (out)
+                   (dotimes (k count) (format out pattern))))
+           (lines (coerce (ai::split-text-lines text) 'vector))
+           (reads 0)
+           (blocks (ai::parse-line-blocks
+                    (lambda (k) (incf reads) (aref lines k))
+                    (lambda (k) (< k (length lines))) 0)))
+      (is = (* 2 count) (length blocks))
+      (true (loop for (quote paragraph) on blocks by #'cddr
+                  for n from 0
+                  always (and (eq :quote (first quote))
+                              (eq :paragraph (first paragraph))
+                              (string= "outside" (car (second paragraph)))
+                              (= (* n (if (search "heading" pattern) 2 3))
+                                 (car (last quote))))))
+      (true (< reads (* 20 count))))))
+
 (define-test markdown-files
-  :parent agent-integration
+    :parent agent-duet
   (let ((root (merge-pathnames (format nil "duet-md-~d/" (random 1000000)) (uiop:temporary-directory))))
     (unwind-protect
-         (progn
-           (dolist (f '("README.md" "notes.txt" "docs/DESIGN.md" "docs/deep/x.markdown" ".hidden/no.md" "node_modules/p/no.md"))
-             (let ((path (merge-pathnames f root)))
-               (ensure-directories-exist path)
-               (with-open-file (out path :direction :output :if-exists :supersede) (write-line "# x" out))))
-           (is equal '("README.md" "docs/deep/x.markdown" "docs/DESIGN.md") (ai::markdown-files root)))
+        (progn
+          (dolist (f '("README.md" "notes.txt" "docs/DESIGN.md" "docs/deep/x.markdown" ".hidden/no.md" "node_modules/p/no.md"))
+            (let ((path (merge-pathnames f root)))
+              (ensure-directories-exist path)
+              (with-open-file (out path :direction :output :if-exists :supersede) (write-line "# x" out))))
+          (is equal '("README.md" "docs/deep/x.markdown" "docs/DESIGN.md") (ai::markdown-files root)))
       (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
 
 ;;; Reading replies
 
 (define-test verdicts
-  :parent agent-integration
+    :parent agent-duet
   (is eq :approved (ai:review-verdict (format nil "Looks good.~%~%VERDICT: APPROVED")))
   (is eq :approved (ai:review-verdict (format nil "Fine~%**Verdict: approved**")))
   (is eq :changes (ai:review-verdict (format nil "1. Bug~%VERDICT: CHANGES REQUESTED")))
@@ -188,7 +232,7 @@
   (is eq :changes (ai:review-verdict (format nil "Reply VERDICT: APPROVED if...~%VERDICT: CHANGES REQUESTED"))))
 
 (define-test plans
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (lead partner)
       (ai:parse-plan (format nil "Here's the split.~%~%**LEAD TASK:**~%Write the parser.~%~%**PARTNER TASK:**~%Write the tests."))
     (is string= "Write the parser." lead)
@@ -224,17 +268,17 @@
          (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies codex-replies))
          (messages '())
          (workflow (make-instance 'ai:workflow :mode mode :lead claude :partner codex
-                                               :request "Add a frobnicate function" :max-rounds rounds
-                                               :on-message (lambda (from to text kind)
-                                                             (declare (ignore to))
-                                                             (push (list (if (symbolp from) from (ai:agent-name from))
-                                                                         kind text)
-                                                                   messages)))))
+                                  :request "Add a frobnicate function" :max-rounds rounds
+                                  :on-message (lambda (from to text kind)
+                                                (declare (ignore to))
+                                                (push (list (if (symbolp from) from (ai:agent-name from))
+                                                            kind text)
+                                                      messages)))))
     (ai:start-workflow workflow)
     (values workflow (reverse messages) claude codex)))
 
 (define-test review-approved
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (workflow messages claude codex)
       (run-fake :review
                 (list (says "Added frobnicate in a.lisp") (says "Fixed the off-by-one"))
@@ -250,7 +294,7 @@
     (true (search "Off by one" (first (fake-prompts claude))))))
 
 (define-test review-gives-up
-  :parent agent-integration
+    :parent agent-duet
   (let ((no (says (format nil "Still wrong~%VERDICT: CHANGES REQUESTED"))))
     (multiple-value-bind (workflow messages)
         (run-fake :review (list (says "v1") (says "v2")) (list no no) :rounds 2)
@@ -268,7 +312,7 @@ contains; the last of PAIRS (unpaired) otherwise."
           when (search key prompt) return reply)))
 
 (define-test divide-and-cross-review
-  :parent agent-integration
+    :parent agent-duet
   (let ((ok (format nil "Fine.~%VERDICT: APPROVED")))
     (multiple-value-bind (workflow messages claude codex)
         (run-fake :divide
@@ -290,7 +334,7 @@ contains; the last of PAIRS (unpaired) otherwise."
       (true (find "Wrote the tests" (fake-prompts claude) :test #'search)))))
 
 (define-test divide-alone
-  :parent agent-integration
+    :parent agent-duet
   (let ((ok (says (format nil "VERDICT: APPROVED"))))
     (let ((workflow (run-fake :divide
                               (list (says (format nil "LEAD TASK:~%Everything~%PARTNER TASK:~%NONE"))
@@ -300,7 +344,7 @@ contains; the last of PAIRS (unpaired) otherwise."
       (is = 1 (length (ai:workflow-loops workflow))))))
 
 (define-test failed-turn
-  :parent agent-integration
+    :parent agent-duet
   ;; Claude has no replies: its turn fails, and so does the workflow.
   (let ((workflow (run-fake :review '() '())))
     (is eq :finished (ai:workflow-state workflow))
@@ -313,7 +357,7 @@ contains; the last of PAIRS (unpaired) otherwise."
   (push prompt (fake-prompts agent)))
 
 (define-test cancel-ends-workflow-step
-  :parent agent-integration
+    :parent agent-duet
   ;; Stopping an agent mid-workflow (its Stop or New button, or a folder
   ;; change) must not leave the workflow running with nobody working.
   (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
@@ -326,7 +370,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))))
 
 (define-test cancel-ends-queued-steps
-  :parent agent-integration
+    :parent agent-duet
   ;; Queued prompts are workflow steps too.
   (let* ((agent (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
          (results '()))
@@ -340,7 +384,7 @@ contains; the last of PAIRS (unpaired) otherwise."
 ;;; Running out of usage
 
 (define-test usage-windows
-  :parent agent-integration
+    :parent agent-duet
   (let* ((info (ai:parse-json "{\"status\":\"allowed\",\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.56,\"resetsAt\":1792443000},\"seven_day\":{\"utilization\":0.27,\"resetsAt\":1792947600}}}"))
          (windows (ai::claude-usage-windows info)))
     (is string= "44% 5h / 73% 7d" (ai::usage-summary windows))
@@ -363,7 +407,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (true (search "3:05 PM" (ai::format-reset-time noon (+ noon (* 2 86400)))))))
 
 (define-test usage-exact-percentages
-  :parent agent-integration
+    :parent agent-duet
   ;; 99.6% of the week used is not the week used up: only the five-hour
   ;; window is, so it's that window's reset that counts.
   (let ((windows (ai::claude-usage-windows
@@ -379,7 +423,7 @@ contains; the last of PAIRS (unpaired) otherwise."
   (ai::claude-agent-event agent nil (ai::make-claude-event :kind :result :text text :error error)))
 
 (define-test claude-limit-evidence
-  :parent agent-integration
+    :parent agent-duet
   (let ((agent (make-instance 'ai:claude-agent))
         (errors '()))
     (flet ((turn (text)
@@ -408,15 +452,15 @@ contains; the last of PAIRS (unpaired) otherwise."
          (paused '())
          (notes '())
          (workflow (make-instance 'ai:workflow :mode mode :lead claude :partner codex :request "Add frobnicate"
-                                               :on-message (lambda (from to text kind)
-                                                             (declare (ignore to))
-                                                             (when (eq from :system) (push (list kind text) notes)))
-                                               :on-pause (lambda (w step) (declare (ignore w)) (push step paused)))))
+                                  :on-message (lambda (from to text kind)
+                                                (declare (ignore to))
+                                                (when (eq from :system) (push (list kind text) notes)))
+                                  :on-pause (lambda (w step) (declare (ignore w)) (push step paused)))))
     (ai:start-workflow workflow)
     (values workflow paused claude codex notes)))
 
 (define-test reviewer-out-then-unreviewed
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (workflow paused claude codex)
       (run-pausing :review (list (says "Wrote it")) (list (says :out-of-usage)))
     (declare (ignore claude codex))
@@ -432,7 +476,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (is eq :finished (ai:workflow-state workflow))))
 
 (define-test out-then-resumed
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (workflow paused)
       (run-pausing :review (list (says "Wrote it"))
                    (list (says :out-of-usage) (says (format nil "Fine.~%VERDICT: APPROVED"))))
@@ -441,7 +485,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))))
 
 (define-test author-out-then-taken-over
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (workflow paused claude codex)
       (run-pausing :review (list (says :out-of-usage)) (list (says "Took it over and wrote it")))
     (declare (ignore claude))
@@ -456,7 +500,7 @@ contains; the last of PAIRS (unpaired) otherwise."
       (is eq codex (ai::loop-author loop)))))
 
 (define-test plan-out-then-taken-over
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (workflow paused claude codex)
       (run-pausing :divide (list (says :out-of-usage)) (list (says "Did the whole thing")))
     (declare (ignore claude))
@@ -467,7 +511,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (is eq :unreviewed (ai::loop-state (first (ai:workflow-loops workflow))))))
 
 (define-test stop-while-paused
-  :parent agent-integration
+    :parent agent-duet
   (multiple-value-bind (workflow paused)
       (run-pausing :review (list (says "Wrote it")) (list (says :out-of-usage)))
     (ai:stop-workflow workflow)
@@ -478,7 +522,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (is eq :stopped (ai:workflow-state workflow))))
 
 (define-test out-agent-turns-prompts-away
-  :parent agent-integration
+    :parent agent-duet
   (let ((agent (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies (list (says "should not run"))))
         (result nil))
     (ai::agent-ran-out agent (+ (get-universal-time) 3600))
@@ -497,7 +541,7 @@ contains; the last of PAIRS (unpaired) otherwise."
 ;;; Codex against a fake app-server (tests/fake-codex, which needs python3)
 
 (defun fake-codex-program ()
-  (namestring (asdf:system-relative-pathname "agent-integration" "tests/fake-codex")))
+  (namestring (asdf:system-relative-pathname "agent-duet" "tests/fake-codex")))
 
 (defun wait-until (predicate &optional (seconds 10))
   (loop repeat (* seconds 50)
@@ -508,11 +552,11 @@ contains; the last of PAIRS (unpaired) otherwise."
 (defmacro with-fake-codex ((agent directory) &body body)
   `(let* ((,directory (merge-pathnames (format nil "duet-codex-~d/" (random 1000000)) (uiop:temporary-directory)))
           (,agent (make-instance 'ai:codex-agent :program (fake-codex-program) :directory ,directory
-                                                 :permission :edits)))
-     (ensure-directories-exist ,directory)
-     (unwind-protect (progn ,@body)
-       (ignore-errors (ai:agent-shutdown ,agent))
-       (uiop:delete-directory-tree ,directory :validate t :if-does-not-exist :ignore))))
+                                 :permission :edits)))
+    (ensure-directories-exist ,directory)
+    (unwind-protect (progn ,@body)
+      (ignore-errors (ai:agent-shutdown ,agent))
+      (uiop:delete-directory-tree ,directory :validate t :if-does-not-exist :ignore))))
 
 (defun touch (directory name)
   (with-open-file (out (merge-pathnames name directory) :direction :output :if-exists :supersede)
@@ -523,7 +567,7 @@ contains; the last of PAIRS (unpaired) otherwise."
     (if (probe-file file) (uiop:read-file-lines file) '())))
 
 (define-test codex-stop-while-starting
-  :parent agent-integration
+    :parent agent-duet
   (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
       (skip "python3 is needed for the fake Codex" (true t))
       (with-fake-codex (agent directory)
@@ -540,7 +584,7 @@ contains; the last of PAIRS (unpaired) otherwise."
           (true (second result))))))
 
 (define-test codex-retry-after-failed-start
-  :parent agent-integration
+    :parent agent-duet
   (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
       (skip "python3 is needed for the fake Codex" (true t))
       (with-fake-codex (agent directory)
@@ -555,11 +599,11 @@ contains; the last of PAIRS (unpaired) otherwise."
           (is = 2 (count "thread/start" (fake-log directory) :test #'string=))))))
 
 (define-test queueing
-  :parent agent-integration
+    :parent agent-duet
   ;; A prompt given while a turn runs waits for it.
   (let* ((results '())
          (agent (make-instance 'fake-agent :id :claude :name "Claude"
-                                           :replies (list (says "one") (says "two")))))
+                               :replies (list (says "one") (says "two")))))
     (setf (ai::agent-busy agent) t)
     (ai:agent-submit agent "first" (lambda (text error) (declare (ignore error)) (push text results)))
     (is equal '() (fake-prompts agent))

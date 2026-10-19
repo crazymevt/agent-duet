@@ -6,7 +6,7 @@
 ;;;; the user's request and each finished reply passed from one to the other.
 ;;;; Its box starts a workflow (workflow.lisp) with the chosen mode and lead.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defvar *window* nil)
 (defvar *claude* nil)
@@ -122,9 +122,9 @@
     (gobject:connect copy :clicked (lambda (b)
                                      (gdk:clipboard-set-text (gtk:widget-get-clipboard b) code)))
     (gtk:build
-      (gtk:box :orientation :vertical :css-classes '("duet-code")
-        (gtk:label :label code :xalign 0.0 :selectable t :wrap t :wrap-mode :char :css-classes '("monospace"))
-        (gtk:box :halign :end copy)))))
+     (gtk:box :orientation :vertical :css-classes '("duet-code")
+              (gtk:label :label code :xalign 0.0 :selectable t :wrap t :wrap-mode :char :css-classes '("monospace"))
+              (gtk:box :halign :end copy)))))
 
 (defun render-markdown (box text)
   "Fill BOX with TEXT, rendered."
@@ -132,7 +132,7 @@
     (gtk:box-append box (if (eq (first segment) :code)
                             (code-block-widget (second segment))
                             (let ((label (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t
-                                                                   :wrap-mode :word-char)))
+                                                        :wrap-mode :word-char)))
                               ;; Markup GTK can't parse would leave the label
                               ;; empty: show the text as it is instead.
                               (let ((markup (prose-markup (second segment))))
@@ -154,9 +154,9 @@
 
 (defun make-message-list ()
   (let* ((messages (make-instance 'gtk:box :orientation :vertical :spacing 10
-                                           :margin-start 12 :margin-end 12 :margin-top 8 :margin-bottom 8))
+                                  :margin-start 12 :margin-end 12 :margin-top 8 :margin-bottom 8))
          (scroller (make-instance 'gtk:scrolled-window :child messages :vexpand t :hexpand t
-                                                       :hscrollbar-policy :never)))
+                                  :hscrollbar-policy :never)))
     ;; The replies are selectable labels, so they can take the focus; the
     ;; viewport would then scroll to the one focused, often the first.
     (let ((viewport (gtk:scrolled-window-get-child scroller)))
@@ -167,8 +167,8 @@
     (gobject:connect (gtk:scrolled-window-get-vadjustment scroller) :changed
                      (lambda (adjustment)
                        (gtk:adjustment-set-value adjustment
-                                                (max 0d0 (- (gtk:adjustment-get-upper adjustment)
-                                                            (gtk:adjustment-get-page-size adjustment))))))
+                                                 (max 0d0 (- (gtk:adjustment-get-upper adjustment)
+                                                             (gtk:adjustment-get-page-size adjustment))))))
     (values messages scroller)))
 
 (defun pane-scroll-to-end (pane)
@@ -189,20 +189,20 @@
 
 (defun pane-note (pane text &rest classes)
   (pane-append pane (make-instance 'gtk:label :label text :wrap t :xalign 0.0 :selectable t
-                                              :wrap-mode :word-char
-                                              :css-classes (or classes '("dim-label")))))
+                                   :wrap-mode :word-char
+                                   :css-classes (or classes '("dim-label")))))
 
 (defun composer (input send)
   (gtk:build
-    (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 8
-      (gtk:frame :hexpand t
-        (gtk:scrolled-window :max-content-height 180 :propagate-natural-height t
-                             :hscrollbar-policy :never :child input))
-      send)))
+   (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 8
+            (gtk:frame :hexpand t
+                       (gtk:scrolled-window :max-content-height 180 :propagate-natural-height t
+                                            :hscrollbar-policy :never :child input))
+            send)))
 
 (defun make-input ()
   (make-instance 'gtk:text-view :wrap-mode :word-char :top-margin 6 :bottom-margin 6
-                                :left-margin 8 :right-margin 8 :accepts-tab nil))
+                 :left-margin 8 :right-margin 8 :accepts-tab nil))
 
 ;;; An agent's pane
 
@@ -256,11 +256,11 @@ agent's effort when the model has it."
       (setf (agent-effort agent) nil))
     (setf (agent-pane-refreshing pane) t)
     (unwind-protect
-         (progn
-           (setf (agent-pane-efforts pane) choices)
-           (gtk:drop-down-set-model dropdown (gtk:string-list-new (mapcar #'effort-label choices)))
-           (gtk:drop-down-set-selected dropdown (or (position (agent-effort agent) choices :test #'equal) 0))
-           (gtk:widget-set-sensitive dropdown (> (length choices) 1)))
+        (progn
+          (setf (agent-pane-efforts pane) choices)
+          (gtk:drop-down-set-model dropdown (gtk:string-list-new (mapcar #'effort-label choices)))
+          (gtk:drop-down-set-selected dropdown (or (position (agent-effort agent) choices :test #'equal) 0))
+          (gtk:widget-set-sensitive dropdown (> (length choices) 1)))
       (setf (agent-pane-refreshing pane) nil))))
 
 (defun set-model-choices (pane models)
@@ -270,21 +270,21 @@ for Codex, the one marked as the default)."
          (dropdown (agent-pane-model-dropdown pane)))
     (setf (agent-pane-refreshing pane) t)
     (unwind-protect
-         (progn
-           (setf (agent-pane-models pane) models)
-           (gtk:drop-down-set-model dropdown
-                                    (gtk:string-list-new
-                                     (or (mapcar (lambda (m) (model-choice-name agent m)) models)
-                                         '("Default model"))))
-           (let ((i (or (position (agent-model agent) models
-                                  :key (lambda (m) (model-choice-id agent m)) :test #'equal)
-                        (and (eq (agent-id agent) :codex)
-                             (position-if (lambda (m) (eq (jget m "isDefault") t)) models))
-                        0)))
-             (gtk:drop-down-set-selected dropdown i)
-             (when models
-               (setf (agent-model agent) (model-choice-id agent (nth i models)))))
-           (gtk:widget-set-sensitive dropdown (not (null models))))
+        (progn
+          (setf (agent-pane-models pane) models)
+          (gtk:drop-down-set-model dropdown
+                                   (gtk:string-list-new
+                                    (or (mapcar (lambda (m) (model-choice-name agent m)) models)
+                                        '("Default model"))))
+          (let ((i (or (position (agent-model agent) models
+                                 :key (lambda (m) (model-choice-id agent m)) :test #'equal)
+                       (and (eq (agent-id agent) :codex)
+                            (position-if (lambda (m) (eq (jget m "isDefault") t)) models))
+                       0)))
+            (gtk:drop-down-set-selected dropdown i)
+            (when models
+              (setf (agent-model agent) (model-choice-id agent (nth i models)))))
+          (gtk:widget-set-sensitive dropdown (not (null models))))
       (setf (agent-pane-refreshing pane) nil))
     (refresh-effort-dropdown pane)))
 
@@ -319,10 +319,10 @@ for Codex, the one marked as the default)."
 (defun make-agent-pane (agent)
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 0.0 :hexpand t :ellipsize :end :css-classes '("dim-label")
-                                             :label "Checking…"))
+                                  :label "Checking…"))
            (input (make-input))
            (send (make-instance 'gtk:button :label "Send" :valign :end :css-classes '("suggested-action")
-                                            :tooltip-text (format nil "Talk to ~a alone" (agent-name agent))))
+                                :tooltip-text (format nil "Talk to ~a alone" (agent-name agent))))
            (pane (new-agent-pane :agent agent :messages messages :scroller scroller
                                  :status status :input input :send send)))
       (flet ((send-it ()
@@ -338,19 +338,19 @@ for Codex, the one marked as the default)."
       (multiple-value-bind (models efforts) (make-model-dropdowns pane)
         (values pane
                 (gtk:build
-                  (gtk:box :orientation :vertical :css-classes '("duet-pane")
-                    (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6
-                      (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
-                      status
-                      (gtk:button :label "New" :css-classes '("flat")
-                                  :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
-                                  :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
-                    (gtk:box :spacing 6 :margin-start 10 :margin-end 10 :margin-top 4 :margin-bottom 6
-                      models efforts)
-                    (gtk:separator)
-                    scroller
-                    (gtk:separator)
-                    (composer input send))))))))
+                 (gtk:box :orientation :vertical :css-classes '("duet-pane")
+                          (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6
+                                   (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
+                                   status
+                                   (gtk:button :label "New" :css-classes '("flat")
+                                               :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
+                                               :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
+                          (gtk:box :spacing 6 :margin-start 10 :margin-end 10 :margin-top 4 :margin-bottom 6
+                                   models efforts)
+                          (gtk:separator)
+                          scroller
+                          (gtk:separator)
+                          (composer input send))))))))
 
 (defun agent-css-class (agent)
   (if (eq (agent-id agent) :claude) "duet-claude" "duet-codex"))
@@ -380,8 +380,8 @@ for Codex, the one marked as the default)."
                                          (agent-pane-version pane) usage
                                          (loop for w in windows
                                                when (window-resets-at w)
-                                                 collect (format nil "~a resets ~a" (window-label w)
-                                                                 (format-reset-time (window-resets-at w))))))))
+                                               collect (format nil "~a resets ~a" (window-label w)
+                                                               (format-reset-time (window-resets-at w))))))))
 
 (defun pane-set-busy (pane busy)
   (let ((agent (agent-pane-agent pane)))
@@ -416,14 +416,14 @@ for Codex, the one marked as the default)."
     (pane-finish-stream pane)
     (setf (gethash id (agent-pane-approvals pane)) buttons)
     (pane-append pane (gtk:build
-                        (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
-                          (gtk:label :label (format nil "~a asks to run:" (agent-name agent))
-                                     :xalign 0.0 :css-classes '("heading"))
-                          (gtk:label :label title :xalign 0.0 :wrap t :wrap-mode :char :selectable t
-                                     :css-classes '("monospace"))
-                          (gtk:label :label (or text "") :xalign 0.0 :wrap t :visible (and text (plusp (length text)) t)
-                                     :css-classes '("dim-label"))
-                          buttons)))
+                       (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                                (gtk:label :label (format nil "~a asks to run:" (agent-name agent))
+                                           :xalign 0.0 :css-classes '("heading"))
+                                (gtk:label :label title :xalign 0.0 :wrap t :wrap-mode :char :selectable t
+                                           :css-classes '("monospace"))
+                                (gtk:label :label (or text "") :xalign 0.0 :wrap t :visible (and text (plusp (length text)) t)
+                                           :css-classes '("dim-label"))
+                                buttons)))
     (pane-update-status pane)
     (when (workflow-running-p)
       (pane-note *middle* (format nil "~a is waiting for you to approve a command (~a pane)." (agent-name agent)
@@ -446,7 +446,7 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
         (when (and (stringp header) (plusp (length header)))
           (gtk:box-append box (make-instance 'gtk:label :label header :xalign 0.0 :css-classes '("caption-heading" "dim-label")))))
       (gtk:box-append box (make-instance 'gtk:label :label (or (jget question "question") "") :xalign 0.0 :wrap t
-                                                    :wrap-mode :word-char :selectable t))
+                                         :wrap-mode :word-char :selectable t))
       (dolist (option (jlist (jget question "options")))
         (let ((check (check (jget option "label")))
               (description (jget option "description")))
@@ -454,7 +454,7 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
           (gtk:box-append box check)
           (when (and (stringp description) (plusp (length description)))
             (gtk:box-append box (make-instance 'gtk:label :label description :xalign 0.0 :wrap t :wrap-mode :word-char
-                                                          :margin-start 28 :css-classes '("dim-label"))))))
+                                               :margin-start 28 :css-classes '("dim-label"))))))
       (let ((other (check "Other:"))
             (entry (make-instance 'gtk:entry :hexpand t :placeholder-text "Your own answer")))
         (gobject:connect entry :changed
@@ -479,9 +479,9 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
          (submit (make-instance 'gtk:button :label "Submit" :css-classes '("suggested-action") :sensitive nil))
          (skip (make-instance 'gtk:button :label "Skip" :tooltip-text "Don't answer; the agent carries on without it"))
          (card (gtk:build (gtk:box :orientation :vertical :spacing 10 :css-classes '("duet-approval")
-                            (gtk:label :label (format nil "~a has ~:[a question~;questions~]:" (agent-name agent)
-                                                      (rest questions))
-                                       :xalign 0.0 :css-classes '("heading")))))
+                                   (gtk:label :label (format nil "~a has ~:[a question~;questions~]:" (agent-name agent)
+                                                             (rest questions))
+                                              :xalign 0.0 :css-classes '("heading")))))
          (answers '())
          (boxes '()))
     (labels ((answers ()
@@ -527,7 +527,7 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
       (remhash id (agent-pane-approvals pane))
       (clear-box buttons)
       (gtk:box-append buttons (make-instance 'gtk:label :label (decision-text decision)
-                                                        :css-classes (if (eq decision :deny) '("error") '("dim-label"))))
+                                             :css-classes (if (eq decision :deny) '("error") '("dim-label"))))
       (pane-update-status pane))))
 
 (defun pane-finish-stream (pane)
@@ -559,13 +559,13 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
         (label (format nil "⚙ ~a" title)))
     (if entry
         (progn (gtk:label-set-text (gtk:expander-get-label-widget (car entry)) label)
-               (gtk:widget-set-tooltip-text (car entry) label))
+          (gtk:widget-set-tooltip-text (car entry) label))
         (let* ((result (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t :wrap-mode :char
-                                                 :css-classes '("monospace" "dim-label")))
+                                      :css-classes '("monospace" "dim-label")))
                ;; Ellipsized, so a long command doesn't widen the pane.
                (title-label (make-instance 'gtk:label :label label :xalign 0.0 :ellipsize :end :hexpand t))
                (expander (make-instance 'gtk:expander :label-widget title-label :child result
-                                                      :css-classes '("duet-tool") :tooltip-text label)))
+                                        :css-classes '("duet-tool") :tooltip-text label)))
           (pane-finish-stream pane)
           (setf (gethash id (agent-pane-tools pane)) (cons expander result))
           (pane-append pane expander)))))
@@ -583,17 +583,17 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
     (when (plusp (length text))
       (let* ((first-line (subseq text 0 (or (position #\Newline text) (length text))))
              (title (make-instance 'gtk:label :label (format nil "💭 ~a" first-line)
-                                              :xalign 0.0 :ellipsize :end :hexpand t)))
+                                   :xalign 0.0 :ellipsize :end :hexpand t)))
         (pane-finish-stream pane)
         (pane-append pane (make-instance 'gtk:expander :label-widget title
-                                                       :child (markdown-box text "dim-label")
-                                                       :css-classes '("duet-tool")))))))
+                                         :child (markdown-box text "dim-label")
+                                         :css-classes '("duet-tool")))))))
 
 (defun pane-prompt (pane text)
   (pane-finish-stream pane)
   (pane-append pane (gtk:build
-                      (gtk:box :halign :end :css-classes '("duet-prompt")
-                        (gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char)))))
+                     (gtk:box :halign :end :css-classes '("duet-prompt")
+                              (gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char)))))
 
 (defun agent-pane-event (agent kind &key text title id error busy decision questions)
   (let ((pane (agent-pane-of agent)))
@@ -659,12 +659,12 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
                                   (t "duet-from-codex")))))
         (pane-append *middle*
                      (gtk:build
-                       (gtk:box :orientation :vertical :spacing 4 :css-classes classes
-                                :halign (cond ((eq from :user) :center)
-                                              ((eq (agent-id from) :claude) :start)
-                                              (t :end))
-                         (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
-                         (markdown-box text)))))))
+                      (gtk:box :orientation :vertical :spacing 4 :css-classes classes
+                               :halign (cond ((eq from :user) :center)
+                                             ((eq (agent-id from) :claude) :start)
+                                             (t :end))
+                               (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
+                               (markdown-box text)))))))
 
 (defun control (name) (getf *controls* name))
 
@@ -798,13 +798,13 @@ usage after the turn) brings the Wait button."
       (push (cons step #'refresh) *pause-cards*)
       (pane-append *middle*
                    (gtk:build
-                     (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
-                       heading
-                       (gtk:label :label (format nil "~a is paused. Nothing done so far is lost."
-                                                 (string-capitalize (step-description step) :end 1))
-                                  :xalign 0.0 :wrap t)
-                       status
-                       buttons))))
+                    (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                             heading
+                             (gtk:label :label (format nil "~a is paused. Nothing done so far is lost."
+                                                       (string-capitalize (step-description step) :end 1))
+                                        :xalign 0.0 :wrap t)
+                             status
+                             buttons))))
     (update-controls)))
 
 (defun start-request ()
@@ -847,18 +847,18 @@ usage after the turn) brings the Wait button."
       (on-return input (lambda () (unless (workflow-running-p) (start-request))))
       (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; each side shows that agent's own work in full.~%~%Return starts; Shift+Return starts a new line."))
       (gtk:build
-        (gtk:box :orientation :vertical :css-classes '("duet-pane" "duet-middle")
-          (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-top 6 :margin-bottom 6
-            (gtk:label :label "Conversation" :css-classes '("heading"))
-            status)
-          (gtk:separator)
-          scroller
-          (gtk:separator)
-          (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6
-            mode lead
-            (gtk:label :label "Rounds" :css-classes '("dim-label") :margin-start 6)
-            rounds)
-          (composer input send))))))
+       (gtk:box :orientation :vertical :css-classes '("duet-pane" "duet-middle")
+                (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-top 6 :margin-bottom 6
+                         (gtk:label :label "Conversation" :css-classes '("heading"))
+                         status)
+                (gtk:separator)
+                scroller
+                (gtk:separator)
+                (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6
+                         mode lead
+                         (gtk:label :label "Rounds" :css-classes '("dim-label") :margin-start 6)
+                         rounds)
+                (composer input send))))))
 
 ;;; The folder, what the agents may do, and the look
 
@@ -908,19 +908,19 @@ usage after the turn) brings the Wait button."
                                                   (namestring *directory*)))
       (let* ((popover (make-instance 'gtk:popover))
              (list (make-instance 'gtk:box :orientation :vertical :spacing 2
-                                           :margin-start 4 :margin-end 4 :margin-top 4 :margin-bottom 4)))
+                                  :margin-start 4 :margin-end 4 :margin-top 4 :margin-bottom 4)))
         (flet ((item (label tooltip action)
                  (let ((b (make-instance 'gtk:button :css-classes '("flat")
-                                                     :child (make-instance 'gtk:label :label label :xalign 0.0
-                                                                                      :ellipsize :start
-                                                                                      :max-width-chars 60)
-                                                     :tooltip-text tooltip)))
+                                         :child (make-instance 'gtk:label :label label :xalign 0.0
+                                                               :ellipsize :start
+                                                               :max-width-chars 60)
+                                         :tooltip-text tooltip)))
                    (gobject:connect b :clicked (lambda (b) (declare (ignore b))
                                                  (gtk:popover-popdown popover)
                                                  (funcall action)))
                    (gtk:box-append list b))))
           (gtk:box-append list (make-instance 'gtk:label :label "Recent folders" :xalign 0.0
-                                                         :margin-start 6 :css-classes '("caption-heading" "dim-label")))
+                                              :margin-start 6 :css-classes '("caption-heading" "dim-label")))
           (dolist (path (setting :recent-folders))
             (unless (equal path (namestring *directory*))
               (let ((path path))
@@ -958,10 +958,10 @@ usage after the turn) brings the Wait button."
          (folder-label (make-instance 'gtk:label :ellipsize :start :max-width-chars 50))
          (folder (make-instance 'gtk:menu-button
                                 :child (gtk:build
-                                         (gtk:box :spacing 6
-                                           (gtk:label :label "Folder:" :css-classes '("dim-label"))
-                                           folder-label
-                                           (gtk:label :label "▾" :css-classes '("dim-label"))))))
+                                        (gtk:box :spacing 6
+                                                 (gtk:label :label "Folder:" :css-classes '("dim-label"))
+                                                 folder-label
+                                                 (gtk:label :label "▾" :css-classes '("dim-label"))))))
          (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
          (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*))))
     (gtk:drop-down-set-selected permission (or (position *permission* *permission-choices* :key #'first) 0))
@@ -980,9 +980,9 @@ usage after the turn) brings the Wait button."
     (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
     (gtk:header-bar-pack-start header folder)
     (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
-                                                      :tooltip-text "Show or hide the terminal panel (Ctrl+`)"))
+                                   :tooltip-text "Show or hide the terminal panel (Ctrl+`)"))
           (documents (make-instance 'gtk:button :label "Documents"
-                                                :tooltip-text "Preview the folder's Markdown files")))
+                                    :tooltip-text "Preview the folder's Markdown files")))
       (gobject:connect terminal :toggled
                        (lambda (b)
                          (let ((active (gtk:toggle-button-get-active b)))
@@ -1067,7 +1067,7 @@ usage after the turn) brings the Wait button."
     (".duet-code" :background-color "alpha(@view_fg_color, 0.07)" :border-radius "6px" :padding "6px")
     (".duet-tool" :opacity "0.8")
     (".duet-approval" :background-color "alpha(@warning_bg_color, 0.22)" :border-radius "8px" :padding "10px"
-                      :border "1px solid alpha(@warning_color, 0.5)")
+     :border "1px solid alpha(@warning_color, 0.5)")
     (".duet-message" :border-radius "10px" :padding ("8px" "12px"))
     (".duet-from-user" :background-color "alpha(@accent_bg_color, 0.18)")
     (".duet-from-claude" :background-color "alpha(#d97757, 0.16)" :margin-right "40px")
@@ -1079,16 +1079,26 @@ usage after the turn) brings the Wait button."
     (".duet-terminal" :padding ("2px" "6px") :font-family "Menlo, Monaco, monospace")))
 
 (defun setup-window-keys (window)
-  "Ctrl+` shows or hides the Terminal panel, wherever the focus is."
+  "Handle window shortcuts wherever the focus is, including the Terminal."
   (let ((keys (gtk:event-controller-key-new)))
     (gtk:event-controller-set-propagation-phase keys :capture)
     (gobject:connect keys :key-pressed
                      (lambda (c keyval keycode state)
                        (declare (ignore c keycode))
-                       (when (and (member (gdk:keyval-name keyval) '("grave" "dead_grave") :test #'string=)
-                                  (member :control-mask (modifier-list state)))
-                         (toggle-terminal)
-                         t)))
+                       (let ((key (gdk:keyval-name keyval))
+                             (modifiers (modifier-list state)))
+                         (cond
+                          ((and (string= key "q")
+                                (member :meta-mask modifiers)
+                                (not (intersection '(:control-mask :alt-mask :shift-mask) modifiers)))
+                           ;; Closing the window runs the normal cleanup for
+                           ;; agents, terminals and document previews before quit.
+                           (gtk:window-close window)
+                           t)
+                          ((and (member key '("grave" "dead_grave") :test #'string=)
+                                (member :control-mask modifiers))
+                           (toggle-terminal)
+                           t)))))
     (gtk:widget-add-controller window keys)))
 
 (defun apply-settings-to (agent)
@@ -1118,17 +1128,17 @@ usage after the turn) brings the Wait button."
         (setf *panes* (list (cons :claude claude-pane) (cons :codex codex-pane)))
         (let* ((middle (make-middle-pane))
                (inner (make-instance 'gtk:paned :orientation :horizontal :position 600
-                                                :shrink-start-child nil :shrink-end-child nil))
+                                     :shrink-start-child nil :shrink-end-child nil))
                (outer (make-instance 'gtk:paned :orientation :horizontal :position 420
-                                                :shrink-start-child nil :shrink-end-child nil)))
+                                     :shrink-start-child nil :shrink-end-child nil)))
           (gtk:paned-set-start-child inner middle)
           (gtk:paned-set-end-child inner codex-widget)
           (gtk:paned-set-start-child outer claude-widget)
           (gtk:paned-set-end-child outer inner)
           ;; The Terminal panel below the three panes, hidden until asked for.
           (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
-                                                    :shrink-start-child nil :shrink-end-child nil
-                                                    :resize-end-child nil)))
+                                         :shrink-start-child nil :shrink-end-child nil
+                                         :resize-end-child nil)))
             (gtk:paned-set-start-child vertical outer)
             (gtk:paned-set-end-child vertical (make-terminal-panel))
             (gtk:window-set-child window vertical)))))
@@ -1164,7 +1174,7 @@ the agents work (by default, the last folder used, or else the current
 directory). On macOS it must run on the first thread: in Cadre, use Run GTK App."
   (load-settings)
   (setf *directory* (and directory (uiop:ensure-directory-pathname directory)))
-  (let ((app (adw:application-new "org.example.agent_integration" '(:default-flags))))
+  (let ((app (adw:application-new "org.example.agent_duet" '(:default-flags))))
     (gobject:connect app :window-removed
                      (lambda (application window)
                        (declare (ignore window))

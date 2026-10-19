@@ -7,7 +7,7 @@
 ;;;; agent is writing can be watched as it grows. Drawing is Cadre's preview
 ;;;; (ui/markdown.lisp), on markdown.lisp's blocks.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defstruct docs
   window list search view title
@@ -52,8 +52,8 @@
     (preview-tag gtk-buffer "md-p-strike" :strikethrough t)
     (preview-tag gtk-buffer "md-p-code" :family "Monospace" :background "rgba(128,128,128,0.18)")
     (preview-tag gtk-buffer "md-p-codeblock" :family "Monospace" :left-margin 28 :right-margin 16
-                                             :paragraph-background "rgba(128,128,128,0.14)"
-                                             :pixels-above-lines 0 :pixels-below-lines 0 :wrap-mode :char)
+                 :paragraph-background "rgba(128,128,128,0.14)"
+                 :pixels-above-lines 0 :pixels-below-lines 0 :wrap-mode :char)
     (preview-tag gtk-buffer "md-p-link" :foreground "#4f8fe6" :underline :single)
     (preview-tag gtk-buffer "md-p-quote" :foreground "#8b8f96" :style :italic)
     (preview-tag gtk-buffer "md-p-rule" :foreground "#8b8f96")
@@ -185,7 +185,7 @@ paragraphs (in a list item); QUOTE styles them as quoted."
                                      (preview-insert (format nil "~%") (list (margin-tag gtk-buffer (1+ level) :hang t)))
                                      (preview-blocks (rest item-blocks) (1+ level) :tight t :quote quote))
                                    (progn (preview-insert (format nil "~%") nil)
-                                          (preview-blocks item-blocks (1+ level) :tight t :quote quote))))))))
+                                     (preview-blocks item-blocks (1+ level) :tight t :quote quote))))))))
                ;; Space between blocks, but not between a tight list's paragraphs.
                (unless (or (and tight (member (first block) '(:paragraph :list))) (eq (first block) :code)
                            (and (eq (first block) :list) more (eq (first (first more)) :list)))
@@ -328,15 +328,15 @@ their #anchors) in the preview; other files with their default application."
       (let ((slash (position #\/ file :from-end t)))
         (gtk:list-box-append list
                              (gtk:build
-                               (gtk:box :orientation :vertical :margin-start 8 :margin-end 8 :margin-top 4 :margin-bottom 4
-                                        :tooltip-text file
-                                 (gtk:label :label (if slash (subseq file (1+ slash)) file) :xalign 0.0 :ellipsize :end)
-                                 (gtk:label :label (if slash (subseq file 0 slash) "") :xalign 0.0 :ellipsize :start
-                                            :visible (and slash t) :css-classes '("caption" "dim-label")))))))
+                              (gtk:box :orientation :vertical :margin-start 8 :margin-end 8 :margin-top 4 :margin-bottom 4
+                                       :tooltip-text file
+                                       (gtk:label :label (if slash (subseq file (1+ slash)) file) :xalign 0.0 :ellipsize :end)
+                                       (gtk:label :label (if slash (subseq file 0 slash) "") :xalign 0.0 :ellipsize :start
+                                                  :visible (and slash t) :css-classes '("caption" "dim-label")))))))
     (select-shown-document docs)
     (when (null shown)
       (gtk:list-box-append list (make-instance 'gtk:label :label (if (docs-files docs) "No match" "No Markdown files here")
-                                                          :margin-top 12 :css-classes '("dim-label"))))))
+                                               :margin-top 12 :css-classes '("dim-label"))))))
 
 (defun refresh-documents (docs)
   "Find the folder's documents again."
@@ -351,8 +351,8 @@ their #anchors) in the preview; other files with their default application."
       (if first
           (show-document docs (document-path docs first))
           (progn (setf (docs-file docs) nil)
-                 (gtk:label-set-text (docs-title docs) "")
-                 (gtk:text-buffer-set-text (gtk:text-view-get-buffer (docs-view docs)) "" -1))))))
+            (gtk:label-set-text (docs-title docs) "")
+            (gtk:text-buffer-set-text (gtk:text-view-get-buffer (docs-view docs)) "" -1))))))
 
 (defun select-shown-document (docs)
   "Highlight the shown document in the list, if the filter lets it through."
@@ -362,9 +362,9 @@ their #anchors) in the preview; other files with their default application."
          (row (and index (gtk:list-box-get-row-at-index (docs-list docs) index))))
     (setf (docs-selecting docs) t)
     (unwind-protect
-         (if row
-             (gtk:list-box-select-row (docs-list docs) row)
-             (gtk:list-box-unselect-all (docs-list docs)))
+        (if row
+            (gtk:list-box-select-row (docs-list docs) row)
+            (gtk:list-box-unselect-all (docs-list docs)))
       (setf (docs-selecting docs) nil))))
 
 (defun show-document (docs path &key anchor)
@@ -391,12 +391,12 @@ their #anchors) in the preview; other files with their default application."
 
 (defun make-documents-window ()
   (let* ((window (make-instance 'gtk:window :title "Documents" :default-width 1100 :default-height 820
-                                            :hide-on-close t))
+                                :hide-on-close t))
          (search (make-instance 'gtk:search-entry :placeholder-text "Filter documents"
-                                                  :margin-start 8 :margin-end 8 :margin-top 8 :margin-bottom 6))
+                                :margin-start 8 :margin-end 8 :margin-top 8 :margin-bottom 6))
          (list (make-instance 'gtk:list-box :selection-mode :single :css-classes '("navigation-sidebar")))
          (view (make-instance 'gtk:text-view :editable nil :cursor-visible nil :wrap-mode :word-char
-                                             :left-margin 24 :right-margin 32 :top-margin 16 :bottom-margin 32))
+                              :left-margin 24 :right-margin 32 :top-margin 16 :bottom-margin 32))
          (title (make-instance 'gtk:label :xalign 0.0 :hexpand t :ellipsize :start :css-classes '("heading")))
          (docs (make-docs :window window :list list :search search :view view :title title)))
     (gobject:connect search :search-changed (lambda (e) (declare (ignore e)) (refill-document-list docs)))
@@ -412,23 +412,23 @@ their #anchors) in the preview; other files with their default application."
                            (when file (show-document docs (document-path docs file)))))))
     (setup-link-clicks docs)
     (let ((paned (make-instance 'gtk:paned :orientation :horizontal :position 280
-                                           :shrink-start-child nil :shrink-end-child nil)))
+                                :shrink-start-child nil :shrink-end-child nil)))
       (gtk:paned-set-start-child paned
                                  (gtk:build
-                                   (gtk:box :orientation :vertical
-                                     search
-                                     (gtk:scrolled-window :vexpand t :hscrollbar-policy :never :child list)
-                                     (gtk:button :label "Refresh list" :css-classes '("flat") :margin-bottom 6
-                                                 :tooltip-text "Look for Markdown files in the folder again"
-                                                 :on-clicked (lambda (b) (declare (ignore b)) (refresh-documents docs))))))
+                                  (gtk:box :orientation :vertical
+                                           search
+                                           (gtk:scrolled-window :vexpand t :hscrollbar-policy :never :child list)
+                                           (gtk:button :label "Refresh list" :css-classes '("flat") :margin-bottom 6
+                                                       :tooltip-text "Look for Markdown files in the folder again"
+                                                       :on-clicked (lambda (b) (declare (ignore b)) (refresh-documents docs))))))
       (gtk:paned-set-end-child paned
                                (gtk:build
-                                 (gtk:box :orientation :vertical
-                                   (gtk:box :spacing 8 :margin-start 16 :margin-end 12 :margin-top 8 :margin-bottom 8
-                                     title
-                                     (gtk:label :label "Preview · updates as the file changes" :css-classes '("dim-label")))
-                                   (gtk:separator)
-                                   (gtk:scrolled-window :vexpand t :hexpand t :hscrollbar-policy :never :child view))))
+                                (gtk:box :orientation :vertical
+                                         (gtk:box :spacing 8 :margin-start 16 :margin-end 12 :margin-top 8 :margin-bottom 8
+                                                  title
+                                                  (gtk:label :label "Preview · updates as the file changes" :css-classes '("dim-label")))
+                                         (gtk:separator)
+                                         (gtk:scrolled-window :vexpand t :hexpand t :hscrollbar-policy :never :child view))))
       (gtk:window-set-child window paned))
     (watch-document docs)
     docs))

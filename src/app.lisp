@@ -7,7 +7,7 @@
 ;;;; shell (as a terminal would have them: that's where claude, codex, git
 ;;;; and Homebrew's tools are found), then runs MAIN. As in Cadre.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defun state-directory ()
   "$XDG_STATE_HOME/agent-duet/, or ~/.local/state/agent-duet/."
@@ -58,7 +58,7 @@ entries each ended by a NUL (env -0). An alist of (name . value)."
               for entry = (subseq output position end)
               for equals = (position #\= entry)
               when (and equals (plusp equals))
-                collect (cons (subseq entry 0 equals) (subseq entry (1+ equals)))
+              collect (cons (subseq entry 0 equals) (subseq entry (1+ equals)))
               do (setf position (1+ end)))))))
 
 (defun login-shell-environment (&key (shell (or (uiop:getenv "SHELL") "/bin/zsh")) (timeout 10))
@@ -89,8 +89,8 @@ environment. Returns the number of variables set."
   (let ((count 0))
     (loop for (name . value) in (apply #'login-shell-environment arguments)
           unless (member name *environment-skipped-names* :test #'string=)
-            do (sb-posix:setenv name value 1)
-               (incf count))
+          do (sb-posix:setenv name value 1)
+             (incf count))
     count))
 
 ;;; The entry point
@@ -99,8 +99,8 @@ environment. Returns the number of variables set."
   "The folder named among ARGUMENTS (ignoring macOS's -psn_… and other options), or nil."
   (loop for argument in arguments
         unless (and (plusp (length argument)) (char= (char argument 0) #\-))
-          do (let ((path (uiop:directory-exists-p argument)))
-               (when path (return path)))))
+        do (let ((path (uiop:directory-exists-p argument)))
+             (when path (return path)))))
 
 (defun app-main ()
   "Run as an application: from the Finder, with the log and the login

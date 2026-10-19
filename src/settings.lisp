@@ -3,7 +3,7 @@
 ;;;; A plist in ~/.config/agent-duet/settings.lisp (or under
 ;;;; $XDG_CONFIG_HOME), read without evaluation.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defvar *settings* '() "The settings plist.")
 
@@ -20,7 +20,7 @@
                (when in
                  (with-standard-io-syntax
                    (let ((*read-eval* nil)
-                         (*package* (find-package '#:agent-integration)))
+                         (*package* (find-package '#:agent-duet)))
                      (let ((plist (read in nil nil)))
                        (and (listp plist) (evenp (length plist)) plist)))))))
             '())))
@@ -31,7 +31,7 @@
    (with-open-file (out file :direction :output :if-exists :supersede)
      (with-standard-io-syntax
        ;; Not readably: that would write base strings as #A(…) arrays.
-       (let ((*package* (find-package '#:agent-integration))
+       (let ((*package* (find-package '#:agent-duet))
              (*print-readably* nil))
          (prin1 *settings* out)
          (terpri out))))))

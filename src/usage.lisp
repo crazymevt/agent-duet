@@ -6,7 +6,7 @@
 ;;;; because the account is out of usage is recognized as such, with the time
 ;;;; it resets when that is known.
 
-(in-package #:agent-integration)
+(in-package #:agent-duet)
 
 (defstruct (window (:constructor make-window (label remaining resets-at)))
   label         ; "5h", "7d"
@@ -28,11 +28,11 @@
       (loop for (name . window) in (cdr windows)
             for used = (jget window "utilization")
             when (realp used)
-              collect (make-window (cond ((equal name "five_hour") "5h")
-                                         ((equal name "seven_day") "7d")
-                                         (t (substitute #\Space #\_ name)))
-                                   (clamp-percent (* 100 (- 1 used)))
-                                   (unix-to-universal (jget window "resetsAt")))))))
+            collect (make-window (cond ((equal name "five_hour") "5h")
+                                       ((equal name "seven_day") "7d")
+                                       (t (substitute #\Space #\_ name)))
+                                 (clamp-percent (* 100 (- 1 used)))
+                                 (unix-to-universal (jget window "resetsAt")))))))
 
 (defun codex-usage-windows (buckets)
   "Windows from Codex's rate-limit BUCKETS ((id . snapshot)s)."
@@ -42,10 +42,10 @@
                      for window = (jget bucket name)
                      for used = (jget window "usedPercent")
                      when (realp used)
-                       collect (make-window (format nil "~@[~a ~]~@[~a~]" (and several bucket-id)
-                                                    (rate-window-label (jget window "windowDurationMins")))
-                                            (clamp-percent (- 100 used))
-                                            (unix-to-universal (jget window "resetsAt"))))))
+                     collect (make-window (format nil "~@[~a ~]~@[~a~]" (and several bucket-id)
+                                                  (rate-window-label (jget window "windowDurationMins")))
+                                          (clamp-percent (- 100 used))
+                                          (unix-to-universal (jget window "resetsAt"))))))
 
 (defun usage-summary (windows)
   "What is left in WINDOWS, as \"72% 5h / 40% 7d\", or nil."
@@ -102,4 +102,4 @@ left: a window at 99.6% isn't, however it shows."
 (defun claude-limit-text-reset (text)
   "The reset time in an old-style \"Claude AI usage limit reached|<unix time>\" message, or nil."
   (let ((bar (and (stringp text) (position #\| text :from-end t))))
-    (and bar (unix-to-universal (ignore-errors (parse-integer text :start (1+ bar)))))))
+                                           (and bar (unix-to-universal (ignore-errors (parse-integer text :start (1+ bar)))))))
