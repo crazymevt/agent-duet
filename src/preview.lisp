@@ -16,6 +16,8 @@
   file                                  ; the document shown, a pathname
   (modified nil)                        ; its write date when drawn
   (text nil)                            ; its contents when drawn
+  (size nil)                            ; its size in bytes when drawn
+  (polls 0)                             ; times it has been checked for changes
   (links '())                           ; (start end url) in the preview
   (block-lines '())                     ; (source line . offset)
   (timer nil)
@@ -207,6 +209,7 @@ KEEP-SCROLL, or go to the top."
          (scroll (and keep-scroll (gtk:adjustment-get-value adjustment))))
     (ensure-preview-tags gtk-buffer)
     (setf (docs-modified docs) (ignore-errors (file-write-date path))
+          (docs-size docs) (ignore-errors (with-open-file (in path :element-type '(unsigned-byte 8)) (file-length in)))
           (docs-text docs) text)
     (let ((*preview* (list gtk-buffer '() '() (uiop:pathname-directory-pathname path))))
       (gtk:text-buffer-set-text gtk-buffer "" -1)
@@ -224,19 +227,27 @@ KEEP-SCROLL, or go to the top."
                        (gtk:adjustment-set-value adjustment (or scroll 0d0)))
                      nil))))
 
-(defparameter *largest-watched-document* (* 4 1024 1024)
-  "Documents bigger than this (in bytes) are redrawn only when their write date changes.")
+(defparameter *large-document* (* 4 1024 1024)
+  "Documents bigger than this (in bytes) have their contents compared only
+every *LARGE-DOCUMENT-CHECK-EVERY* polls, to keep the window responsive.")
+
+(defparameter *large-document-check-every* 5)
 
 (defun document-changed-p (docs)
   "Whether DOCS's file differs from what was drawn; its new contents too, when read.
 Write dates count only whole seconds, so the contents are compared as well:
-a save in the same second as the last drawing would be missed otherwise."
+a save in the same second as the last drawing would be missed otherwise.
+A large document is compared every few polls, and sooner if its date or size changes."
   (let* ((file (docs-file docs))
          (date (ignore-errors (file-write-date file)))
-         (size (ignore-errors (with-open-file (in file) (file-length in)))))
+         (size (ignore-errors (with-open-file (in file :element-type '(unsigned-byte 8)) (file-length in)))))
+    (incf (docs-polls docs))
     (cond ((null date) nil)                     ; gone, or unreadable for now
-          ((and size (> size *largest-watched-document*))
-           (not (eql date (docs-modified docs))))
+          ((and size (> size *large-document*)
+                (eql date (docs-modified docs))
+                (eql size (docs-size docs))
+                (plusp (mod (docs-polls docs) *large-document-check-every*)))
+           nil)
           (t (let ((text (read-document file)))
                (values (not (equal text (docs-text docs))) text))))))
 
