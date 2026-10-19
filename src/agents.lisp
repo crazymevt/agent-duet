@@ -106,6 +106,23 @@ says why)."
   (setf (agent-queue agent) (append (agent-queue agent) (list (cons prompt callback))))
   (unless (agent-busy agent) (agent-next agent)))
 
+(defgeneric agent-steer (agent prompt)
+  (:documentation "Deliver PROMPT to the running turn without interrupting it."))
+
+(defmethod agent-steer ((agent agent) prompt)
+  (declare (ignore prompt))
+  (error "This agent does not support sending while working."))
+
+(defun agent-send-now (agent prompt)
+  "Send a side-pane message, steering if busy. Preserve the running callback."
+  (if (agent-busy agent)
+      (progn
+        (unless (car (agent-turn-token agent))
+          (error "The agent is stopping; wait for it to finish."))
+        (agent-steer agent prompt)
+        (agent-emit agent :prompt :text prompt))
+      (agent-submit agent prompt)))
+
 (defun agent-next (agent)
   (let ((next (pop (agent-queue agent))))
     (when next
@@ -339,7 +356,10 @@ when it isn't running with the current settings."
            ;; This turn's reset time, replacing any earlier one.
            (agent-ran-out agent (or (claude-limit-text-reset text) (and (integerp hit) hit)))
            (setf error :out-of-usage))
-         (agent-turn-finished agent text error))))))
+         ;; Streaming input can leave another response queued in the CLI.
+         ;; Keep the workflow callback until that response has completed.
+         (unless (and (not error) (plusp (or (event-queued-turn-count event) 0)))
+           (agent-turn-finished agent text error)))))))
 
 (defmethod agent-usage-windows ((agent claude-agent))
   (claude-usage-windows (claude-agent-limits agent)))
@@ -355,6 +375,12 @@ when it isn't running with the current settings."
 
 (defmethod agent-begin-turn ((agent claude-agent) prompt)
   (claude-send (claude-agent-ensure-process agent) prompt))
+
+(defmethod agent-steer ((agent claude-agent) prompt)
+  ;; Use the current process: changing settings must not restart a busy CLI.
+  (let ((cp (claude-agent-process agent)))
+    (unless (claude-alive-p cp) (error "Claude is not ready to receive a message yet."))
+    (claude-send cp prompt)))
 
 (defmethod agent-interrupt ((agent claude-agent))
   (let ((cp (claude-agent-process agent)))
@@ -524,6 +550,23 @@ rather than using a server with no thread."
                   (let ((why (princ-to-string e)))
                     (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
        :name "codex turn"))))
+
+(defmethod agent-steer ((agent codex-agent) prompt)
+  (let* ((server (codex-agent-server agent))
+         (turn-id (and server (codex-turn-id server)))
+         (thread-id (and server (codex-thread-id server)))
+         (deliver (agent-deliver agent)))
+    (unless (and (codex-alive-p server) turn-id thread-id)
+      (error "Codex is still starting; send again when it begins responding."))
+    ;; JSON-RPC waits for acknowledgement, so keep it off the GUI thread.
+    ;; Capture both IDs: never steer a later workflow turn by accident.
+    (sb-thread:make-thread
+     (lambda ()
+       (handler-case (codex-steer-turn server prompt :thread-id thread-id :turn-id turn-id)
+         (error (e)
+           (let ((why (format nil "Could not send while working: ~a~%Message: ~a" e prompt)))
+             (funcall deliver (lambda () (agent-emit agent :note :text why)))))))
+     :name "codex steer")))
 
 (defmethod agent-interrupt ((agent codex-agent))
   (let ((server (codex-agent-server agent)))

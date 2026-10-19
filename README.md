@@ -13,6 +13,12 @@ The window has three panes:
 - **Right: ChatGPT.** The same, for Codex.
 
 Each side pane also has its own box for talking to that agent alone.
+While it works, press Return or **Send now** to send more instructions without
+stopping it. The agent picks them up when its protocol allows; a tool already
+running can finish first. **Stop** is a separate button. Messages sent while
+working use the current turn's model and permissions. If Codex is still starting,
+wait for it to begin responding and send again; a delivery failure is shown with
+the message text so you can retry.
 
 ## Working together
 

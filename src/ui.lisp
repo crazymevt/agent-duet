@@ -207,7 +207,7 @@
 ;;; An agent's pane
 
 (defstruct (agent-pane (:include pane) (:constructor new-agent-pane))
-  agent
+  agent stop
   (stream-box nil) (stream-label nil) (stream-text "")
   (tools (make-hash-table :test 'equal))
   (approvals (make-hash-table :test 'equal))  ; approval id → its card's button row
@@ -326,17 +326,20 @@ for Codex, the one marked as the default)."
            (input (make-input))
            (send (make-instance 'gtk:button :label "Send" :valign :end :css-classes '("suggested-action")
                                 :tooltip-text (format nil "Talk to ~a alone" (agent-name agent))))
-           (pane (new-agent-pane :agent agent :messages messages :scroller scroller
+           (stop (make-instance 'gtk:button :label "Stop" :valign :end :visible nil
+                                :css-classes '("destructive-action")
+                                :tooltip-text (format nil "Stop ~a" (agent-name agent))))
+           (pane (new-agent-pane :agent agent :stop stop :messages messages :scroller scroller
                                  :status status :input input :send send)))
       (flet ((send-it ()
-               (if (agent-busy agent)
-                   (agent-cancel agent)
-                   (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text input))))
-                     (when (plusp (length text))
-                       (clear-text-view input)
-                       (agent-submit agent text))))))
+               (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text input))))
+                 (when (plusp (length text))
+                   (handler-case
+                       (progn (agent-send-now agent text) (clear-text-view input))
+                     (error (e) (pane-note pane (princ-to-string e) "error")))))))
         (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (send-it)))
-        (on-return input (lambda () (unless (agent-busy agent) (send-it)))))
+        (gobject:connect stop :clicked (lambda (b) (declare (ignore b)) (agent-cancel agent)))
+        (on-return input #'send-it))
       (setf (agent-listener agent) #'agent-pane-event)
       (multiple-value-bind (models efforts) (make-model-dropdowns pane)
         (values pane
@@ -353,7 +356,9 @@ for Codex, the one marked as the default)."
                           (gtk:separator)
                           scroller
                           (gtk:separator)
-                          (composer input send))))))))
+                          (composer input
+                                    (gtk:build (gtk:box :orientation :vertical :spacing 6
+                                                       :valign :end send stop))))))))))
 
 (defun agent-css-class (agent)
   (if (eq (agent-id agent) :claude) "duet-claude" "duet-codex"))
@@ -388,10 +393,10 @@ for Codex, the one marked as the default)."
 
 (defun pane-set-busy (pane busy)
   (let ((agent (agent-pane-agent pane)))
-    (gtk:button-set-label (pane-send pane) (if busy "Stop" "Send"))
-    (gtk:widget-set-css-classes (pane-send pane) (if busy '("destructive-action") '("suggested-action")))
+    (gtk:button-set-label (pane-send pane) (if busy "Send now" "Send"))
+    (gtk:widget-set-visible (agent-pane-stop pane) busy)
     (gtk:widget-set-tooltip-text (pane-send pane)
-                                 (if busy (format nil "Stop ~a" (agent-name agent))
+                                 (if busy (format nil "Send to ~a while it keeps working" (agent-name agent))
                                      (format nil "Talk to ~a alone" (agent-name agent))))
     (pane-update-status pane)))
 

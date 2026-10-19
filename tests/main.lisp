@@ -640,3 +640,51 @@ contains; the last of PAIRS (unpaired) otherwise."
     (setf (ai::agent-busy agent) nil)
     (ai::agent-next agent)
     (is equal '("one") results)))
+
+
+(define-test codex-send-while-working
+    :parent agent-duet
+  (with-fake-codex (agent directory)
+    (let ((results nil))
+      (touch directory "await-steer")
+      (ai:agent-submit agent "original task"
+                       (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () (let ((server (ai::codex-agent-server agent)))
+                                    (and server (ai::codex-turn-id server))))))
+      (true (ai:agent-busy agent))
+      (ai:agent-send-now agent "focus on tests")
+      (true (wait-until (lambda () results)))
+      (is equal '(("steered reply" nil)) results)
+      (is string= "focus on tests" (uiop:read-file-string (merge-pathnames "steered" directory)))
+      (is = 1 (count "turn/start" (fake-log directory) :test #'equal))
+      (false (member "turn/interrupt" (fake-log directory) :test #'equal))
+      (false (ai::agent-queue agent)))))
+
+(define-test claude-streaming-completion
+    :parent agent-duet
+  ;; A result with another CLI response queued must not start the reviewer.
+  (let* ((agent (make-instance 'ai:claude-agent))
+         (cp (ai::make-claude-process))
+         (results nil))
+    (setf (ai::claude-agent-process agent) cp
+          (ai::agent-busy agent) t
+          (ai::agent-callback agent) (lambda (text error) (push (list text error) results)))
+    (flet ((result (text queued)
+             (first (ai::parse-claude-event
+                     (ai:json-string (ai:jobj "type" "result" "subtype" "success"
+                                              "result" text "queued_turn_count" queued))))))
+      (ai::claude-agent-event agent cp (result "first" 1))
+      (true (ai:agent-busy agent))
+      (false results)
+      (ai::claude-agent-event agent cp (result "updated" 0))
+      (false (ai:agent-busy agent))
+      (is equal '(("updated" nil)) results))))
+
+(define-test send-now-idle-and-stopping
+    :parent agent-duet
+  (let ((agent (make-instance 'hanging-agent :id :claude :name "Claude" :replies nil)))
+    (ai:agent-send-now agent "first")
+    (is equal '("first") (fake-prompts agent))
+    (ai:agent-cancel agent)
+    (fail (ai:agent-send-now agent "too late"))
+    (false (ai::agent-queue agent))))

@@ -36,9 +36,22 @@ for line in sys.stdin:
     elif method == "turn/start":
         send({"id": rid, "result": {"turn": {"id": "turn-1"}}})
         send({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+        if os.path.exists("await-steer"):
+            continue
         send({"method": "item/completed",
               "params": {"item": {"type": "agentMessage", "id": "m1", "text": "hi"}}})
         send({"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+    elif method == "turn/steer":
+        params = msg["params"]
+        assert params["expectedTurnId"] == "turn-1"
+        assert params["threadId"] == "thread-1"
+        with open("steered", "w") as out:
+            out.write(params["input"][0]["text"])
+        send({"id": rid, "result": {"turnId": "turn-1"}})
+        send({"method": "item/completed", "params": {"item": {
+            "type": "agentMessage", "id": "m2", "text": "steered reply"}}})
+        send({"method": "turn/completed", "params": {"turn": {
+            "id": "turn-1", "status": "completed"}}})
     elif method == "turn/interrupt":
         send({"id": rid, "result": {}})
     else:

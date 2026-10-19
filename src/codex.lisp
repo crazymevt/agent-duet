@@ -374,6 +374,16 @@ the rest of the session) or :deny."
                        "effort" (or effort :null)
                        "approvalPolicy" (or approval-policy :omit))))
 
+(defun codex-steer-params (thread-id turn-id text)
+  (unless (and thread-id turn-id) (error "Codex has no active turn"))
+  (jobj "threadId" thread-id "expectedTurnId" turn-id
+        "input" (vector (jobj "type" "text" "text" text))))
+
+(defun codex-steer-turn (server text &key (thread-id (codex-thread-id server))
+                                        (turn-id (codex-turn-id server)))
+  "Append input to exactly this active turn; never interrupt or start another."
+  (codex-request server "turn/steer" (codex-steer-params thread-id turn-id text)))
+
 ;;; Models and usage
 
 (defun codex-models-from-response (response)

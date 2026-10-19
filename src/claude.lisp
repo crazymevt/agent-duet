@@ -178,7 +178,7 @@ then the copy inside the Claude desktop app.")
   :permission  ID (the request's), NAME, INPUT, TEXT (why), DATA: the request
   :rate-limit  DATA: the account's usage (rate_limit_info)
   :other     DATA: the JSON"
-  kind text name id input error cost duration session-id model data subagent)
+  kind text name id input error cost duration session-id model data subagent queued-turn-count)
 
 (defun content-text (content)
   "A tool result's content (a string or an array of blocks) as text."
@@ -227,6 +227,7 @@ since a message can hold several blocks. Nil for lines that are not JSON."
             (list (event :kind :result :text (let ((r (jget json "result"))) (if (stringp r) r ""))
                          :error (or (jtrue-p (jget json "is_error"))
                                     (not (equal (jget json "subtype") "success")))
+                         :queued-turn-count (jget json "queued_turn_count")
                          :cost (jget json "total_cost_usd") :duration (jget json "duration_ms")
                          :session-id (jget json "session_id") :data (jget json "usage"))))
            ((equal type "rate_limit_event")
