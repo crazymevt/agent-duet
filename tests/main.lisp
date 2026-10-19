@@ -167,6 +167,9 @@
   (is eq :approved (ai:review-verdict (format nil "Fine~%**Verdict: approved**")))
   (is eq :changes (ai:review-verdict (format nil "1. Bug~%VERDICT: CHANGES REQUESTED")))
   (is eq :changes (ai:review-verdict "No verdict here"))
+  (is eq :changes (ai:review-verdict (format nil "Not yet.~%VERDICT: NOT APPROVED")))
+  (is eq :changes (ai:review-verdict (format nil "VERDICT: APPROVED WITH CHANGES")))
+  (is eq :approved (ai:review-verdict (format nil "VERDICT: APPROVED.")))
   ;; The last verdict counts: a review may quote the format first.
   (is eq :changes (ai:review-verdict (format nil "Reply VERDICT: APPROVED if...~%VERDICT: CHANGES REQUESTED"))))
 
@@ -284,6 +287,97 @@ contains; the last of PAIRS (unpaired) otherwise."
   (let ((workflow (run-fake :review '() '())))
     (is eq :finished (ai:workflow-state workflow))
     (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))))
+
+(defclass hanging-agent (fake-agent) ()
+  (:documentation "Starts turns and never finishes them, until cancelled."))
+
+(defmethod ai:agent-begin-turn ((agent hanging-agent) prompt)
+  (push prompt (fake-prompts agent)))
+
+(define-test cancel-ends-workflow-step
+  :parent agent-integration
+  ;; Stopping an agent mid-workflow (its Stop or New button, or a folder
+  ;; change) must not leave the workflow running with nobody working.
+  (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies '()))
+         (workflow (make-instance 'ai:workflow :mode :review :lead claude :partner codex :request "x")))
+    (ai:start-workflow workflow)
+    (is eq :running (ai:workflow-state workflow))
+    (ai:agent-cancel claude)
+    (is eq :finished (ai:workflow-state workflow))
+    (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))))
+
+(define-test cancel-ends-queued-steps
+  :parent agent-integration
+  ;; Queued prompts are workflow steps too.
+  (let* ((agent (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+         (results '()))
+    (ai:agent-submit agent "one" (lambda (text error) (push (list :one text error) results)))
+    (ai:agent-submit agent "two" (lambda (text error) (push (list :two text error) results)))
+    (ai:agent-cancel agent)
+    (is = 2 (length results))
+    (true (every #'third results))
+    (false (ai::agent-queue agent))))
+
+;;; Codex against a fake app-server (tests/fake-codex, which needs python3)
+
+(defun fake-codex-program ()
+  (namestring (asdf:system-relative-pathname "agent-integration" "tests/fake-codex")))
+
+(defun wait-until (predicate &optional (seconds 10))
+  (loop repeat (* seconds 50)
+        until (funcall predicate)
+        do (sleep 0.02))
+  (funcall predicate))
+
+(defmacro with-fake-codex ((agent directory) &body body)
+  `(let* ((,directory (merge-pathnames (format nil "duet-codex-~d/" (random 1000000)) (uiop:temporary-directory)))
+          (,agent (make-instance 'ai:codex-agent :program (fake-codex-program) :directory ,directory
+                                                 :permission :edits)))
+     (ensure-directories-exist ,directory)
+     (unwind-protect (progn ,@body)
+       (ignore-errors (ai:agent-shutdown ,agent))
+       (uiop:delete-directory-tree ,directory :validate t :if-does-not-exist :ignore))))
+
+(defun touch (directory name)
+  (with-open-file (out (merge-pathnames name directory) :direction :output :if-exists :supersede)
+    (write-line "" out)))
+
+(defun fake-log (directory)
+  (let ((file (merge-pathnames "log" directory)))
+    (if (probe-file file) (uiop:read-file-lines file) '())))
+
+(define-test codex-stop-while-starting
+  :parent agent-integration
+  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
+      (skip "python3 is needed for the fake Codex" (true t))
+      (with-fake-codex (agent directory)
+        (let ((result nil))
+          ;; Hold the app-server in initialize, stop the turn, then let it go.
+          (touch directory "hold")
+          (ai:agent-submit agent "do it" (lambda (text error) (setf result (list text error))))
+          (true (wait-until (lambda () (member "initialize" (fake-log directory) :test #'string=))))
+          (ai:agent-cancel agent)
+          (delete-file (merge-pathnames "hold" directory))
+          (true (wait-until (lambda () (not (ai:agent-busy agent)))))
+          (sleep 0.3)
+          (false (member "turn/start" (fake-log directory) :test #'string=))
+          (true (second result))))))
+
+(define-test codex-retry-after-failed-start
+  :parent agent-integration
+  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
+      (skip "python3 is needed for the fake Codex" (true t))
+      (with-fake-codex (agent directory)
+        (let ((results '()))
+          (touch directory "fail-thread-once")
+          (ai:agent-submit agent "first" (lambda (text error) (push (list text error) results)))
+          (true (wait-until (lambda () (= 1 (length results)))))
+          (true (second (first results)))       ; failed
+          (ai:agent-submit agent "second" (lambda (text error) (push (list text error) results)))
+          (true (wait-until (lambda () (= 2 (length results)))))
+          (is equal '("hi" nil) (first results))
+          (is = 2 (count "thread/start" (fake-log directory) :test #'string=))))))
 
 (define-test queueing
   :parent agent-integration

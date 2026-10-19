@@ -103,13 +103,15 @@ When you finish, ~a will review your part."
 ;;; Reading replies
 
 (defun review-verdict (text)
-  "From a review's TEXT: :approved, or :changes (also when there is no verdict line)."
+  "From a review's TEXT: :approved when its last verdict line says exactly
+APPROVED (give or take Markdown emphasis and punctuation), otherwise
+:changes. \"NOT APPROVED\", or no verdict at all, is :changes."
   (let ((at (search "VERDICT:" text :from-end t :test #'char-equal)))
-    (if at
-        (let ((line (string-upcase (subseq text at (or (position #\Newline text :start at) (length text))))))
-          (if (and (search "APPROVED" line) (not (search "CHANGES" line)))
-              :approved
-              :changes))
+    (if (and at (string-equal "APPROVED"
+                              (string-trim '(#\Space #\Tab #\Return #\* #\_ #\` #\. #\! #\")
+                                           (subseq text (+ at (length "VERDICT:"))
+                                                   (or (position #\Newline text :start at) (length text))))))
+        :approved
         :changes)))
 
 (defun clean-section (text)

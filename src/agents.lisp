@@ -43,6 +43,8 @@ read-only ones), Codex runs them in its sandbox without asking.
    (busy :initform nil :accessor agent-busy)
    (queue :initform '() :accessor agent-queue :documentation "Waiting (prompt . callback)s, oldest first")
    (callback :initform nil :accessor agent-callback :documentation "The running turn's")
+   (turn-token :initform (list nil) :accessor agent-turn-token
+               :documentation "(t) while the running turn may go on; AGENT-CANCEL makes it (nil)")
    (approvals :initform '() :accessor agent-approvals :documentation "Unanswered (id . answer-function)s")
    (stderr :initform '() :accessor agent-stderr :documentation "The last lines of standard error, newest first")))
 
@@ -77,7 +79,8 @@ says why)."
   (let ((next (pop (agent-queue agent))))
     (when next
       (setf (agent-busy agent) t
-            (agent-callback agent) (cdr next))
+            (agent-callback agent) (cdr next)
+            (agent-turn-token agent) (list t))
       (agent-emit agent :busy :busy t)
       (agent-emit agent :prompt :text (car next))
       (handler-case (agent-begin-turn agent (car next))
@@ -96,13 +99,23 @@ says why)."
           (error (e) (agent-emit agent :note :text (format nil "Error after ~a's turn: ~a" (agent-name agent) e)))))
       (unless (agent-busy agent) (agent-next agent)))))
 
+(defparameter *stopped-text* "Stopped by the user.")
+
 (defun agent-cancel (agent)
-  "Drop the waiting prompts and interrupt the running turn."
-  (setf (agent-queue agent) '())
-  (agent-deny-approvals agent)
-  (when (agent-busy agent)
-    (setf (agent-callback agent) nil)
-    (ignore-errors (agent-interrupt agent))))
+  "Drop the waiting prompts and interrupt the running turn. Whoever is
+waiting on them (a workflow) hears that they were stopped: told nothing,
+it would wait for ever."
+  (let ((waiting (mapcar #'cdr (agent-queue agent)))
+        (running (and (agent-busy agent) (agent-callback agent))))
+    (setf (agent-queue agent) '())
+    (setf (car (agent-turn-token agent)) nil)
+    (agent-deny-approvals agent)
+    (when (agent-busy agent)
+      (setf (agent-callback agent) nil)
+      (ignore-errors (agent-interrupt agent)))
+    (dolist (callback (remove nil (cons running waiting)))
+      (handler-case (funcall callback *stopped-text* t)
+        (error (e) (agent-emit agent :note :text (format nil "Error after stopping ~a: ~a" (agent-name agent) e)))))))
 
 ;;; Approvals
 
@@ -256,6 +269,7 @@ when it isn't running with the current settings."
     (when (claude-alive-p cp) (claude-interrupt cp))))
 
 (defmethod agent-shutdown ((agent claude-agent))
+  (setf (car (agent-turn-token agent)) nil)
   (let ((cp (claude-agent-process agent)))
     (setf (claude-agent-process agent) nil)
     (agent-deny-approvals agent)
@@ -304,7 +318,25 @@ running in the current directory and sandbox. Blocks: call it off the GUI thread
         (setf server new
               (codex-agent-server agent) new
               (codex-agent-config agent) config)
-        (let ((instructions (collaboration-instructions agent)))
+        (codex-agent-open-thread agent server)))
+    server))
+
+(defun codex-agent-open-thread (agent server)
+  "Start or resume the agent's thread on the new SERVER. If that fails, the
+server is stopped and forgotten, so the next turn starts again from scratch
+rather than using a server with no thread."
+  (let ((ready nil))
+    (unwind-protect
+         (progn
+           (codex-agent-setup-thread agent server)
+           (setf ready t))
+      (unless ready
+        (when (eq server (codex-agent-server agent))
+          (setf (codex-agent-server agent) nil))
+        (stop-codex-app-server server)))))
+
+(defun codex-agent-setup-thread (agent server)
+  (let ((instructions (collaboration-instructions agent)))
           (if (codex-agent-thread-id agent)
               (progn
                 (codex-initialize-app-server server)
@@ -318,8 +350,7 @@ running in the current directory and sandbox. Blocks: call it off the GUI thread
               (setf (codex-agent-thread-id agent)
                     (codex-start-thread server :model (agent-model agent) :instructions instructions
                                                :sandbox (codex-agent-sandbox agent)
-                                               :approval-policy (codex-agent-approval-policy agent)))))))
-    server))
+                                               :approval-policy (codex-agent-approval-policy agent))))))
 
 (defun codex-agent-event (agent server event)
   (when (eq server (codex-agent-server agent))
@@ -362,17 +393,30 @@ running in the current directory and sandbox. Blocks: call it off the GUI thread
   (let ((deliver (agent-deliver agent))
         (model (agent-model agent))
         (effort (agent-effort agent))
-        (policy (codex-agent-approval-policy agent)))
-    ;; Starting the app-server and the turn wait for replies: not on the GUI thread.
-    (sb-thread:make-thread
-     (lambda ()
-       (handler-case
-           (codex-start-turn (codex-agent-ensure-server agent) prompt
-                             :model model :effort effort :approval-policy policy)
-         (error (e)
-           (let ((why (princ-to-string e)))
-             (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
-     :name "codex turn")))
+        (policy (codex-agent-approval-policy agent))
+        (token (agent-turn-token agent)))
+    ;; Starting the app-server and the turn wait for replies: not on the GUI
+    ;; thread. A Stop meanwhile finds no turn to interrupt, so the token is
+    ;; checked before the turn starts, and again after, in case Stop came
+    ;; while it was starting.
+    (flet ((stopped ()
+             (funcall deliver (lambda () (when (eq token (agent-turn-token agent))
+                                           (agent-turn-finished agent *stopped-text* t))))))
+      (sb-thread:make-thread
+       (lambda ()
+         (handler-case
+             (let ((server (codex-agent-ensure-server agent)))
+               (if (not (car token))
+                   (stopped)
+                   (let ((turn-id (jget (codex-start-turn server prompt :model model :effort effort
+                                                                        :approval-policy policy)
+                                        "turn" "id")))
+                     (unless (car token)
+                       (ignore-errors (codex-interrupt server :turn-id turn-id))))))
+           (error (e)
+             (let ((why (princ-to-string e)))
+               (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
+       :name "codex turn"))))
 
 (defmethod agent-interrupt ((agent codex-agent))
   (let ((server (codex-agent-server agent)))
@@ -380,6 +424,7 @@ running in the current directory and sandbox. Blocks: call it off the GUI thread
       (sb-thread:make-thread (lambda () (ignore-errors (codex-interrupt server))) :name "codex interrupt"))))
 
 (defmethod agent-shutdown ((agent codex-agent))
+  (setf (car (agent-turn-token agent)) nil)
   (let ((server (codex-agent-server agent)))
     (setf (codex-agent-server agent) nil)
     (agent-deny-approvals agent)
