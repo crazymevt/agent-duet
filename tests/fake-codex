@@ -4,6 +4,7 @@
 Controlled by files in its working folder:
   hold              initialize waits while this exists
   fail-thread-once  thread/start fails once (the file is removed)
+  fail-resume       thread/resume fails
 Every method received is appended to the file `log`, one per line.
 """
 import json, os, sys, time
@@ -33,6 +34,11 @@ for line in sys.stdin:
             send({"id": rid, "error": {"code": -32000, "message": "temporary failure"}})
         else:
             send({"id": rid, "result": {"thread": {"id": "thread-1"}}})
+    elif method == "thread/resume":
+        if os.path.exists("fail-resume"):
+            send({"id": rid, "error": {"code": -32600, "message": "no rollout found"}})
+        else:
+            send({"id": rid, "result": {"thread": {"id": msg["params"]["threadId"]}}})
     elif method == "turn/start":
         send({"id": rid, "result": {"turn": {"id": "turn-1"}}})
         send({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}})

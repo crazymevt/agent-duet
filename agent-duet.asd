@@ -15,6 +15,7 @@
                (:file "codex")
                (:file "usage")
                (:file "settings")
+               (:file "history")
                (:file "agents")
                (:file "workflow")))
 
@@ -39,5 +40,7 @@
   :license "MIT"
   :depends-on ("agent-duet/core" "parachute")
   :components ((:module "tests"
-                :components ((:file "main"))))
+                :serial t
+                :components ((:file "main")
+                             (:file "history"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))

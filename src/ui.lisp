@@ -17,6 +17,7 @@
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
 (defvar *permission* :ask)
+(defvar *history* nil "The conversation being recorded (history.lisp); nil until something is said.")
 
 (defun deliver (thunk)
   (glib:call-in-main-thread thunk))
@@ -607,6 +608,7 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
 (defun agent-pane-event (agent kind &key text title id error busy decision questions)
   (let ((pane (agent-pane-of agent)))
     (when pane
+      (record-agent-event pane kind text id error)
       (ecase kind
         (:busy (pane-set-busy pane busy) (update-controls))
         (:prompt (pane-prompt pane text))
@@ -626,16 +628,183 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
            (pane-text pane (agent-pane-stream-text pane)))
          (when error (pane-note pane (or text "The turn failed.") "error")))))))
 
+(defun clear-agent-pane (pane)
+  (clear-box (pane-messages pane))
+  (clrhash (agent-pane-tools pane))
+  (clrhash (agent-pane-approvals pane))
+  (pane-finish-stream pane)
+  (pane-update-status pane))
+
 (defun new-conversation (agent)
+  "A new conversation with AGENT alone. The history goes on, AGENT's part
+of it now carried on from here."
   (agent-cancel agent)
   (agent-new-conversation agent)
   (let ((pane (agent-pane-of agent)))
-    (clear-box (pane-messages pane))
-    (clrhash (agent-pane-tools pane))
-    (clrhash (agent-pane-approvals pane))
-    (pane-finish-stream pane)
-    (pane-note pane "New conversation.")
-    (pane-update-status pane)))
+    (clear-agent-pane pane)
+    (pane-note pane "New conversation."))
+  (when *history*
+    (record (agent-id agent) :note "New conversation.")
+    (save-current-history)))
+
+;;; History: each conversation kept, to look back on and carry on (history.lisp)
+
+(defun record (who kind text)
+  "Add to the conversation's history. A prompt starts one if need be; what
+comes without one (a turn stopped as the folder changes) isn't kept."
+  (when (and *directory* (stringp text) (plusp (length text)))
+    (when (and (null *history*) (eq kind :prompt))
+      (setf *history* (make-history *directory*)))
+    (when *history*
+      (history-add-entry *history* who kind text))))
+
+(defun record-agent-event (pane kind text id error)
+  "Keep what an agent pane shows (but deltas, thinking and approvals)."
+  (let ((who (agent-id (agent-pane-agent pane))))
+    (case kind
+      (:prompt (record who :prompt text) (save-current-history))
+      (:text (record who :text text))
+      (:tool-result
+       ;; Recorded when it ends, by then with its full title.
+       (let ((entry (gethash id (agent-pane-tools pane))))
+         (when entry
+           (record who :tool (format nil "~a~:[~; — failed~]"
+                                     (string-left-trim "⚙ " (gtk:label-get-text (gtk:expander-get-label-widget (car entry))))
+                                     error)))))
+      (:note (record who :note text))
+      (:turn-done
+       ;; A reply that streamed but never finished its block.
+       (when (agent-pane-stream-box pane)
+         (record who :text (agent-pane-stream-text pane)))
+       (when error (record who :error (if (plusp (length text)) text "The turn failed.")))
+       (save-current-history)))))
+
+(defun save-current-history ()
+  "Save the history, with what resumes each agent's conversation."
+  (when *history*
+    (dolist (agent (list *claude* *codex*))
+      (setf (history-handle *history* (agent-id agent)) (agent-conversation-handle agent)))
+    (save-history *history*)))
+
+(defun finish-history ()
+  "Save the history; what is said next starts another."
+  (save-current-history)
+  (setf *history* nil))
+
+(defun agents-idle-p ()
+  (not (or (workflow-running-p) (agent-busy *claude*) (agent-busy *codex*))))
+
+(defun new-duet-conversation ()
+  "New conversations with both, and an empty history."
+  (if (not (agents-idle-p))
+      (pane-note *middle* "Stop the agents before starting a new conversation." "error")
+      (progn
+        (finish-history)
+        (dolist (agent (list *claude* *codex*))
+          (agent-new-conversation agent)
+          (clear-agent-pane (agent-pane-of agent)))
+        (clear-box (pane-messages *middle*))
+        (pane-note *middle* "New conversation."))))
+
+(defun replay-history (history)
+  "Show HISTORY's entries in the panes, as they were."
+  (dolist (entry (history-entries history))
+    (destructuring-bind (&key who kind text &allow-other-keys) entry
+      (case who
+        ((:claude :codex)
+         (let ((pane (cdr (assoc who *panes*))))
+           (case kind
+             (:prompt (pane-prompt pane text))
+             (:text (pane-text pane text))
+             (:tool (pane-note pane (format nil "⚙ ~a" text) "dim-label" "duet-tool"))
+             (:error (pane-note pane text "error"))
+             (t (pane-note pane text)))))
+        (:user (middle-bubble :user "You  ·  request" text))
+        (:middle
+         (case kind
+           (:text
+            ;; The header, as MIDDLE-MESSAGE wrote it, says whose it was.
+            (let* ((end (or (search (format nil "~%~%") text) (length text)))
+                   (header (subseq text 0 end)))
+              (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
+                                   ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
+                                   (t :user))
+                             header (string-left-trim '(#\Newline) (subseq text end)))))
+           (:error (pane-note *middle* text "error"))
+           (t (pane-note *middle* text "dim-label" "duet-note"))))))))
+
+(defun format-history-time (time)
+  (multiple-value-bind (s minute hour day month year) (decode-universal-time time)
+    (declare (ignore s))
+    (format nil "~d-~2,'0d-~2,'0d ~2,'0d:~2,'0d" year month day hour minute)))
+
+(defun open-history (id)
+  "Show conversation ID again; the agents carry it on from their next message."
+  ;; It may be this one, with entries not yet saved.
+  (save-current-history)
+  (let ((history (load-history id)))
+    (cond
+     ((not (agents-idle-p))
+      (pane-note *middle* "Stop the agents before opening another conversation." "error"))
+     ((null history)
+      (pane-note *middle* "That conversation couldn't be read." "error"))
+     ((not (uiop:directory-exists-p (history-directory history)))
+      (pane-note *middle* (format nil "That conversation's folder, ~a, is gone." (history-directory history)) "error"))
+     (t
+      (finish-history)
+      (set-directory (history-directory history))
+      (dolist (agent (list *claude* *codex*))
+        (agent-resume-conversation agent (history-handle history (agent-id agent)))
+        (clear-agent-pane (agent-pane-of agent)))
+      (clear-box (pane-messages *middle*))
+      (replay-history history)
+      (setf *history* history)
+      (pane-note *middle* (format nil "Carrying on the conversation from ~a. Each agent picks it up at its next message."
+                                  (format-history-time (history-updated history)))
+                 "dim-label" "duet-note")))))
+
+(defun fill-history-list (box popover)
+  (clear-box box)
+  (flet ((item (child tooltip action)
+           (let ((b (make-instance 'gtk:button :css-classes '("flat") :child child :tooltip-text tooltip)))
+             (gobject:connect b :clicked (lambda (b) (declare (ignore b))
+                                           (gtk:popover-popdown popover)
+                                           (funcall action)))
+             (gtk:box-append box b))))
+    (item (make-instance 'gtk:label :label "New conversation" :xalign 0.0)
+          "Start new conversations with both agents" #'new-duet-conversation)
+    (gtk:box-append box (make-instance 'gtk:separator))
+    (gtk:box-append box (make-instance 'gtk:label :label (format nil "Earlier in ~a" (folder-label *directory*))
+                                       :xalign 0.0 :margin-start 6 :ellipsize :start :max-width-chars 50
+                                       :css-classes '("caption-heading" "dim-label")))
+    (let ((summaries (list-histories :directory *directory* :limit 30)))
+      (unless summaries
+        (gtk:box-append box (make-instance 'gtk:label :label "Nothing yet" :xalign 0.0 :margin-start 6
+                                           :css-classes '("dim-label"))))
+      (dolist (summary summaries)
+        (let ((id (getf summary :id))
+              (title (or (getf summary :title) "Untitled")))
+          (item (gtk:build
+                 (gtk:box :orientation :vertical
+                          (gtk:label :label (format nil "~:[~;• ~]~a" (and *history* (equal id (history-id *history*))) title)
+                                     :xalign 0.0 :ellipsize :end :max-width-chars 50)
+                          (gtk:label :label (format nil "~a  ·  ~d entries" (format-history-time (getf summary :updated))
+                                                    (getf summary :entry-count))
+                                     :xalign 0.0 :css-classes '("caption" "dim-label"))))
+                title (lambda () (open-history id))))))))
+
+(defun make-history-button ()
+  (let* ((button (make-instance 'gtk:menu-button :label "History"
+                                :tooltip-text "Start a new conversation, or carry on an earlier one in this folder"))
+         (popover (make-instance 'gtk:popover))
+         (box (make-instance 'gtk:box :orientation :vertical :spacing 2
+                             :margin-start 4 :margin-end 4 :margin-top 4 :margin-bottom 4)))
+    (gtk:popover-set-child popover (make-instance 'gtk:scrolled-window :child box :hscrollbar-policy :never
+                                                  :max-content-height 480 :propagate-natural-height t))
+    ;; Read the saved conversations when the menu opens, not before.
+    (gobject:connect popover :show (lambda (p) (declare (ignore p)) (fill-history-list box popover)))
+    (gtk:menu-button-set-popover button popover)
+    button))
 
 ;;; The conversation between them
 
@@ -653,27 +822,35 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
     (:review "review")
     (t nil)))
 
+(defun middle-bubble (side header text)
+  "A message in the conversation, from SIDE: :user, :claude or :codex."
+  (pane-append *middle*
+               (gtk:build
+                (gtk:box :orientation :vertical :spacing 4
+                         :css-classes (list "duet-message" (ecase side
+                                                             (:user "duet-from-user")
+                                                             (:claude "duet-from-claude")
+                                                             (:codex "duet-from-codex")))
+                         :halign (ecase side (:user :center) (:claude :start) (:codex :end))
+                         (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
+                         (markdown-box text)))))
+
 (defun middle-message (from to text kind)
   (if (eq from :system)
-      (pane-note *middle* text "dim-label" "duet-note")
-      (let* ((header (format nil "~a → ~a~@[  ·  ~a~]" (participant-name from) (participant-name to)
-                             (let ((label (kind-label kind)))
-                               (if (eq kind :review)
-                                   (format nil "~a: ~(~a~)" label
-                                           (if (eq (review-verdict text) :approved) "approved" "changes requested"))
-                                   label))))
-             (classes (list "duet-message"
-                            (cond ((eq from :user) "duet-from-user")
-                                  ((eq (agent-id from) :claude) "duet-from-claude")
-                                  (t "duet-from-codex")))))
-        (pane-append *middle*
-                     (gtk:build
-                      (gtk:box :orientation :vertical :spacing 4 :css-classes classes
-                               :halign (cond ((eq from :user) :center)
-                                             ((eq (agent-id from) :claude) :start)
-                                             (t :end))
-                               (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
-                               (markdown-box text)))))))
+      (progn (pane-note *middle* text "dim-label" "duet-note")
+        (record :middle :note text))
+      (let ((header (format nil "~a → ~a~@[  ·  ~a~]" (participant-name from) (participant-name to)
+                            (let ((label (kind-label kind)))
+                              (if (eq kind :review)
+                                  (format nil "~a: ~(~a~)" label
+                                          (if (eq (review-verdict text) :approved) "approved" "changes requested"))
+                                  label)))))
+        (middle-bubble (if (eq from :user) :user (agent-id from)) header text)
+        ;; The request is the conversation's title; the rest keep their header.
+        (if (eq from :user)
+            (record :user :prompt text)
+            (record :middle :text (format nil "~a~%~%~a" header text)))
+        (save-current-history))))
 
 (defun control (name) (getf *controls* name))
 
@@ -884,12 +1061,18 @@ usage after the turn) brings the Wait button."
   (let ((directory (uiop:ensure-directory-pathname directory))
         (first-time (null *directory*)))
     (unless (equal directory *directory*)
+      ;; Stop the agents while the history is still theirs, so what they
+      ;; were saying is kept, with what resumes it; then put it away.
+      (dolist (agent (list *claude* *codex*))
+        (when agent
+          (agent-cancel agent)
+          (agent-shutdown agent)))
+      (finish-history)
       (setf *directory* directory)
       (note-recent-folder directory)
       (setf (setting :directory) (namestring directory))
       (dolist (agent (list *claude* *codex*))
         (when agent
-          (agent-cancel agent)
           (agent-new-conversation agent)
           (setf (agent-directory agent) directory)
           (unless first-time
@@ -1000,7 +1183,8 @@ usage after the turn) brings the Wait button."
       (gobject:connect documents :clicked (lambda (b) (declare (ignore b)) (show-documents)))
       (setf *controls* (list* :terminal terminal *controls*))
       (gtk:header-bar-pack-start header terminal)
-      (gtk:header-bar-pack-start header documents))
+      (gtk:header-bar-pack-start header documents)
+      (gtk:header-bar-pack-start header (make-history-button)))
     (gtk:header-bar-pack-end header theme)
     (gtk:header-bar-pack-end header permission)
     header))
@@ -1161,6 +1345,7 @@ usage after the turn) brings the Wait button."
       (setf *directory* nil)
       (set-directory directory))
     (update-controls)
+    (prune-histories)
     (check-agents)
     ;; Usage resets with nothing else happening: keep the status lines current.
     (glib:timeout-add-seconds glib:+priority-default+ 30
@@ -1172,6 +1357,7 @@ usage after the turn) brings the Wait button."
                        (dolist (agent (list *claude* *codex*))
                          (ignore-errors (agent-cancel agent))
                          (ignore-errors (agent-shutdown agent)))
+                       (ignore-errors (finish-history))
                        (ignore-errors (kill-all-terminals))
                        (ignore-errors (close-documents))
                        nil))

@@ -91,9 +91,17 @@ read-only ones), Codex runs them in its sandbox without asking.
 (defgeneric agent-new-conversation (agent)
   (:documentation "End the agent's process and forget its conversation."))
 
+(defgeneric agent-conversation-handle (agent)
+  (:documentation "What resumes the agent's conversation (Claude's session, Codex's thread), or nil."))
+
+(defgeneric agent-resume-conversation (agent handle)
+  (:documentation "End the agent's process; its next turn carries on the conversation HANDLE
+(from AGENT-CONVERSATION-HANDLE), or starts a new one when HANDLE is nil."))
+
 (defmethod agent-interrupt ((agent agent)) nil)
 (defmethod agent-shutdown ((agent agent)) nil)
 (defmethod agent-new-conversation ((agent agent)) (agent-shutdown agent))
+(defmethod agent-conversation-handle ((agent agent)) nil)
 
 (defun agent-emit (agent kind &rest plist)
   (when (agent-listener agent)
@@ -238,6 +246,8 @@ Running a command may need the user's approval; if one is denied, carry on witho
    (session-id :initform nil :accessor claude-agent-session-id)
    (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume")
    (limits :initform nil :accessor claude-agent-limits :documentation "The last rate_limit_info")
+   (prompts :initform '() :accessor claude-agent-prompts
+            :documentation "The running turn's prompt and what was sent while it ran, to send again")
    (limit-hit :initform nil :accessor claude-agent-limit-hit
               :documentation "Set when this turn's rate_limit_event said rejected: its reset, or :unknown"))
   (:default-initargs :id :claude :name "Claude" :partner-name "ChatGPT" :model *claude-model*))
@@ -346,20 +356,41 @@ when it isn't running with the current settings."
                (agent-ran-out agent reset))
              (progn (agent-has-usage agent) (agent-emit agent :usage)))))
       (:result
-       ;; Out of usage only on this turn's evidence (its rate_limit_event
-       ;; said rejected, or its error says so), never on what an earlier
-       ;; turn left behind: a later sign-in failure is a sign-in failure.
-       (let* ((text (event-text event))
-              (error (event-error event))
-              (hit (shiftf (claude-agent-limit-hit agent) nil)))
-         (when (and error (or hit (claude-limit-text-p text)))
-           ;; This turn's reset time, replacing any earlier one.
-           (agent-ran-out agent (or (claude-limit-text-reset text) (and (integerp hit) hit)))
-           (setf error :out-of-usage))
-         ;; Streaming input can leave another response queued in the CLI.
-         ;; Keep the workflow callback until that response has completed.
-         (unless (and (not error) (plusp (or (event-queued-turn-count event) 0)))
-           (agent-turn-finished agent text error)))))))
+       (if (and (event-error event) (search "No conversation found" (event-text event)))
+           (claude-agent-resume-failed agent cp (event-text event))
+           (claude-agent-result agent event))))))
+
+(defun claude-agent-resume-failed (agent cp why)
+  "The CLI hasn't the session it was to resume (deleted, or made in another
+folder): carry on the turn in a new conversation."
+  (setf (claude-agent-session-id agent) nil (claude-agent-started agent) nil
+        (claude-agent-process agent) nil)
+  (stop-claude cp)
+  (agent-emit agent :note :text (format nil "Couldn't resume Claude's conversation (~a). Carrying on in a new one." why))
+  (when (agent-busy agent)
+    (let ((prompts (claude-agent-prompts agent)))
+      (cond ((not (car (agent-turn-token agent))) (agent-turn-finished agent *stopped-text* t))
+            ((null prompts) (agent-turn-finished agent why t))
+            ;; The prompt, then what was sent while it ran, in order.
+            (t (handler-case (let ((new (claude-agent-ensure-process agent)))
+                               (dolist (prompt prompts) (claude-send new prompt)))
+                 (error (e) (agent-turn-finished agent (princ-to-string e) t))))))))
+
+(defun claude-agent-result (agent event)
+  ;; Out of usage only on this turn's evidence (its rate_limit_event said
+  ;; rejected, or its error says so), never on what an earlier turn left
+  ;; behind: a later sign-in failure is a sign-in failure.
+  (let* ((text (event-text event))
+         (error (event-error event))
+         (hit (shiftf (claude-agent-limit-hit agent) nil)))
+    (when (and error (or hit (claude-limit-text-p text)))
+      ;; This turn's reset time, replacing any earlier one.
+      (agent-ran-out agent (or (claude-limit-text-reset text) (and (integerp hit) hit)))
+      (setf error :out-of-usage))
+    ;; Streaming input can leave another response queued in the CLI.
+    ;; Keep the workflow callback until that response has completed.
+    (unless (and (not error) (plusp (or (event-queued-turn-count event) 0)))
+      (agent-turn-finished agent text error))))
 
 (defmethod agent-usage-windows ((agent claude-agent))
   (claude-usage-windows (claude-agent-limits agent)))
@@ -374,13 +405,15 @@ when it isn't running with the current settings."
         (agent-turn-finished agent why t)))))
 
 (defmethod agent-begin-turn ((agent claude-agent) prompt)
+  (setf (claude-agent-prompts agent) (list prompt))
   (claude-send (claude-agent-ensure-process agent) prompt))
 
 (defmethod agent-steer ((agent claude-agent) prompt)
   ;; Use the current process: changing settings must not restart a busy CLI.
   (let ((cp (claude-agent-process agent)))
     (unless (claude-alive-p cp) (error "Claude is not ready to receive a message yet."))
-    (claude-send cp prompt)))
+    (claude-send cp prompt)
+    (setf (claude-agent-prompts agent) (append (claude-agent-prompts agent) (list prompt)))))
 
 (defmethod agent-interrupt ((agent claude-agent))
   (let ((cp (claude-agent-process agent)))
@@ -397,6 +430,14 @@ when it isn't running with the current settings."
 (defmethod agent-new-conversation ((agent claude-agent))
   (agent-shutdown agent)
   (setf (claude-agent-session-id agent) nil (claude-agent-started agent) nil))
+
+(defmethod agent-conversation-handle ((agent claude-agent))
+  (and (claude-agent-started agent) (claude-agent-session-id agent)))
+
+(defmethod agent-resume-conversation ((agent claude-agent) handle)
+  (agent-new-conversation agent)
+  (when handle
+    (setf (claude-agent-session-id agent) handle (claude-agent-started agent) t)))
 
 ;;; Codex
 
@@ -455,20 +496,28 @@ rather than using a server with no thread."
 
 (defun codex-agent-setup-thread (agent server)
   (let ((instructions (collaboration-instructions agent)))
-    (if (codex-agent-thread-id agent)
-        (progn
-          (codex-initialize-app-server server)
-          (codex-request server "thread/resume"
-                         (jobj "threadId" (codex-agent-thread-id agent)
-                               "cwd" (uiop:native-namestring (codex-directory server))
-                               "sandbox" (codex-agent-sandbox agent)
-                               "approvalPolicy" (codex-agent-approval-policy agent)
-                               "developerInstructions" instructions))
-          (setf (codex-thread-id server) (codex-agent-thread-id agent)))
-        (setf (codex-agent-thread-id agent)
-              (codex-start-thread server :model (agent-model agent) :instructions instructions
-                                  :sandbox (codex-agent-sandbox agent)
-                                  :approval-policy (codex-agent-approval-policy agent))))))
+    (when (codex-agent-thread-id agent)
+      (codex-initialize-app-server server)
+      ;; A thread Codex no longer has (deleted, or from an old history):
+      ;; say so and start a new one, rather than failing every turn.
+      (handler-case
+          (progn
+            (codex-request server "thread/resume"
+                           (jobj "threadId" (codex-agent-thread-id agent)
+                                 "cwd" (uiop:native-namestring (codex-directory server))
+                                 "sandbox" (codex-agent-sandbox agent)
+                                 "approvalPolicy" (codex-agent-approval-policy agent)
+                                 "developerInstructions" instructions))
+            (setf (codex-thread-id server) (codex-agent-thread-id agent)))
+        (codex-request-error (e)
+          (let ((why (format nil "Couldn't resume ChatGPT's conversation (~a). Starting a new one." e)))
+            (setf (codex-agent-thread-id agent) nil)
+            (funcall (agent-deliver agent) (lambda () (agent-emit agent :note :text why)))))))
+    (unless (codex-agent-thread-id agent)
+      (setf (codex-agent-thread-id agent)
+            (codex-start-thread server :model (agent-model agent) :instructions instructions
+                                :sandbox (codex-agent-sandbox agent)
+                                :approval-policy (codex-agent-approval-policy agent))))))
 
 (defun codex-agent-event (agent server event)
   (when (eq server (codex-agent-server agent))
@@ -586,6 +635,13 @@ rather than using a server with no thread."
 (defmethod agent-new-conversation ((agent codex-agent))
   (agent-shutdown agent)
   (setf (codex-agent-thread-id agent) nil))
+
+(defmethod agent-conversation-handle ((agent codex-agent))
+  (codex-agent-thread-id agent))
+
+(defmethod agent-resume-conversation ((agent codex-agent) handle)
+  (agent-new-conversation agent)
+  (setf (codex-agent-thread-id agent) handle))
 
 (defun codex-agent-refresh-usage (agent)
   "Read the account's rate limits again, in the background."

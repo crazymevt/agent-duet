@@ -96,6 +96,14 @@ call it off the GUI thread."
   (codex-send-json server (jobj "jsonrpc" "2.0" "method" method
                                 "params" (or params (jobj)))))
 
+(define-condition codex-request-error (error)
+  ((method :initarg :method :reader codex-request-error-method)
+   (message :initarg :message :reader codex-request-error-message))
+  (:documentation "The app-server answered a request with an error.")
+  (:report (lambda (c stream)
+             (format stream "Codex app-server ~a failed: ~a"
+                     (codex-request-error-method c) (codex-request-error-message c)))))
+
 (defun codex-request (server method &optional params)
   "Send METHOD and wait at most *CODEX-REQUEST-TIMEOUT* seconds for its result."
   (let* ((id (sb-thread:with-mutex ((codex-lock server))
@@ -129,8 +137,8 @@ call it off the GUI thread."
     (sb-thread:with-mutex ((codex-lock server))
       (when (codex-pending-error pending) (error "Codex app-server: ~a" (codex-pending-error pending)))
       (when (jget (codex-pending-result pending) "error")
-        (error "Codex app-server ~a failed: ~a" method
-               (jget (codex-pending-result pending) "error" "message")))
+        (error 'codex-request-error :method method
+                                    :message (jget (codex-pending-result pending) "error" "message")))
       (jget (codex-pending-result pending) "result"))))
 
 (defun codex-deliver-event (server event)

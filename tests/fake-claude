@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""A stand-in for `claude -p --input-format stream-json` in the tests.
+
+With --resume, it has no such session: it says so, as the CLI does, and
+exits. Otherwise it answers each user message with "fresh reply". Its
+arguments are appended to the file `args` in its working folder.
+
+With the file `expect-steer` there, it reads two messages before answering
+(either way), and the fresh reply lists their texts.
+"""
+import json, os, sys
+
+args = sys.argv[1:]
+with open("args", "a") as out:
+    out.write(" ".join(args) + "\n")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+if "--resume" in args:
+    session = args[args.index("--resume") + 1]
+    sys.stdin.readline()
+    if os.path.exists("expect-steer"):
+        sys.stdin.readline()
+    send({"type": "result", "subtype": "error_during_execution", "is_error": True,
+          "session_id": session, "errors": ["No conversation found with session ID: " + session]})
+    sys.exit(0)
+
+session = args[args.index("--session-id") + 1] if "--session-id" in args else "new"
+def text(line):
+    return json.loads(line)["message"]["content"][0]["text"]
+
+for line in sys.stdin:
+    if json.loads(line).get("type") == "user":
+        reply = "fresh reply"
+        if os.path.exists("expect-steer"):
+            reply += ": " + text(line) + " + " + text(sys.stdin.readline())
+        send({"type": "system", "subtype": "init", "session_id": session})
+        send({"type": "result", "subtype": "success", "is_error": False,
+              "result": reply, "session_id": session})

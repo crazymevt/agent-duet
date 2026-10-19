@@ -224,7 +224,12 @@ since a message can hold several blocks. Nil for lines that are not JSON."
                                  :text (content-text (jget block "content"))
                                  :error (jtrue-p (jget block "is_error")))))
            ((equal type "result")
-            (list (event :kind :result :text (let ((r (jget json "result"))) (if (stringp r) r ""))
+            (list (event :kind :result :text (let ((r (jget json "result")))
+                                               ;; A failure before any reply says why in "errors".
+                                               (cond ((and (stringp r) (plusp (length r))) r)
+                                                     ((jlist (jget json "errors"))
+                                                      (format nil "~{~a~^~%~}" (remove-if-not #'stringp (jlist (jget json "errors")))))
+                                                     (t "")))
                          :error (or (jtrue-p (jget json "is_error"))
                                     (not (equal (jget json "subtype") "success")))
                          :queued-turn-count (jget json "queued_turn_count")

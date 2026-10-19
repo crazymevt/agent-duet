@@ -730,3 +730,103 @@ contains; the last of PAIRS (unpaired) otherwise."
                              (ai::make-claude-event :kind :permission :id "approval"
                                                    :name "Bash" :input (ai:jobj "command" "make test")))
       (true (assoc "approval" (ai::agent-approvals agent) :test #'equal)))))
+
+;;; Resuming a conversation from the history
+
+(define-test claude-resume-conversation
+    :parent agent-duet
+  (let ((agent (make-instance 'ai:claude-agent)))
+    (false (ai::agent-conversation-handle agent))
+    (ai::agent-resume-conversation agent "session-1")
+    (is equal "session-1" (ai::agent-conversation-handle agent))
+    (true (ai::claude-agent-started agent))
+    (ai::agent-resume-conversation agent nil)
+    (false (ai::agent-conversation-handle agent))))
+
+(defmacro with-fake-claude ((agent directory notes) &body body)
+  "Run BODY with AGENT, a Claude agent working in DIRECTORY against
+tests/fake-claude, its notes pushed onto NOTES."
+  (let ((program (gensym)))
+    `(let* ((,directory (merge-pathnames (format nil "duet-claude-~d/" (random 1000000)) (uiop:temporary-directory)))
+            (,program ai:*claude-program*)
+            (,agent (make-instance 'ai:claude-agent :directory ,directory))
+            (,notes '()))
+       (ensure-directories-exist ,directory)
+       ;; Set, not bound: a retry starts the CLI from the reader thread.
+       (setf ai:*claude-program* (namestring (asdf:system-relative-pathname "agent-duet" "tests/fake-claude")))
+       (setf (ai:agent-listener ,agent)
+             (lambda (agent kind &key text &allow-other-keys)
+               (declare (ignore agent))
+               (when (eq kind :note) (push text ,notes))))
+       (unwind-protect (progn ,@body)
+         (setf ai:*claude-program* ,program)
+         (ignore-errors (ai:agent-shutdown ,agent))
+         (uiop:delete-directory-tree ,directory :validate t :if-does-not-exist :ignore)))))
+
+(define-test claude-resume-missing-session
+    :parent agent-duet
+  (let ((event (first (ai::parse-claude-event
+                       "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"gone\",\"errors\":[\"No conversation found with session ID: gone\"]}"))))
+    (is string= "No conversation found with session ID: gone" (ai::event-text event)))
+  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
+      (skip "python3 is needed for the fake Claude" (true t))
+      (with-fake-claude (agent directory notes)
+        (let ((results nil))
+          (ai::agent-resume-conversation agent "gone")
+          (ai:agent-submit agent "the task" (lambda (text error) (push (list text error) results)))
+          (true (wait-until (lambda () results)))
+          ;; It says so, and the same task carries on in a new conversation.
+          (is equal '(("fresh reply" nil)) results)
+          (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
+          (let ((handle (ai::agent-conversation-handle agent)))
+            (true handle)
+            (isnt equal "gone" handle))
+          (is = 2 (length (uiop:read-file-lines (merge-pathnames "args" directory))))))))
+
+(define-test claude-resume-missing-session-steered
+    :parent agent-duet
+  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
+      (skip "python3 is needed for the fake Claude" (true t))
+      (with-fake-claude (agent directory notes)
+        (let ((results nil))
+          (touch directory "expect-steer")
+          (ai::agent-resume-conversation agent "gone")
+          (ai:agent-submit agent "the task" (lambda (text error) (push (list text error) results)))
+          ;; Sent while the resume is still pending: the new conversation gets it too.
+          (ai:agent-send-now agent "and this")
+          (true (wait-until (lambda () results)))
+          (is equal '(("fresh reply: the task + and this" nil)) results)))))
+
+(define-test codex-resume-conversation
+    :parent agent-duet
+  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
+      (skip "python3 is needed for the fake Codex" (true t))
+      (with-fake-codex (agent directory)
+        (let ((results nil))
+          (ai::agent-resume-conversation agent "thread-old")
+          (is equal "thread-old" (ai::agent-conversation-handle agent))
+          (ai:agent-submit agent "carry on" (lambda (text error) (push (list text error) results)))
+          (true (wait-until (lambda () results)))
+          (is equal '(("hi" nil)) results)
+          (true (member "thread/resume" (fake-log directory) :test #'string=))
+          (false (member "thread/start" (fake-log directory) :test #'string=))
+          (is equal "thread-old" (ai::agent-conversation-handle agent))))))
+
+(define-test codex-resume-missing-thread
+    :parent agent-duet
+  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
+      (skip "python3 is needed for the fake Codex" (true t))
+      (with-fake-codex (agent directory)
+        (let ((results nil) (notes nil))
+          (setf (ai:agent-listener agent)
+                (lambda (agent kind &key text &allow-other-keys)
+                  (declare (ignore agent))
+                  (when (eq kind :note) (push text notes))))
+          (touch directory "fail-resume")
+          (ai::agent-resume-conversation agent "thread-gone")
+          (ai:agent-submit agent "carry on" (lambda (text error) (push (list text error) results)))
+          (true (wait-until (lambda () results)))
+          ;; It says so, and carries on in a new thread.
+          (is equal '(("hi" nil)) results)
+          (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
+          (is equal "thread-1" (ai::agent-conversation-handle agent))))))
