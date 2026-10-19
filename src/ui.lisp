@@ -349,18 +349,32 @@ for Codex, the one marked as the default)."
   (if (eq (agent-id agent) :claude) "duet-claude" "duet-codex"))
 
 (defun pane-update-status (pane)
+  "The status line: what the agent is doing, and how much usage it has left
+(orange when low or out)."
   (let* ((agent (agent-pane-agent pane))
          (waiting (plusp (hash-table-count (agent-pane-approvals pane))))
-         (usage (and (eq (agent-id agent) :codex) (codex-usage-summary (agent-usage agent)))))
+         (windows (agent-usage-windows agent))
+         (usage (usage-summary windows))
+         (out (agent-out-until agent))
+         (out-now (or (agent-out-of-usage-p agent) (eq out :unknown))))
     (gtk:label-set-text (pane-status pane)
-                        (format nil "~a~@[ · ~a left~]"
+                        (format nil "~a~:[~@[ · ~a left~]~;~*~]"
                                 (cond (waiting "Waiting for your approval")
                                       ((agent-busy agent) "Working…")
+                                      (out-now (if (integerp out)
+                                                   (format nil "Out of usage until ~a" (format-reset-time out))
+                                                   "Out of usage"))
                                       (t (agent-pane-ready pane)))
-                                usage))
+                                out-now usage))
+    (gtk:widget-set-css-classes (pane-status pane)
+                                (if (or out-now (usage-low-p windows)) '("warning") '("dim-label")))
     (gtk:widget-set-tooltip-text (pane-status pane)
-                                 (format nil "~@[~a~]~@[~%Remaining usage: ~a~]"
-                                         (agent-pane-version pane) usage))))
+                                 (format nil "~@[~a~]~@[~%Remaining usage: ~a~]~{~%~a~}"
+                                         (agent-pane-version pane) usage
+                                         (loop for w in windows
+                                               when (window-resets-at w)
+                                                 collect (format nil "~a resets ~a" (window-label w)
+                                                                 (format-reset-time (window-resets-at w))))))))
 
 (defun pane-set-busy (pane busy)
   (let ((agent (agent-pane-agent pane)))
@@ -494,7 +508,7 @@ for Codex, the one marked as the default)."
         (:tool-result (pane-tool-result pane id text error))
         (:approval (pane-approval pane id title text))
         (:approval-answered (pane-approval-answered pane id decision))
-        (:usage (pane-update-status pane))
+        (:usage (pane-update-status pane) (refresh-pause-cards agent))
         (:note (pane-note pane text "error"))
         (:turn-done
          ;; A turn that streamed but never finished its block.
@@ -570,12 +584,127 @@ for Codex, the one marked as the default)."
       (dolist (name '(:mode :lead :rounds :folder :permission))
         (gtk:widget-set-sensitive (control name) (not running)))
       (gtk:label-set-text (pane-status *middle*)
-                          (if running
-                              (format nil "Working · ~{~a~^, ~}"
-                                      (or (loop for a in (list *claude* *codex*)
-                                                when (agent-busy a) collect (agent-name a))
-                                          '("waiting")))
-                              "")))))
+                          (cond ((not running) "")
+                                ((workflow-paused *workflow*)
+                                 (format nil "Paused: ~a out of usage"
+                                         (format nil "~{~a~^ and ~}"
+                                                 (remove-duplicates (mapcar (lambda (s) (agent-name (step-agent s)))
+                                                                            (workflow-paused *workflow*))
+                                                                    :test #'string=))))
+                                (t (format nil "Working · ~{~a~^, ~}"
+                                           (or (loop for a in (list *claude* *codex*)
+                                                     when (agent-busy a) collect (agent-name a))
+                                               '("waiting")))))))))
+
+;;; A step paused because its agent ran out of usage
+
+(defvar *pause-timers* '() "(step . glib source id): steps set to resume when usage resets.")
+(defvar *pause-cards* '() "(step . refresh function) for the pause cards still waiting on a choice.")
+
+(defun clear-pause-timer (step)
+  (let ((entry (assoc step *pause-timers*)))
+    (when entry
+      (ignore-errors (glib:source-remove (cdr entry)))
+      (setf *pause-timers* (remove entry *pause-timers*)))))
+
+(defun clear-pause-timers ()
+  (dolist (entry *pause-timers*) (ignore-errors (glib:source-remove (cdr entry))))
+  (setf *pause-timers* '()
+        *pause-cards* '()))
+
+(defun resume-when-reset (workflow step reset)
+  "Give STEP to its agent again a minute after RESET (a universal time)."
+  (let ((seconds (max 5 (+ 60 (- reset (get-universal-time))))))
+    (clear-pause-timer step)
+    (push (cons step (glib:timeout-add-seconds glib:+priority-default+ seconds
+                                               (lambda ()
+                                                 (setf *pause-timers* (remove step *pause-timers* :key #'car))
+                                                 (resume-step workflow step)
+                                                 (update-controls)
+                                                 nil)))
+          *pause-timers*)))
+
+(defun refresh-pause-cards (agent)
+  "AGENT's usage changed: its cards may now know when it resets."
+  (dolist (entry *pause-cards*)
+    (when (eq (step-agent (car entry)) agent)
+      (funcall (cdr entry)))))
+
+(defun show-paused-step (workflow step)
+  "A card in the conversation: the step that paused, and what to do about it.
+It follows the agent's usage: a reset time learned later (Codex reads its
+usage after the turn) brings the Wait button."
+  (let* ((agent (step-agent step))
+         (other (other-agent workflow agent))
+         (heading (make-instance 'gtk:label :xalign 0.0 :css-classes '("heading")))
+         (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+         (status (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("dim-label") :visible nil))
+         (wait-button nil)
+         (waiting-for nil))                     ; the reset being waited for, once Wait is chosen
+    (labels ((reset () (and (integerp (agent-out-until agent)) (agent-out-until agent)))
+             (settled (text)
+               (setf *pause-cards* (remove step *pause-cards* :key #'car))
+               (clear-pause-timer step)
+               (clear-box buttons)
+               (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label")))
+               (gtk:widget-set-visible status nil)
+               (update-controls))
+             (choice (label tooltip classes action)
+               (let ((b (make-instance 'gtk:button :label label :tooltip-text tooltip :css-classes classes)))
+                 (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (funcall action)))
+                 (gtk:box-append buttons b)
+                 b))
+             (wait ()
+               (let ((reset (reset)))
+                 (when reset
+                   (setf waiting-for reset)
+                   (resume-when-reset workflow step reset)
+                   (gtk:label-set-text status (format nil "Waiting: ~a will carry on at about ~a. Leave the app open."
+                                                      (agent-name agent) (format-reset-time (+ reset 60))))
+                   (gtk:widget-set-visible status t))))
+             (refresh ()
+               (let ((reset (reset)))
+                 (gtk:label-set-text heading (format nil "~a is out of usage~@[ until ~a~]" (agent-name agent)
+                                                     (and reset (format-reset-time reset))))
+                 (when reset
+                   (unless wait-button
+                     (setf wait-button (choice "" (format nil "Send it to ~a again once its usage resets" (agent-name agent))
+                                               '("suggested-action") #'wait)))
+                   (gtk:button-set-label wait-button (format nil "Wait until ~a" (format-reset-time reset)))
+                   ;; Already waiting, for a reset that has moved: wait for the new one.
+                   (when (and waiting-for (/= waiting-for reset))
+                     (wait))))))
+      (choice "Stop" "Stop the whole task here" '("destructive-action")
+              (lambda () (stop-workflow workflow) (settled "Stopped")))
+      (let ((hand-off (choice (if (eq (step-role step) :review)
+                                  "Finish unreviewed"
+                                  (format nil "Let ~a take over" (agent-name other)))
+                              (if (eq (step-role step) :review)
+                                  "Finish this part without a review, and say so"
+                                  (format nil "~a carries on from where ~a stopped; its work won't be reviewed"
+                                          (agent-name other) (agent-name agent)))
+                              '()
+                              (lambda () (settled (if (eq (step-role step) :review)
+                                                      "Finished unreviewed"
+                                                      (format nil "Handed to ~a" (agent-name other))))
+                                (hand-off-step workflow step)))))
+        (unless (or (eq (step-role step) :review) (can-hand-off-p workflow step))
+          (gtk:widget-set-sensitive hand-off nil)
+          (gtk:widget-set-tooltip-text hand-off (format nil "~a is out of usage too" (agent-name other)))))
+      (choice "Try again" (format nil "Send it to ~a again now" (agent-name agent)) '()
+              (lambda () (settled "Tried again") (resume-step workflow step)))
+      (refresh)
+      (push (cons step #'refresh) *pause-cards*)
+      (pane-append *middle*
+                   (gtk:build
+                     (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                       heading
+                       (gtk:label :label (format nil "~a is paused. Nothing done so far is lost."
+                                                 (string-capitalize (step-description step) :end 1))
+                                  :xalign 0.0 :wrap t)
+                       status
+                       buttons))))
+    (update-controls)))
 
 (defun start-request ()
   (if (workflow-running-p)
@@ -592,7 +721,10 @@ for Codex, the one marked as the default)."
                                                 :request text
                                                 :max-rounds (gtk:spin-button-get-value-as-int (control :rounds))
                                                 :on-message #'middle-message
-                                                :on-finish (lambda (w) (declare (ignore w)) (update-controls))))
+                                                :on-pause #'show-paused-step
+                                                :on-finish (lambda (w) (declare (ignore w))
+                                                             (clear-pause-timers)
+                                                             (update-controls))))
                 (start-workflow *workflow*)
                 (update-controls)))))))
 
@@ -903,6 +1035,11 @@ for Codex, the one marked as the default)."
       (set-directory directory))
     (update-controls)
     (check-agents)
+    ;; Usage resets with nothing else happening: keep the status lines current.
+    (glib:timeout-add-seconds glib:+priority-default+ 30
+                              (lambda ()
+                                (dolist (entry *panes*) (pane-update-status (cdr entry)))
+                                t))
     (gobject:connect window :close-request
                      (lambda (w) (declare (ignore w))
                        (dolist (agent (list *claude* *codex*))

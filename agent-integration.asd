@@ -13,6 +13,7 @@
                (:file "markdown")
                (:file "claude")
                (:file "codex")
+               (:file "usage")
                (:file "settings")
                (:file "agents")
                (:file "workflow")))

@@ -29,6 +29,23 @@ Type a request in the middle and press Return. Choose how they work:
 *Claude leads* / *ChatGPT leads* picks the lead. Start becomes Stop while they
 work.
 
+## Running out of usage
+
+When an agent's account runs out partway through a task, its step pauses
+instead of failing, and a card in the middle pane offers:
+
+- **Wait until 3:05 PM** (when the reset time is known): it's sent to the
+  same agent again a minute after its usage resets. Leave the app open.
+- **Try again**: send it again now.
+- **Let ChatGPT take over** (or Claude): the other agent picks up the work
+  where it stopped. It won't be reviewed, since the reviewer is the one out,
+  and the conversation says so. If it was a review that paused, this button is
+  **Finish unreviewed**: that part is done, marked as not reviewed.
+- **Stop**.
+
+Nothing done so far is lost. While an agent is out, with a known reset time,
+it turns prompts away without trying; its status line says until when.
+
 ## Folder, models and look
 
 - **Folder** (top left): where both agents work. Its menu lists recent folders
@@ -38,8 +55,9 @@ work.
   opus, haiku) and effort; ChatGPT's models as Codex lists them, with the
   thinking levels each supports. A change applies from that agent's next
   message, carrying on the same conversation.
-- **ChatGPT's remaining usage** shows in its status line (for example
-  `65% 5h / 56% 7d left`), refreshed after each turn.
+- **Remaining usage** for both shows in their status lines (for example
+  `65% 5h / 56% 7d left`; hover for the reset times), turning orange when
+  under 10% is left.
 - **Dark / Light / System** (top right).
 
 These, the permission setting and the recent folders are remembered in
@@ -105,6 +123,8 @@ Or `(agent-integration:main "/path/to/project/")` to choose the folder.
   `--permission-prompt-tool stdio`, Codex through the app-server's approval
   requests).
 - `src/settings.lisp`: what's remembered between runs.
+- `src/usage.lisp`: both accounts' usage windows, and recognizing a turn that
+  failed because one ran out.
 - `src/workflow.lisp`: the two ways of working together. No GTK.
 - `src/ui.lisp`: the window.
 - `src/terminal.lisp`: the Terminal panel (VTE through CFFI, from Cadre).

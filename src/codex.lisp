@@ -417,18 +417,7 @@ the rest of the session) or :deny."
 
 (defun codex-usage-summary (buckets)
   "What is left in each of BUCKETS' windows, as \"72% 5h / 40% 7d\", or nil."
-  (let ((windows
-          (loop for (bucket-id . bucket) in buckets
-                for several = (> (length buckets) 1)
-                append (loop for window-name in '("primary" "secondary")
-                             for window = (jget bucket window-name)
-                             for used = (jget window "usedPercent")
-                             when (numberp used)
-                               collect (format nil "~@[~a ~]~d%~@[ ~a~]"
-                                               (and several bucket-id)
-                                               (round (max 0 (min 100 (- 100 used))))
-                                               (rate-window-label (jget window "windowDurationMins")))))))
-    (and windows (format nil "~{~a~^ / ~}" windows))))
+  (usage-summary (codex-usage-windows buckets)))
 
 (defun call-with-codex-server (program directory function)
   "Call FUNCTION with a fresh, initialized app-server, stopped afterwards."

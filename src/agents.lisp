@@ -16,7 +16,11 @@
 ;;;;   :turn-done TEXT ERROR the turn ended; TEXT is the final reply
 ;;;;   :note TEXT            something to tell the user (the CLI exited…)
 ;;;;   :busy BUSY            the agent started or stopped working
-;;;;   :usage                the agent's usage changed (Codex: AGENT-USAGE)
+;;;;   :usage                the agent's usage changed (see AGENT-USAGE-WINDOWS)
+;;;;
+;;;; A turn that fails because the account is out of usage ends with ERROR
+;;;; :out-of-usage, and the agent remembers until when (AGENT-OUT-UNTIL);
+;;;; until then, when that is known, it turns prompts away without trying.
 ;;;; Everything is called through DELIVER, on the GUI thread in the app.
 ;;;;
 ;;;; The model, effort and permission can change at any time; a turn uses
@@ -46,7 +50,34 @@ read-only ones), Codex runs them in its sandbox without asking.
    (turn-token :initform (list nil) :accessor agent-turn-token
                :documentation "(t) while the running turn may go on; AGENT-CANCEL makes it (nil)")
    (approvals :initform '() :accessor agent-approvals :documentation "Unanswered (id . answer-function)s")
-   (stderr :initform '() :accessor agent-stderr :documentation "The last lines of standard error, newest first")))
+   (stderr :initform '() :accessor agent-stderr :documentation "The last lines of standard error, newest first")
+   (out-until :initform nil :accessor agent-out-until
+              :documentation "When out of usage: the universal time it resets, or :unknown")))
+
+(defgeneric agent-usage-windows (agent)
+  (:documentation "The account's usage WINDOWs, as far as known.")
+  (:method ((agent agent)) '()))
+
+(defun agent-out-of-usage-p (agent &optional (now (get-universal-time)))
+  "Whether AGENT is known to be out of usage until a time still to come."
+  (let ((until (agent-out-until agent)))
+    (and (integerp until) (> until now))))
+
+(defun agent-out-message (agent)
+  (let ((until (agent-out-until agent)))
+    (format nil "~a is out of usage~:[~*~; until ~a~]." (agent-name agent)
+            (integerp until) (and (integerp until) (format-reset-time until)))))
+
+(defun agent-ran-out (agent until)
+  "AGENT's account is out of usage until UNTIL (a universal time, or nil if unknown)."
+  (setf (agent-out-until agent) (or until :unknown))
+  (agent-emit agent :usage))
+
+(defun agent-has-usage (agent)
+  "AGENT's account has usage again."
+  (when (agent-out-until agent)
+    (setf (agent-out-until agent) nil)
+    (agent-emit agent :usage)))
 
 (defgeneric agent-begin-turn (agent prompt)
   (:documentation "Start a turn on PROMPT. The turn ends with AGENT-TURN-FINISHED."))
@@ -83,11 +114,16 @@ says why)."
             (agent-turn-token agent) (list t))
       (agent-emit agent :busy :busy t)
       (agent-emit agent :prompt :text (car next))
-      (handler-case (agent-begin-turn agent (car next))
-        (error (e) (agent-turn-finished agent (princ-to-string e) t))))))
+      (if (agent-out-of-usage-p agent)
+          ;; Known to be out: don't spend a request finding out again.
+          (agent-turn-finished agent (agent-out-message agent) :out-of-usage)
+          (handler-case (agent-begin-turn agent (car next))
+            (error (e) (agent-turn-finished agent (princ-to-string e) t)))))))
 
 (defun agent-turn-finished (agent text error)
-  "The running turn ended with TEXT, its final reply, or with an ERROR."
+  "The running turn ended with TEXT, its final reply, or with an ERROR (true;
+:out-of-usage when the account ran out)."
+  (unless error (agent-has-usage agent))
   (when (agent-busy agent)
     (let ((callback (agent-callback agent)))
       (setf (agent-busy agent) nil (agent-callback agent) nil)
@@ -175,7 +211,10 @@ Running a command may need the user's approval; if one is denied, carry on witho
   ((process :initform nil :accessor claude-agent-process)
    (config :initform nil :accessor claude-agent-config :documentation "What the process was started with")
    (session-id :initform nil :accessor claude-agent-session-id)
-   (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume"))
+   (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume")
+   (limits :initform nil :accessor claude-agent-limits :documentation "The last rate_limit_info")
+   (limit-hit :initform nil :accessor claude-agent-limit-hit
+              :documentation "Set when this turn's rate_limit_event said rejected: its reset, or :unknown"))
   (:default-initargs :id :claude :name "Claude" :partner-name "ChatGPT" :model *claude-model*))
 
 (defun claude-agent-wanted-config (agent)
@@ -250,7 +289,30 @@ when it isn't running with the current settings."
                                  (claude-answer-permission cp id (not (eq decision :deny))
                                                            :input input
                                                            :always-rules (and (eq decision :always) suggestions)))))))
-      (:result (agent-turn-finished agent (event-text event) (event-error event))))))
+      (:rate-limit
+       (let ((info (event-data event)))
+         (setf (claude-agent-limits agent) info)
+         (if (equal (jget info "status") "rejected")
+             (let ((reset (or (unix-to-universal (jget info "resetsAt"))
+                              (exhausted-reset (claude-usage-windows info)))))
+               (setf (claude-agent-limit-hit agent) (or reset :unknown))
+               (agent-ran-out agent reset))
+             (progn (agent-has-usage agent) (agent-emit agent :usage)))))
+      (:result
+       ;; Out of usage only on this turn's evidence (its rate_limit_event
+       ;; said rejected, or its error says so), never on what an earlier
+       ;; turn left behind: a later sign-in failure is a sign-in failure.
+       (let* ((text (event-text event))
+              (error (event-error event))
+              (hit (shiftf (claude-agent-limit-hit agent) nil)))
+         (when (and error (or hit (claude-limit-text-p text)))
+           ;; This turn's reset time, replacing any earlier one.
+           (agent-ran-out agent (or (claude-limit-text-reset text) (and (integerp hit) hit)))
+           (setf error :out-of-usage))
+         (agent-turn-finished agent text error))))))
+
+(defmethod agent-usage-windows ((agent claude-agent))
+  (claude-usage-windows (claude-agent-limits agent)))
 
 (defun claude-agent-exited (agent cp code)
   (when (eq cp (claude-agent-process agent))
@@ -370,13 +432,28 @@ rather than using a server with no thread."
                                (when (codex-alive-p server)
                                  (codex-answer-approval server id decision))))))
       (:rate-limits (setf (agent-usage agent) (merge-rate-limits (agent-usage agent) (codex-event-data event)))
-       (agent-emit agent :usage))
+       (codex-agent-usage-changed agent))
       ((:stderr :protocol-error) (agent-note-stderr agent (codex-event-text event)))
-      (:result (agent-turn-finished agent (if (codex-event-error event)
-                                              (or (codex-event-text event) "The turn failed.")
-                                              (or (codex-agent-last-text agent) ""))
-                                    (codex-event-error event))
+      (:result
+       (let ((error (codex-event-error event)))
+         (when (and error (codex-limit-error-p (codex-event-data event)))
+           (agent-ran-out agent (exhausted-reset (codex-usage-windows (agent-usage agent))))
+           (setf error :out-of-usage))
+         (agent-turn-finished agent (if error
+                                        (or (codex-event-text event) "The turn failed.")
+                                        (or (codex-agent-last-text agent) ""))
+                              error))
        (codex-agent-refresh-usage agent)))))
+
+(defun codex-agent-usage-changed (agent)
+  "New usage figures: if the agent is out with no reset time yet, take it from them."
+  (when (eq (agent-out-until agent) :unknown)
+    (let ((reset (exhausted-reset (codex-usage-windows (agent-usage agent)))))
+      (when reset (setf (agent-out-until agent) reset))))
+  (agent-emit agent :usage))
+
+(defmethod agent-usage-windows ((agent codex-agent))
+  (codex-usage-windows (agent-usage agent)))
 
 (defun codex-agent-exited (agent server code)
   (when (eq server (codex-agent-server agent))
@@ -446,7 +523,7 @@ rather than using a server with no thread."
            (when usage
              (funcall deliver (lambda ()
                                 (setf (agent-usage agent) usage)
-                                (agent-emit agent :usage))))))
+                                (codex-agent-usage-changed agent))))))
        :name "codex usage"))))
 
 (defun codex-agent-load-catalog (agent program)

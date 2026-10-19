@@ -131,6 +131,7 @@ then the copy inside the Claude desktop app.")
   :tool-result  ID, TEXT, ERROR
   :result    TEXT, ERROR, COST, DURATION, SESSION-ID, DATA: usage
   :permission  ID (the request's), NAME, INPUT, TEXT (why), DATA: the request
+  :rate-limit  DATA: the account's usage (rate_limit_info)
   :other     DATA: the JSON"
   kind text name id input error cost duration session-id model data subagent)
 
@@ -183,6 +184,8 @@ since a message can hold several blocks. Nil for lines that are not JSON."
                                      (not (equal (jget json "subtype") "success")))
                           :cost (jget json "total_cost_usd") :duration (jget json "duration_ms")
                           :session-id (jget json "session_id") :data (jget json "usage"))))
+            ((equal type "rate_limit_event")
+             (list (event :kind :rate-limit :data (jget json "rate_limit_info"))))
             ;; With --permission-prompt-tool stdio, a tool that needs
             ;; permission asks here; CLAUDE-ANSWER-PERMISSION answers.
             ((and (equal type "control_request") (equal (jget json "request" "subtype") "can_use_tool"))

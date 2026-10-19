@@ -15,6 +15,12 @@
 ;;;; the conversation view: (on-message from to text kind), FROM and TO
 ;;;; being agents, :user or :system, and KIND one of :request :plan :work
 ;;;; :review :note.
+;;;;
+;;;; When an agent's account runs out of usage, the step it was given (a
+;;;; STEP) pauses rather than fails, and ON-PAUSE is told: the user decides
+;;;; whether to RESUME-STEP (once the usage resets), HAND-OFF-STEP to the
+;;;; other agent, or STOP-WORKFLOW. Work handed off goes unreviewed when the
+;;;; one that ran out was to review it, and says so.
 
 (in-package #:agent-integration)
 
@@ -28,6 +34,8 @@
    (max-rounds :initarg :max-rounds :initform *default-max-rounds* :reader workflow-max-rounds)
    (on-message :initarg :on-message :initform nil :accessor workflow-on-message)
    (on-finish :initarg :on-finish :initform nil :accessor workflow-on-finish)
+   (on-pause :initarg :on-pause :initform nil :accessor workflow-on-pause)
+   (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
    (loops :initform '() :accessor workflow-loops)
    (state :initform :new :accessor workflow-state :documentation ":new :running :finished :stopped")))
 
@@ -37,7 +45,15 @@
   label                                 ; how to name it in notes: nil, or "Claude's part"
   (summary "")                          ; the author's latest report
   (round 0)                             ; reviews done
-  (state :working))                     ; :working :reviewing :approved :unresolved :failed
+  (skip-review nil)                     ; true once taken over: its reviewer ran out
+  (state :working))                     ; :working :reviewing :approved :unresolved :unreviewed :failed
+
+(defstruct (workflow-step (:conc-name step-) (:constructor make-step))
+  "A prompt given to an agent for the workflow, kept so it can be given
+again, or to the other agent, after the first ran out of usage."
+  agent prompt then
+  role                                  ; :plan, :work or :review
+  loop)                                 ; the review loop it belongs to (not for :plan)
 
 (defun post (workflow from to text kind)
   (when (workflow-on-message workflow)
@@ -49,13 +65,84 @@
 (defun workflow-live-p (workflow)
   (eq (workflow-state workflow) :running))
 
-(defun submit (workflow agent prompt then)
+(defun submit (workflow agent prompt then &key role loop)
   "Give AGENT PROMPT; call THEN with its reply, unless the workflow has
-been stopped meanwhile. A failed turn ends the workflow's part in it."
-  (agent-submit agent prompt
+been stopped meanwhile. A turn that failed for want of usage pauses
+instead (PAUSE-STEP); another failed turn ends the workflow's part in it."
+  (submit-step workflow (make-step :agent agent :prompt prompt :then then :role role :loop loop)))
+
+(defun submit-step (workflow step)
+  (agent-submit (step-agent step) (step-prompt step)
                 (lambda (text error)
                   (when (workflow-live-p workflow)
-                    (funcall then text error)))))
+                    (if (eq error :out-of-usage)
+                        (pause-step workflow step)
+                        (funcall (step-then step) text error))))))
+
+;;; Running out of usage
+
+(defun other-agent (workflow agent)
+  (if (eq agent (workflow-lead workflow)) (workflow-partner workflow) (workflow-lead workflow)))
+
+(defun step-description (step)
+  "What STEP was, for the user: \"Claude's review of ChatGPT's part\"."
+  (let ((name (agent-name (step-agent step)))
+        (loop (step-loop step)))
+    (ecase (step-role step)
+      (:plan (format nil "~a's plan for splitting the work" name))
+      (:work (format nil "~a's work~@[ on ~a~]" name (and loop (loop-label loop))))
+      (:review (format nil "~a's review of ~a" name
+                       (or (and loop (loop-label loop))
+                           (format nil "~a's work" (agent-name (loop-author loop)))))))))
+
+(defun pause-step (workflow step)
+  (setf (workflow-paused workflow) (append (workflow-paused workflow) (list step)))
+  (note workflow "~a ~a paused." (agent-out-message (step-agent step)) (step-description step))
+  (when (workflow-on-pause workflow)
+    (funcall (workflow-on-pause workflow) workflow step)))
+
+(defun unpause (workflow step)
+  "Take STEP off the paused list; true if it was on it (so each choice counts once)."
+  (when (member step (workflow-paused workflow))
+    (setf (workflow-paused workflow) (remove step (workflow-paused workflow)))
+    t))
+
+(defun resume-step (workflow step)
+  "Give STEP's prompt to its agent again (its usage has reset, or the user wants to try)."
+  (when (and (workflow-live-p workflow) (unpause workflow step))
+    (note workflow "Trying ~a again." (step-description step))
+    (submit-step workflow step)))
+
+(defun can-hand-off-p (workflow step)
+  "Whether the other agent could take STEP over (it isn't out of usage too)."
+  (not (agent-out-of-usage-p (other-agent workflow (step-agent step)))))
+
+(defun hand-off-step (workflow step)
+  "Have the other agent take STEP over. A review isn't handed off: the work
+finishes unreviewed. Work or a plan goes to the other agent, and what it
+does then goes unreviewed, since the one that would review it is out."
+  (when (and (workflow-live-p workflow) (unpause workflow step))
+    (let* ((out (step-agent step))
+           (other (other-agent workflow out))
+           (loop (step-loop step)))
+      (ecase (step-role step)
+        (:review
+         (setf (loop-state loop) :unreviewed)
+         (note workflow "~@[~a ~]finished without a review: ~a ran out of usage."
+               (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)) (agent-name out))
+         (check-finished workflow))
+        (:work
+         (note workflow "~a takes over ~a. It won't be reviewed: ~a is out of usage."
+               (agent-name other) (step-description step) (agent-name out))
+         (setf (loop-author loop) other
+               (loop-skip-review loop) t)
+         (loop-work workflow loop (takeover-prompt out (step-prompt step))))
+        (:plan
+         (note workflow "~a does the whole task. It won't be reviewed: ~a is out of usage."
+               (agent-name other) (agent-name out))
+         (run-loop workflow (make-review-loop :author other :reviewer out :task (workflow-request workflow)
+                                              :skip-review t)
+                   (takeover-plan-prompt out (workflow-request workflow))))))))
 
 ;;; The prompts
 
@@ -99,6 +186,18 @@ its files alone:~%~%~a~%~%When you finish, ~a will review your part."
 ~a is doing this part at the same time, so leave its files alone:~%~%~a~%~%~
 When you finish, ~a will review your part."
             l request partner-task l lead-task l)))
+
+(defun takeover-prompt (out prompt)
+  (format nil "~a ran out of usage partway through a task, so you're taking it over. Some of its work ~
+may already be in the files: look before you continue, and don't redo what's done. Here is what ~a was ~
+asked (\"you\" there meant ~a):~%~%~a~%~%~
+No one will review your work this time, since ~a is out of usage. Finish with a summary of what you changed."
+          (agent-name out) (agent-name out) (agent-name out) prompt (agent-name out)))
+
+(defun takeover-plan-prompt (out request)
+  (format nil "~a ran out of usage before it could plan this task with you, so do all of it yourself:~%~%~a~%~%~
+No one will review your work this time, since ~a is out of usage. Finish with a summary of what you changed."
+          (agent-name out) request (agent-name out)))
 
 ;;; Reading replies
 
@@ -155,7 +254,8 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                (lambda (text error)
                  (if error
                      (fail workflow "~a couldn't make a plan: ~a" (agent-name lead) text)
-                     (start-parts workflow text))))))
+                     (start-parts workflow text)))
+               :role :plan)))
     workflow))
 
 (defun start-parts (workflow plan)
@@ -189,12 +289,18 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
   (setf (loop-state loop) :working)
   (submit workflow (loop-author loop) prompt
           (lambda (text error)
-            (if error
-                (loop-failed workflow loop (format nil "~a's turn failed: ~a" (agent-name (loop-author loop)) text))
-                (progn
-                  (setf (loop-summary loop) text)
-                  (post workflow (loop-author loop) (loop-reviewer loop) text :work)
-                  (loop-review workflow loop))))))
+            (cond (error
+                   (loop-failed workflow loop (format nil "~a's turn failed: ~a" (agent-name (loop-author loop)) text)))
+                  (t
+                   (setf (loop-summary loop) text)
+                   (post workflow (loop-author loop) (loop-reviewer loop) text :work)
+                   (if (loop-skip-review loop)
+                       (progn (setf (loop-state loop) :unreviewed)
+                              (note workflow "~@[~a ~]done, not reviewed."
+                                    (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)))
+                              (check-finished workflow))
+                       (loop-review workflow loop)))))
+          :role :work :loop loop))
 
 (defun loop-review (workflow loop)
   (setf (loop-state loop) :reviewing)
@@ -218,7 +324,8 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                         (t
                          (note workflow "Round ~d~@[ (~a)~]: ~a addresses the review."
                                (1+ (loop-round loop)) (loop-label loop) (agent-name (loop-author loop)))
-                         (loop-work workflow loop (fix-prompt loop text)))))))))
+                         (loop-work workflow loop (fix-prompt loop text)))))))
+          :role :review :loop loop))
 
 (defun loop-failed (workflow loop why)
   (setf (loop-state loop) :failed)
@@ -226,10 +333,11 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
   (check-finished workflow))
 
 (defun loop-done-p (loop)
-  (member (loop-state loop) '(:approved :unresolved :failed)))
+  (member (loop-state loop) '(:approved :unresolved :unreviewed :failed)))
 
 (defun check-finished (workflow)
-  (when (and (workflow-live-p workflow) (every #'loop-done-p (workflow-loops workflow)))
+  (when (and (workflow-live-p workflow) (null (workflow-paused workflow))
+             (every #'loop-done-p (workflow-loops workflow)))
     (setf (workflow-state workflow) :finished)
     (note workflow "Done: ~{~a~^; ~}."
           (loop for l in (workflow-loops workflow)
@@ -237,6 +345,7 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
                                 (case (loop-state l)
                                   (:approved "approved")
                                   (:unresolved "not approved")
+                                  (:unreviewed "not reviewed")
                                   (t "failed")))))
     (when (workflow-on-finish workflow)
       (funcall (workflow-on-finish workflow) workflow))))
@@ -250,7 +359,8 @@ partner's is nil when there is none (NONE, or no PARTNER TASK section)."
 (defun stop-workflow (workflow)
   "Stop WORKFLOW and both agents' work on it."
   (when (workflow-live-p workflow)
-    (setf (workflow-state workflow) :stopped)
+    (setf (workflow-state workflow) :stopped
+          (workflow-paused workflow) '())
     (agent-cancel (workflow-lead workflow))
     (agent-cancel (workflow-partner workflow))
     (note workflow "Stopped.")

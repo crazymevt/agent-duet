@@ -194,10 +194,14 @@
 
 (defmethod ai:agent-begin-turn ((agent fake-agent) prompt)
   (push prompt (fake-prompts agent))
-  (let ((reply (if (functionp (fake-replies agent))
-                   (fake-replies agent)
-                   (pop (fake-replies agent)))))
-    (ai:agent-turn-finished agent (if reply (funcall reply prompt) "out of replies") (null reply))))
+  (let* ((reply (if (functionp (fake-replies agent))
+                    (fake-replies agent)
+                    (pop (fake-replies agent))))
+         (text (if reply (funcall reply prompt) "out of replies")))
+    ;; A reply of :out-of-usage plays the account running out.
+    (if (eq text :out-of-usage)
+        (ai:agent-turn-finished agent "You've hit your limit" :out-of-usage)
+        (ai:agent-turn-finished agent text (null reply)))))
 
 (defun says (text) (lambda (prompt) (declare (ignore prompt)) text))
 
@@ -318,6 +322,163 @@ contains; the last of PAIRS (unpaired) otherwise."
     (is = 2 (length results))
     (true (every #'third results))
     (false (ai::agent-queue agent))))
+
+;;; Running out of usage
+
+(define-test usage-windows
+  :parent agent-integration
+  (let* ((info (ai:parse-json "{\"status\":\"allowed\",\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.56,\"resetsAt\":1792443000},\"seven_day\":{\"utilization\":0.27,\"resetsAt\":1792947600}}}"))
+         (windows (ai::claude-usage-windows info)))
+    (is string= "44% 5h / 73% 7d" (ai::usage-summary windows))
+    (false (ai::usage-low-p windows))
+    (false (ai::exhausted-reset windows)))
+  (let* ((info (ai:parse-json "{\"status\":\"rejected\",\"unifiedWindows\":{\"five_hour\":{\"utilization\":1.0,\"resetsAt\":1792443000},\"seven_day\":{\"utilization\":0.95,\"resetsAt\":1792947600}}}"))
+         (windows (ai::claude-usage-windows info)))
+    (true (ai::usage-low-p windows))
+    (is = (ai::unix-to-universal 1792443000) (ai::exhausted-reset windows)))
+  (let ((buckets (ai::codex-rate-limits-from-response
+                  (ai:parse-json "{\"rateLimits\":{\"primary\":{\"usedPercent\":100,\"windowDurationMins\":300,\"resetsAt\":1792443000},\"secondary\":{\"usedPercent\":40,\"windowDurationMins\":10080,\"resetsAt\":1792947600}}}"))))
+    (is = (ai::unix-to-universal 1792443000) (ai::exhausted-reset (ai::codex-usage-windows buckets))))
+  (true (ai::codex-limit-error-p (ai:parse-json "{\"status\":\"failed\",\"error\":{\"message\":\"x\",\"codexErrorInfo\":\"usageLimitExceeded\"}}")))
+  (false (ai::codex-limit-error-p (ai:parse-json "{\"status\":\"failed\",\"error\":{\"message\":\"x\",\"codexErrorInfo\":\"badRequest\"}}")))
+  (true (ai::claude-limit-text-p "You've hit your limit · resets 3pm"))
+  (false (ai::claude-limit-text-p "Error: file not found"))
+  (is = (ai::unix-to-universal 1792443000) (ai::claude-limit-text-reset "Claude AI usage limit reached|1792443000"))
+  (let ((noon (encode-universal-time 0 5 15 19 10 2026)))
+    (is string= "3:05 PM" (ai::format-reset-time noon noon))
+    (true (search "3:05 PM" (ai::format-reset-time noon (+ noon (* 2 86400)))))))
+
+(define-test usage-exact-percentages
+  :parent agent-integration
+  ;; 99.6% of the week used is not the week used up: only the five-hour
+  ;; window is, so it's that window's reset that counts.
+  (let ((windows (ai::claude-usage-windows
+                  (ai:parse-json "{\"unifiedWindows\":{\"five_hour\":{\"utilization\":1.0,\"resetsAt\":1792443000},\"seven_day\":{\"utilization\":0.996,\"resetsAt\":1792947600}}}"))))
+    (is = (ai::unix-to-universal 1792443000) (ai::exhausted-reset windows))
+    (is string= "0% 5h / <1% 7d" (ai::usage-summary windows)))
+  (is string= "71% 5h" (ai::usage-summary (ai::claude-usage-windows
+                                           (ai:parse-json "{\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.29}}}")))))
+
+(defun claude-result (agent text error)
+  "Feed AGENT (a Claude agent, busy with a turn) the turn's result event."
+  (setf (ai::agent-busy agent) t)
+  (ai::claude-agent-event agent nil (ai::make-claude-event :kind :result :text text :error error)))
+
+(define-test claude-limit-evidence
+  :parent agent-integration
+  (let ((agent (make-instance 'ai:claude-agent))
+        (errors '()))
+    (flet ((turn (text)
+             (setf (ai::agent-callback agent) (lambda (tx e) (declare (ignore tx)) (push e errors)))
+             (claude-result agent text t)
+             (first errors)))
+      ;; A new limit replaces an expired reset time.
+      (setf (ai::agent-out-until agent) (- (get-universal-time) 3600))
+      (is eq :out-of-usage (turn "Claude AI usage limit reached|1792443000"))
+      (is = (ai::unix-to-universal 1792443000) (ai::agent-out-until agent))
+      ;; A limit left over as :unknown doesn't make a sign-in failure one.
+      (setf (ai::agent-out-until agent) :unknown)
+      (is eq t (turn "Invalid API key · Please run /login"))
+      ;; This turn's rejected rate-limit event is evidence, even with plain text.
+      (ai::claude-agent-event agent nil (ai::make-claude-event
+                                         :kind :rate-limit
+                                         :data (ai:parse-json "{\"status\":\"rejected\",\"resetsAt\":1792443000}")))
+      (is eq :out-of-usage (turn "Error"))
+      ;; ...for that turn only.
+      (is eq t (turn "Error")))))
+
+(defun run-pausing (mode claude-replies codex-replies)
+  "Like RUN-FAKE, also collecting the paused steps."
+  (let* ((claude (make-instance 'fake-agent :id :claude :name "Claude" :replies claude-replies))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies codex-replies))
+         (paused '())
+         (notes '())
+         (workflow (make-instance 'ai:workflow :mode mode :lead claude :partner codex :request "Add frobnicate"
+                                               :on-message (lambda (from to text kind)
+                                                             (declare (ignore to))
+                                                             (when (eq from :system) (push (list kind text) notes)))
+                                               :on-pause (lambda (w step) (declare (ignore w)) (push step paused)))))
+    (ai:start-workflow workflow)
+    (values workflow paused claude codex notes)))
+
+(define-test reviewer-out-then-unreviewed
+  :parent agent-integration
+  (multiple-value-bind (workflow paused claude codex)
+      (run-pausing :review (list (says "Wrote it")) (list (says :out-of-usage)))
+    (declare (ignore claude codex))
+    (is eq :running (ai:workflow-state workflow))
+    (is = 1 (length paused))
+    (is eq :review (ai::step-role (first paused)))
+    (is string= "ChatGPT's review of Claude's work" (ai::step-description (first paused)))
+    (ai::hand-off-step workflow (first paused))
+    (is eq :finished (ai:workflow-state workflow))
+    (is eq :unreviewed (ai::loop-state (first (ai:workflow-loops workflow))))
+    ;; A second click does nothing.
+    (ai::hand-off-step workflow (first paused))
+    (is eq :finished (ai:workflow-state workflow))))
+
+(define-test out-then-resumed
+  :parent agent-integration
+  (multiple-value-bind (workflow paused)
+      (run-pausing :review (list (says "Wrote it"))
+                   (list (says :out-of-usage) (says (format nil "Fine.~%VERDICT: APPROVED"))))
+    (ai::resume-step workflow (first paused))
+    (is eq :finished (ai:workflow-state workflow))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))))
+
+(define-test author-out-then-taken-over
+  :parent agent-integration
+  (multiple-value-bind (workflow paused claude codex)
+      (run-pausing :review (list (says :out-of-usage)) (list (says "Took it over and wrote it")))
+    (declare (ignore claude))
+    (is eq :work (ai::step-role (first paused)))
+    (true (ai::can-hand-off-p workflow (first paused)))
+    (ai::hand-off-step workflow (first paused))
+    (true (search "taking it over" (first (fake-prompts codex))))
+    (true (search "Add frobnicate" (first (fake-prompts codex))))
+    (is eq :finished (ai:workflow-state workflow))
+    (let ((loop (first (ai:workflow-loops workflow))))
+      (is eq :unreviewed (ai::loop-state loop))
+      (is eq codex (ai::loop-author loop)))))
+
+(define-test plan-out-then-taken-over
+  :parent agent-integration
+  (multiple-value-bind (workflow paused claude codex)
+      (run-pausing :divide (list (says :out-of-usage)) (list (says "Did the whole thing")))
+    (declare (ignore claude))
+    (is eq :plan (ai::step-role (first paused)))
+    (ai::hand-off-step workflow (first paused))
+    (true (search "do all of it yourself" (first (fake-prompts codex))))
+    (is eq :finished (ai:workflow-state workflow))
+    (is eq :unreviewed (ai::loop-state (first (ai:workflow-loops workflow))))))
+
+(define-test stop-while-paused
+  :parent agent-integration
+  (multiple-value-bind (workflow paused)
+      (run-pausing :review (list (says "Wrote it")) (list (says :out-of-usage)))
+    (ai:stop-workflow workflow)
+    (is eq :stopped (ai:workflow-state workflow))
+    (false (ai::workflow-paused workflow))
+    ;; Choices on the old card do nothing now.
+    (ai::resume-step workflow (first paused))
+    (is eq :stopped (ai:workflow-state workflow))))
+
+(define-test out-agent-turns-prompts-away
+  :parent agent-integration
+  (let ((agent (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies (list (says "should not run"))))
+        (result nil))
+    (ai::agent-ran-out agent (+ (get-universal-time) 3600))
+    (true (ai::agent-out-of-usage-p agent))
+    (ai:agent-submit agent "work" (lambda (text error) (setf result (list text error))))
+    (is eq :out-of-usage (second result))
+    (true (search "out of usage until" (first result)))
+    (false (fake-prompts agent))
+    ;; Unknown reset: it still tries (it may have reset).
+    (ai::agent-ran-out agent nil)
+    (false (ai::agent-out-of-usage-p agent))
+    ;; A successful turn clears it.
+    (ai:agent-submit agent "work" (lambda (text error) (declare (ignore text error))))
+    (false (ai::agent-out-until agent))))
 
 ;;; Codex against a fake app-server (tests/fake-codex, which needs python3)
 
