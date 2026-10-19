@@ -5,3 +5,6 @@
 - [x] **Completion and attention notifications:** Notify the user when both agents finish, a permission request needs attention, or usage limits pause a task.
 - [x] **Separate worktrees for split tasks:** Give each agent its own worktree, then integrate and review their changes, allowing tasks with overlapping files to run independently.
 - [x] **Compare proposals mode:** Have both agents independently propose an approach, then reconcile their differences before implementation.
+- [ ] **Check command before review:** Set a per-folder check command (`make test`, `npm test`, …) that runs after each work round. A failure goes back to the author with its output before the reviewer is asked, and the output is attached to the review prompt, so approval also means the checks pass.
+- [ ] **Shared project notes:** A per-folder notes file (or the project's `AGENTS.md` / `CLAUDE.md`) included in both agents' prompts, so project conventions don't have to be restated each task.
+- [ ] **Drag files and images into prompts:** Drop a file or image onto a pane's message box (or the middle request box) to attach it to the prompt sent to that agent, or to both.
