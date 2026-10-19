@@ -764,9 +764,10 @@ usage after the turn) brings the Wait button."
 (defun folder-label (directory)
   (let ((home (namestring (user-homedir-pathname)))
         (path (string-right-trim "/" (namestring directory))))
-    (if (and (> (length path) (length home)) (string= home path :end2 (length home)))
-        (format nil "~~/~a" (subseq path (length home)))
-        path)))
+    (cond ((string= path (string-right-trim "/" home)) "~")
+          ((and (> (length path) (length home)) (string= home path :end2 (length home)))
+           (format nil "~~/~a" (subseq path (length home))))
+          (t path))))
 
 (defun set-directory (directory)
   "Have both agents work in DIRECTORY, in new conversations."
@@ -1030,7 +1031,9 @@ usage after the turn) brings the Wait button."
     (let ((directory (or *directory*
                          (let ((saved (setting :directory)))
                            (and saved (uiop:directory-exists-p saved)))
-                         (uiop:getcwd))))
+                         ;; Started from the Finder, the current directory is /.
+                         (let ((cwd (uiop:getcwd)))
+                           (if (equal (namestring cwd) "/") (user-homedir-pathname) cwd)))))
       (setf *directory* nil)
       (set-directory directory))
     (update-controls)

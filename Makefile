@@ -3,7 +3,7 @@
 LISP ?= sbcl
 RUN = $(LISP) --non-interactive --eval '(require :asdf)' --eval '(push (truename ".") asdf:*central-registry*)'
 
-.PHONY: load test run dev build clean
+.PHONY: load test run dev build app install-app clean
 
 # Load the system, fetching its dependencies
 load:
@@ -28,6 +28,17 @@ dev:
 build:
 	$(RUN) --eval '(ql:quickload :agent-integration)' --eval '(gtk4:save-executable "bin/agent-integration" (function agent-integration:main))'
 
+# The macOS app: build/Agent Duet.app (GTK, libadwaita and VTE come from Homebrew)
+app:
+	$(LISP) --dynamic-space-size 2048 --non-interactive --load scripts/build-app.lisp
+	SBCL=$(LISP) scripts/make-app.sh
+
+# Build the app and put it in /Applications
+install-app: app
+	rm -rf "/Applications/Agent Duet.app"
+	ditto "build/Agent Duet.app" "/Applications/Agent Duet.app"
+	@echo "Installed /Applications/Agent Duet.app"
+
 clean:
 	find . -name '*.fasl' -delete
-	rm -rf bin
+	rm -rf bin build

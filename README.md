@@ -112,6 +112,21 @@ make build    # bin/agent-integration
 
 Or `(agent-integration:main "/path/to/project/")` to choose the folder.
 
+### As a Mac app
+
+```sh
+make app           # build/Agent Duet.app
+make install-app   # build it and put it in /Applications
+```
+
+The app carries its own Lisp image and SBCL runtime; GTK, libadwaita and VTE
+still come from Homebrew (`brew install gtk4 libadwaita vte3`). Opened from the
+Finder or the Dock, it takes `PATH` from your login shell, so `claude`, `codex`
+and your tools are found as in a terminal, and it starts in the last folder you
+used (your home folder the first time). Its output goes to
+`~/.local/state/agent-duet/agent-duet.log`. It's signed ad hoc, or with
+`CODESIGN_IDENTITY` if that's set.
+
 ## Layout of the code
 
 - `src/json.lisp`, `src/claude.lisp`, `src/codex.lisp`, `src/markdown.lisp`

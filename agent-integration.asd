@@ -28,7 +28,8 @@
   :serial t
   :components ((:file "ui")
                (:file "terminal")
-               (:file "preview"))
+               (:file "preview")
+               (:file "app"))
   :entry-point "agent-integration:main"
   :in-order-to ((test-op (test-op "agent-integration/tests"))))
 
