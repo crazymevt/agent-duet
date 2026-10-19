@@ -52,7 +52,30 @@
     (true (search "failed (exit code 7)" (first (fake-prompts reviewer))))
     (true (search (format nil "```~%broken~%~%```") (first (fake-prompts reviewer))))
     (true (search (format nil "still fails after ~d fix attempts" ai::*check-fix-attempts*)
-                  (first (fake-prompts reviewer))))))
+                  (first (fake-prompts reviewer))))
+    ;; The reviewer approved, but approval means the check passes too.
+    (let ((loop (first (ai:workflow-loops workflow))))
+      (true (ai::loop-check-failed loop))
+      (is eq :unresolved (ai::loop-state loop)))))
+
+(define-test check-on-takeover :parent agent-duet
+  ;; Work taken over goes unreviewed, but its check still runs and is fixed.
+  (with-check-workflow (workflow author reviewer directory "test -f done-marker"
+                                (list (says "Done")
+                                      (lambda (prompt)
+                                        (true (search "exit code 1" prompt))
+                                        (write-file-text directory "done-marker" "ok")
+                                        "Fixed")))
+    (setf (ai:workflow-state workflow) :running)
+    (ai::run-loop workflow (ai::make-review-loop :author author :reviewer reviewer :task "Do it"
+                                                 :skip-review t)
+                  "Do it")
+    (true (wait-until (lambda () (eq :finished (ai:workflow-state workflow)))))
+    (let ((loop (first (ai:workflow-loops workflow))))
+      (is = 2 (length (fake-prompts author)))
+      (false (fake-prompts reviewer))
+      (false (ai::loop-check-failed loop))
+      (is eq :unreviewed (ai::loop-state loop)))))
 
 (define-test check-disabled :parent agent-duet
   (dolist (command '(nil "   "))

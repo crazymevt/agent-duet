@@ -48,5 +48,6 @@
                              (:file "check")
                              (:file "history")
                              (:file "notify")
+                             (:file "prompts")
                              (:file "worktree"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))

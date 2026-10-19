@@ -90,6 +90,7 @@
   (tree nil)                            ; the worktree it's done in, or nil for the folder
   (check-handle nil)                    ; active asynchronous check
   (check-report nil)                    ; most recent result for the reviewer
+  (check-failed nil)                    ; true while the check fails after the fix attempts
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
   (state :working))                     ; :working :checking :reviewing :approved :unresolved :unreviewed :failed
@@ -681,7 +682,8 @@ lead, who made it, is told its part again."
   (loop-work workflow loop prompt))
 
 (defun loop-work (workflow loop prompt)
-  (setf (loop-check-report loop) nil)
+  (setf (loop-check-report loop) nil
+        (loop-check-failed loop) nil)
   (setf (loop-state loop) :working)
   (submit workflow (loop-author loop) prompt
           (lambda (text error)
@@ -690,13 +692,18 @@ lead, who made it, is told its part again."
                   (t
                    (setf (loop-summary loop) text)
                    (post workflow (loop-author loop) (loop-reviewer loop) text :work)
-                   (if (loop-skip-review loop)
-                       (progn (setf (loop-state loop) :unreviewed)
-                         (note workflow "~@[~a ~]done, not reviewed."
-                               (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)))
-                         (check-finished workflow))
-                       (loop-check workflow loop)))))
+                   (loop-check workflow loop))))
           :role :work :loop loop))
+
+(defun loop-checked (workflow loop)
+  "The checks are done with: review the work, or, taken over, finish it unreviewed."
+  (if (loop-skip-review loop)
+      (progn (setf (loop-state loop) :unreviewed)
+        (note workflow "~@[~a ~]done, not reviewed~:[~;; its check still fails~]."
+              (and (loop-label loop) (string-capitalize (loop-label loop) :end 1))
+              (loop-check-failed loop))
+        (check-finished workflow))
+      (loop-review workflow loop)))
 
 (defun check-in (workflow loop token command fixes code output timed-out)
   "Accept only the current check's result, delivered on the workflow thread."
@@ -710,15 +717,18 @@ lead, who made it, is told its part again."
                                     command (if passed "passed" "failed") code))))
            (report (format nil "~a~%~%~a" status (check-output-block (check-output-tail output)))))
       ;; Users see all results, but successful output adds no information
-      ;; to the review. Failures stay explicit even after the fix budget.
+      ;; to the review. Failures stay explicit even after the fix budget,
+      ;; and the work can't be approved until the check passes.
       (setf (loop-check-report loop)
             (if passed status
-                (format nil "The check still fails after ~d fix attempt~:p; take that into account in your review.~%~%~a"
-                        fixes report)))
+                (format nil "The check still fails after ~d fix attempt~:p, so the work can't be approved ~
+until it passes: request changes, saying what needs fixing.~%~%~a"
+                        fixes report))
+            (loop-check-failed loop) (not passed))
       (post workflow :system (loop-author loop) report :check)
       (when (workflow-live-p workflow)
         (if (or passed (>= fixes *check-fix-attempts*))
-            (loop-review workflow loop)
+            (loop-checked workflow loop)
             (progn
               (setf (loop-state loop) :working)
               (submit workflow (loop-author loop)
@@ -736,7 +746,7 @@ lead, who made it, is told its part again."
   "Check the current work before review; FIXES does not count review rounds."
   (let ((command (blank-to-nil (workflow-check-command workflow))))
     (if (null command)
-        (loop-review workflow loop)
+        (loop-checked workflow loop)
         (let ((token (list nil)))
           (setf (loop-state loop) :checking
                 (loop-check-handle loop) token)
@@ -777,7 +787,13 @@ still open, and is asked once to settle them (that's no new round)."
   (post workflow (loop-reviewer loop) (loop-author loop) text :review)
   (take-findings workflow loop text)
   (let ((open (count-findings (loop-findings loop) :open)))
-    (cond ((and (eq (review-verdict text) :approved) (plusp open) (not confirming))
+    (cond ((and (eq (review-verdict text) :approved) (loop-check-failed loop))
+           ;; Approval means the check passes too; the user can continue it.
+           (setf (loop-state loop) :unresolved)
+           (note workflow "~a approved ~a, but its check still fails, so it isn't approved."
+                 (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work"))
+           (check-finished workflow))
+          ((and (eq (review-verdict text) :approved) (plusp open) (not confirming))
            (note workflow "~a approved with ~d finding~:p still open; asking it to settle them."
                  (agent-name (loop-reviewer loop)) open)
            (loop-review workflow loop t))

@@ -5,8 +5,8 @@
 - *Check* command per folder (`make test`, `npm test`, …): it runs after
   each round of work, before the review. A failure goes back to the author
   with its output (up to twice a round), and the review prompt says how the
-  check went. The reviewer can still approve work whose check fails after
-  the fix attempts, so look at the last check result too. The conversation
+  check went. Work whose check still fails after the fix attempts can't be
+  approved, and work taken over unreviewed is checked too. The conversation
   shows each run and its result.
 - *Shared notes*: Claude is given the folder's `AGENTS.md`, and ChatGPT its
   `CLAUDE.md`, with their instructions, so both follow the project's

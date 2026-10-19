@@ -78,10 +78,12 @@ merged result), and the conversation shows whether it passed, with the end
 of its output. If it fails, the author is given the command, its exit code
 and output to fix, and it runs again, up to twice a round; then the review
 goes ahead anyway. The review prompt says how the check went (and, if it
-still fails, includes its output). An approval doesn't mean the check passed:
-after the fix attempts, the reviewer may approve work whose check still fails,
-so look at the last check result in the conversation. A check that runs over 10 minutes is stopped as failed; **Stop** stops
-it too.
+still fails, includes its output). Work can't be approved while its check
+fails: the reviewer is asked to request changes, and if it approves anyway,
+the work is stopped as not approved (**Continue** carries it on). Work taken
+over because the reviewer ran out of usage is still checked and fixed the
+same way before it's marked not reviewed. A check that runs over 10 minutes
+is stopped as failed; **Stop** stops it too.
 
 Each review lists its findings in a checklist, `F1`, `F2`, … with the file
 and line where there is one. The next review marks each finding fixed,
