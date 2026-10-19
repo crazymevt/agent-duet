@@ -35,7 +35,7 @@
 ;;;; workflow's ON-MESSAGE is told of each message passed between them, for
 ;;;; the conversation view: (on-message from to text kind), FROM and TO
 ;;;; being agents, :user or :system, and KIND one of :request :proposal
-;;;; :plan :work :review :findings :note.
+;;;; :plan :work :review :findings :note :check.
 ;;;;
 ;;;; When an agent's account runs out of usage, the step it was given (a
 ;;;; STEP) pauses rather than fails, and ON-PAUSE is told: the user decides
@@ -54,7 +54,8 @@
 (defparameter *default-max-rounds* 3)
 
 (defclass workflow ()
-  ((mode :initarg :mode :initform :review :reader workflow-mode)
+  ((check-command :initarg :check-command :initform nil :reader workflow-check-command)
+   (mode :initarg :mode :initform :review :reader workflow-mode)
    (lead :initarg :lead :reader workflow-lead)
    (partner :initarg :partner :reader workflow-partner)
    (request :initarg :request :reader workflow-request)
@@ -87,9 +88,11 @@
   (last-review nil)                     ; the reviewer's latest review
   (findings '())                        ; the review checklist: FINDINGs, by id
   (tree nil)                            ; the worktree it's done in, or nil for the folder
+  (check-handle nil)                    ; active asynchronous check
+  (check-report nil)                    ; most recent result for the reviewer
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
-  (state :working))                     ; :working :reviewing :approved :unresolved :unreviewed :failed
+  (state :working))                     ; :working :checking :reviewing :approved :unresolved :unreviewed :failed
 
 (defstruct (workflow-step (:conc-name step-) (:constructor make-step))
   "A prompt given to an agent for the workflow, kept so it can be given
@@ -255,7 +258,10 @@ End your reply with one line on its own, exactly one of:~%~
 VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
             author (loop-task loop) author (loop-summary loop)
-            (and (loop-tree loop) (worktree-note loop))
+            (let ((tree (and (loop-tree loop) (worktree-note loop))))
+              (if (loop-check-report loop)
+                  (format nil "~a~a~%~%" (or tree "") (loop-check-report loop))
+                  tree))
             findings (findings-lines findings) findings
             (next-finding-id findings))))
 
@@ -675,6 +681,7 @@ lead, who made it, is told its part again."
   (loop-work workflow loop prompt))
 
 (defun loop-work (workflow loop prompt)
+  (setf (loop-check-report loop) nil)
   (setf (loop-state loop) :working)
   (submit workflow (loop-author loop) prompt
           (lambda (text error)
@@ -688,8 +695,70 @@ lead, who made it, is told its part again."
                          (note workflow "~@[~a ~]done, not reviewed."
                                (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)))
                          (check-finished workflow))
-                       (loop-review workflow loop)))))
+                       (loop-check workflow loop)))))
           :role :work :loop loop))
+
+(defun check-in (workflow loop token command fixes code output timed-out)
+  "Accept only the current check's result, delivered on the workflow thread."
+  (when (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
+    (setf (loop-check-handle loop) nil)
+    (let* ((passed (and (not timed-out) (eql code 0)))
+           (status (cond (timed-out
+                          (format nil "Check `~a` failed (exit code ~a; timed out)." command code))
+                         ((null code) (format nil "Check `~a` couldn't run (no exit code)." command))
+                         (t (format nil "Check `~a` ~a (exit code ~a)."
+                                    command (if passed "passed" "failed") code))))
+           (report (format nil "~a~%~%~a" status (check-output-block (check-output-tail output)))))
+      ;; Users see all results, but successful output adds no information
+      ;; to the review. Failures stay explicit even after the fix budget.
+      (setf (loop-check-report loop)
+            (if passed status
+                (format nil "The check still fails after ~d fix attempt~:p; take that into account in your review.~%~%~a"
+                        fixes report)))
+      (post workflow :system (loop-author loop) report :check)
+      (when (workflow-live-p workflow)
+        (if (or passed (>= fixes *check-fix-attempts*))
+            (loop-review workflow loop)
+            (progn
+              (setf (loop-state loop) :working)
+              (submit workflow (loop-author loop)
+                      (format nil "~a~%~%Fix the failing check, then summarize what you changed." report)
+                      (lambda (text error)
+                        (if error
+                            (loop-failed workflow loop (format nil "Check fix failed: ~a" text))
+                            (progn
+                              (setf (loop-summary loop) text)
+                              (post workflow (loop-author loop) (loop-reviewer loop) text :work)
+                              (loop-check workflow loop (1+ fixes)))))
+                      :role :work :loop loop)))))))
+
+(defun loop-check (workflow loop &optional (fixes 0))
+  "Check the current work before review; FIXES does not count review rounds."
+  (let ((command (blank-to-nil (workflow-check-command workflow))))
+    (if (null command)
+        (loop-review workflow loop)
+        (let ((token (list nil)))
+          (setf (loop-state loop) :checking
+                (loop-check-handle loop) token)
+          (post workflow :system (loop-author loop)
+                (format nil "Running check~@[ (~a)~]: `~a`" (loop-label loop) command) :check)
+          ;; Install a token before launching: immediate delivery must not
+          ;; overwrite a newer check's handle when RUN-CHECK returns.
+          (when (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
+            (setf (car token)
+                  (run-check command (or (loop-tree loop) (agent-directory (loop-author loop)))
+                             (agent-deliver (loop-author loop))
+                             (lambda (code output timed-out)
+                               (check-in workflow loop token command fixes code output timed-out))))
+            ;; Also cover cancellation between launching and storing the handle.
+            (unless (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
+              (kill-check (car token))))))))
+
+(defun cancel-workflow-checks (workflow)
+  (dolist (loop (workflow-loops workflow))
+    (let ((token (loop-check-handle loop)))
+      (setf (loop-check-handle loop) nil)
+      (when token (kill-check (car token))))))
 
 (defun loop-review (workflow loop &optional confirming)
   "Have LOOP's reviewer review the work; CONFIRMING: it approved with findings
@@ -761,6 +830,7 @@ still open, and is asked once to settle them (that's no new round)."
             (t (integrate workflow))))))
 
 (defun finish-workflow (workflow)
+  (cancel-workflow-checks workflow)
   (setf (workflow-state workflow) :finished
         (workflow-context workflow) (working-context workflow))
   (note workflow "Done: ~{~a~^; ~}."
@@ -771,6 +841,7 @@ still open, and is asked once to settle them (that's no new round)."
     (funcall (workflow-on-finish workflow) workflow)))
 
 (defun fail (workflow fmt &rest args)
+  (cancel-workflow-checks workflow)
   (apply #'note workflow fmt args)
   (leave-worktrees workflow)
   (setf (workflow-state workflow) :finished)
@@ -783,6 +854,7 @@ still open, and is asked once to settle them (that's no new round)."
     (setf (workflow-state workflow) :stopped
           (workflow-paused workflow) '()
           (workflow-pending-plan workflow) nil)
+    (cancel-workflow-checks workflow)
     (agent-cancel (workflow-lead workflow))
     (agent-cancel (workflow-partner workflow))
     (note workflow "Stopped.")
@@ -907,7 +979,7 @@ worktree, into this folder. The overall request:~%~%~a" (workflow-request workfl
 `git diff ~a` shows all of them." (subseq base 0 (min 12 (length base))) base))))
       (setf (workflow-loops workflow) (append (workflow-loops workflow) (list l)))
       (note workflow "~a reviews the merged result." (agent-name (workflow-partner workflow)))
-      (loop-review workflow l))))
+      (loop-check workflow l))))
 
 (defun integration-failed (workflow why trees)
   "Merging stopped at TREES (the first not merged): say so, and end. The

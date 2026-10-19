@@ -19,6 +19,7 @@
                (:file "notify")
                (:file "worktree")
                (:file "agents")
+               (:file "check")
                (:file "workflow")))
 
 (defsystem "agent-duet"
@@ -44,6 +45,7 @@
   :components ((:module "tests"
                 :serial t
                 :components ((:file "main")
+                             (:file "check")
                              (:file "history")
                              (:file "notify")
                              (:file "worktree"))))
