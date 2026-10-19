@@ -162,6 +162,13 @@
     (let ((viewport (gtk:scrolled-window-get-child scroller)))
       (when (typep viewport 'gtk:viewport)
         (gtk:viewport-set-scroll-to-focus viewport nil)))
+    ;; Layout updates the range after idle callbacks may already have run.
+    ;; Follow that range too, so streamed and rendered replies stay in view.
+    (gobject:connect (gtk:scrolled-window-get-vadjustment scroller) :changed
+                     (lambda (adjustment)
+                       (gtk:adjustment-set-value adjustment
+                                                (max 0d0 (- (gtk:adjustment-get-upper adjustment)
+                                                            (gtk:adjustment-get-page-size adjustment))))))
     (values messages scroller)))
 
 (defun pane-scroll-to-end (pane)
@@ -220,11 +227,11 @@
 
 (defun model-choice-name (agent model)
   (if (eq (agent-id agent) :claude)
-      model
+      (claude-model-label model)
       (or (jget model "displayName") (codex-model-id model))))
 
 (defun model-choice-id (agent model)
-  (if (eq (agent-id agent) :claude) model (codex-model-id model)))
+  (if (eq (agent-id agent) :claude) (claude-model-id model) (codex-model-id model)))
 
 (defun pane-current-model-entry (pane)
   (nth (gtk:drop-down-get-selected (agent-pane-model-dropdown pane)) (agent-pane-models pane)))
@@ -359,7 +366,7 @@ for Codex, the one marked as the default)."
          (out-now (or (agent-out-of-usage-p agent) (eq out :unknown))))
     (gtk:label-set-text (pane-status pane)
                         (format nil "~a~:[~@[ · ~a left~]~;~*~]"
-                                (cond (waiting "Waiting for your approval")
+                                (cond (waiting "Waiting for you")
                                       ((agent-busy agent) "Working…")
                                       (out-now (if (integerp out)
                                                    (format nil "Out of usage until ~a" (format-reset-time out))
@@ -388,10 +395,12 @@ for Codex, the one marked as the default)."
 ;;; Approvals
 
 (defun decision-text (decision)
-  (ecase decision
-    (:allow "Allowed")
-    (:always "Allowed for the rest of this conversation")
-    (:deny "Denied")))
+  (if (consp decision)
+      (format nil "Answered: ~{~a~^; ~}" (mapcar #'cdr (cdr decision)))
+      (ecase decision
+        (:allow "Allowed")
+        (:always "Allowed for the rest of this conversation")
+        (:deny "Denied"))))
 
 (defun pane-approval (pane id title text)
   (let* ((agent (agent-pane-agent pane))
@@ -418,6 +427,97 @@ for Codex, the one marked as the default)."
     (pane-update-status pane)
     (when (workflow-running-p)
       (pane-note *middle* (format nil "~a is waiting for you to approve a command (~a pane)." (agent-name agent)
+                                  (if (eq (agent-id agent) :claude) "left" "right"))
+                 "warning" "duet-note"))))
+
+(defun question-choices (question)
+  "Widgets for one of AskUserQuestion's QUESTIONS, and a function giving the
+answer chosen (nil when none): the chosen labels, or what was typed in Other."
+  (let* ((multiple (jtrue-p (jget question "multiSelect")))
+         (box (make-instance 'gtk:box :orientation :vertical :spacing 4))
+         (checks '())
+         (group nil))
+    (flet ((check (label)
+             (let ((check (make-instance 'gtk:check-button :label label)))
+               (unless multiple
+                 (if group (gtk:check-button-set-group check group) (setf group check)))
+               check)))
+      (let ((header (jget question "header")))
+        (when (and (stringp header) (plusp (length header)))
+          (gtk:box-append box (make-instance 'gtk:label :label header :xalign 0.0 :css-classes '("caption-heading" "dim-label")))))
+      (gtk:box-append box (make-instance 'gtk:label :label (or (jget question "question") "") :xalign 0.0 :wrap t
+                                                    :wrap-mode :word-char :selectable t))
+      (dolist (option (jlist (jget question "options")))
+        (let ((check (check (jget option "label")))
+              (description (jget option "description")))
+          (push (cons check (jget option "label")) checks)
+          (gtk:box-append box check)
+          (when (and (stringp description) (plusp (length description)))
+            (gtk:box-append box (make-instance 'gtk:label :label description :xalign 0.0 :wrap t :wrap-mode :word-char
+                                                          :margin-start 28 :css-classes '("dim-label"))))))
+      (let ((other (check "Other:"))
+            (entry (make-instance 'gtk:entry :hexpand t :placeholder-text "Your own answer")))
+        (gobject:connect entry :changed
+                         (lambda (e) (when (plusp (length (gtk:editable-get-text e)))
+                                       (gtk:check-button-set-active other t))))
+        (gtk:box-append box (gtk:build (gtk:box :spacing 6 other entry)))
+        (setf checks (nreverse checks))
+        (values box
+                (lambda ()
+                  (let ((chosen (loop for (check . label) in checks
+                                      when (gtk:check-button-get-active check) collect label))
+                        (typed (string-trim " " (gtk:editable-get-text entry))))
+                    (when (and (gtk:check-button-get-active other) (plusp (length typed)))
+                      (setf chosen (append chosen (list typed))))
+                    (and chosen (format nil "~{~a~^, ~}" chosen))))
+                (cons other (mapcar #'car checks))
+                entry)))))
+
+(defun pane-question (pane id questions)
+  (let* ((agent (agent-pane-agent pane))
+         (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+         (submit (make-instance 'gtk:button :label "Submit" :css-classes '("suggested-action") :sensitive nil))
+         (skip (make-instance 'gtk:button :label "Skip" :tooltip-text "Don't answer; the agent carries on without it"))
+         (card (gtk:build (gtk:box :orientation :vertical :spacing 10 :css-classes '("duet-approval")
+                            (gtk:label :label (format nil "~a has ~:[a question~;questions~]:" (agent-name agent)
+                                                      (rest questions))
+                                       :xalign 0.0 :css-classes '("heading")))))
+         (answers '())
+         (boxes '()))
+    (labels ((answers ()
+               ;; Every question's answer, or nil while one is unanswered.
+               (loop for (question . answer) in answers
+                     for text = (funcall answer)
+                     unless text return nil
+                     collect (cons question text)))
+             (refresh (&rest ignore)
+               (declare (ignore ignore))
+               (gtk:widget-set-sensitive submit (and (answers) t)))
+             (finish (decision)
+               (dolist (box boxes) (gtk:widget-set-sensitive box nil))
+               (agent-answer-approval agent id decision)))
+      (dolist (question questions)
+        (multiple-value-bind (box answer checks entry) (question-choices question)
+          (dolist (check checks) (gobject:connect check :toggled #'refresh))
+          (gobject:connect entry :changed #'refresh)
+          (push (cons (or (jget question "question") "") answer) answers)
+          (push box boxes)
+          (gtk:box-append card box)))
+      (setf answers (nreverse answers))
+      (gobject:connect submit :clicked
+                       (lambda (b) (declare (ignore b))
+                         (let ((chosen (answers)))
+                           (when chosen (finish (cons :answers chosen))))))
+      (gobject:connect skip :clicked (lambda (b) (declare (ignore b)) (finish :deny))))
+    (gtk:box-append buttons skip)
+    (gtk:box-append buttons submit)
+    (gtk:box-append card buttons)
+    (pane-finish-stream pane)
+    (setf (gethash id (agent-pane-approvals pane)) buttons)
+    (pane-append pane card)
+    (pane-update-status pane)
+    (when (workflow-running-p)
+      (pane-note *middle* (format nil "~a is waiting for you to answer a question (~a pane)." (agent-name agent)
                                   (if (eq (agent-id agent) :claude) "left" "right"))
                  "warning" "duet-note"))))
 
@@ -495,7 +595,7 @@ for Codex, the one marked as the default)."
                       (gtk:box :halign :end :css-classes '("duet-prompt")
                         (gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char)))))
 
-(defun agent-pane-event (agent kind &key text title id error busy decision)
+(defun agent-pane-event (agent kind &key text title id error busy decision questions)
   (let ((pane (agent-pane-of agent)))
     (when pane
       (ecase kind
@@ -507,6 +607,7 @@ for Codex, the one marked as the default)."
         (:tool (pane-tool pane id title))
         (:tool-result (pane-tool-result pane id text error))
         (:approval (pane-approval pane id title text))
+        (:question (pane-question pane id questions))
         (:approval-answered (pane-approval-answered pane id decision))
         (:usage (pane-update-status pane) (refresh-pause-cards agent))
         (:note (pane-note pane text "error"))
@@ -901,7 +1002,11 @@ usage after the turn) brings the Wait button."
   (sb-thread:make-thread
    (lambda ()
      (let ((status (check-claude)))
-       (deliver (lambda () (show-claude-status status)))))
+       (deliver (lambda () (show-claude-status status)))
+       (when (claude-status-program status)
+         (let ((models (ignore-errors (claude-list-models (claude-status-program status)))))
+           (when models
+             (deliver (lambda () (set-model-choices (agent-pane-of *claude*) models))))))))
    :name "check claude")
   (let ((agent *codex*))
     (sb-thread:make-thread

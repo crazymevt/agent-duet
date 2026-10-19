@@ -68,6 +68,20 @@
       (is string= "deny" (ai:jget answer "response" "response" "behavior"))
       (false (ai:jget answer "response" "response" "updatedPermissions")))))
 
+(define-test claude-question
+  :parent agent-integration
+  (let* ((event (first (ai::parse-claude-event
+                        "{\"type\":\"control_request\",\"request_id\":\"q1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which database?\",\"header\":\"DB\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Relational\"},{\"label\":\"SQLite\",\"description\":\"Embedded\"}],\"multiSelect\":false}]}}}")))
+         (input (ai::event-input event))
+         (answer (ai:parse-json (ai::permission-response-line
+                                 "q1" t :input (ai::question-answer-input input '(("Which database?" . "SQLite")))))))
+    (is string= "AskUserQuestion" (ai::event-name event))
+    (is string= "Which database?" (ai:jget (first (ai::jlist (ai:jget input "questions"))) "question"))
+    ;; The answers go back with the questions, keyed by question text.
+    (is string= "allow" (ai:jget answer "response" "response" "behavior"))
+    (is string= "SQLite" (ai:jget answer "response" "response" "updatedInput" "answers" "Which database?"))
+    (is string= "DB" (ai:jget answer "response" "response" "updatedInput" "questions" 0 "header"))))
+
 (define-test approvals
   :parent agent-integration
   (let* ((seen '())

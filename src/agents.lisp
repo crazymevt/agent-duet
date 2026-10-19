@@ -161,6 +161,14 @@ it would wait for ever."
   (push (cons id answer) (agent-approvals agent))
   (agent-emit agent :approval :id id :title title :text text))
 
+(defun agent-ask-question (agent id questions answer)
+  "Ask the user AGENT's QUESTIONS (AskUserQuestion's, a list of JSON objects
+with question, header, options and multiSelect). ANSWER gets :deny, or
+(:answers . ALIST) mapping each question's text to the chosen labels, joined
+with \", \" when several were chosen."
+  (push (cons id answer) (agent-approvals agent))
+  (agent-emit agent :question :id id :questions questions))
+
 (defun agent-answer-approval (agent id decision)
   "Answer AGENT's approval request ID with DECISION (see AGENT-ASK-APPROVAL)."
   (let ((entry (assoc id (agent-approvals agent) :test #'equal)))
@@ -239,7 +247,8 @@ when it isn't running with the current settings."
                            :session-id (unless resume session) :resume resume
                            :model (agent-model agent) :effort (agent-effort agent)
                            :permission-mode (if (eq permission :full) "bypassPermissions" "acceptEdits")
-                           :permission-tool (and (eq permission :ask) "stdio")
+                           ;; Always, so AskUserQuestion reaches the user (see CLAUDE-AGENT-EVENT).
+                           :permission-tool "stdio"
                            :allowed-tools (unless (eq permission :full) *claude-review-tools*)
                            :system-prompt (collaboration-instructions agent)))
                (new nil))
@@ -267,6 +276,11 @@ when it isn't running with the current settings."
         (format nil "$ ~a" command)
         (claude-tool-title name input))))
 
+(defun question-answer-input (input answers)
+  "AskUserQuestion's INPUT with the user's ANSWERS (question text → answer)."
+  (cons :object (append (remove "answers" (cdr input) :key #'car :test #'equal)
+                        (list (cons "answers" (cons :object answers))))))
+
 (defun claude-agent-event (agent cp event)
   (when (and (eq cp (claude-agent-process agent)) (not (event-subagent event)))
     (case (event-kind event)
@@ -283,12 +297,28 @@ when it isn't running with the current settings."
       (:permission
        (let ((id (event-id event)) (input (event-input event))
              (suggestions (jlist (jget (event-data event) "permission_suggestions"))))
-         (agent-ask-approval agent id (claude-approval-title (event-name event) input) (event-text event)
-                             (lambda (decision)
-                               (when (claude-alive-p cp)
-                                 (claude-answer-permission cp id (not (eq decision :deny))
-                                                           :input input
-                                                           :always-rules (and (eq decision :always) suggestions)))))))
+         (cond
+           ((equal (event-name event) "AskUserQuestion")
+            (agent-ask-question agent id (jlist (jget input "questions"))
+                                (lambda (decision)
+                                  (when (claude-alive-p cp)
+                                    (if (consp decision)
+                                        (claude-answer-permission cp id t
+                                                                  :input (question-answer-input input (cdr decision)))
+                                        (claude-answer-permission cp id nil
+                                                                  :message "The user declined to answer."))))))
+           ;; The CLI asks here only so questions reach the user; outside Ask
+           ;; mode, anything else needing approval is refused as before.
+           ((not (eq (agent-permission agent) :ask))
+            (claude-answer-permission cp id nil :message "Permission to use this tool hasn't been granted."))
+           (t
+            (agent-ask-approval agent id (claude-approval-title (event-name event) input) (event-text event)
+                                (lambda (decision)
+                                  (when (claude-alive-p cp)
+                                    (claude-answer-permission cp id (not (eq decision :deny))
+                                                              :input input
+                                                              :always-rules (and (eq decision :always)
+                                                                                 suggestions)))))))))
       (:rate-limit
        (let ((info (event-data event)))
          (setf (claude-agent-limits agent) info)

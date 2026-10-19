@@ -16,6 +16,44 @@ then the copy inside the Claude desktop app.")
 
 (defparameter *claude-models* '("sonnet" "opus" "haiku"))
 
+(defun claude-model-id (model)
+  (if (stringp model) model (jget model "value")))
+
+(defun claude-model-label (model)
+  "The CLI's versioned model name, without pricing or other description text."
+  (if (stringp model)
+      (string-capitalize model)
+      (let* ((description (jget model "description"))
+             (name (jget model "displayName")))
+        (if (and (stringp description) (not (equal (claude-model-id model) "default")))
+            (string-trim " " (subseq description 0 (position #\· description)))
+            (format nil "~a~@[ (~a)~]" name (jget model "resolvedModel"))))))
+
+(defun claude-list-models (program)
+  "Read the CLI's initialization catalog without submitting a model turn."
+  (let ((ready (sb-thread:make-semaphore))
+        (models nil)
+        (cp nil))
+    (unwind-protect
+         (progn
+           (setf cp (start-claude
+                     (append (claude-arguments) '("--safe-mode" "--strict-mcp-config"))
+                     :program program :directory (uiop:temporary-directory)
+                     :on-event
+                     (lambda (event)
+                       (let ((object (event-data event)))
+                         (when (and (equal (jget object "type") "control_response")
+                                    (equal (jget object "response" "request_id") "models"))
+                           (setf models (remove-if-not #'claude-model-id
+                                                      (jlist (jget object "response" "response" "models"))))
+                           (sb-thread:signal-semaphore ready))))
+                     :on-exit (lambda (code) (declare (ignore code)) (sb-thread:signal-semaphore ready))))
+           (claude-write-line cp (json-string (jobj "type" "control_request" "request_id" "models"
+                                                    "request" (jobj "subtype" "initialize"))))
+           (sb-thread:wait-on-semaphore ready :timeout 10)
+           models)
+      (when cp (stop-claude cp)))))
+
 ;;; Random identifiers
 
 (defun random-octets (n)
