@@ -13,6 +13,8 @@
 (defvar *codex* nil)
 (defvar *panes* '() "Agent id → AGENT-PANE.")
 (defvar *middle* nil "The conversation's PANE.")
+(defvar *checklist* nil "The review checklist panel's PANE.")
+(defvar *checklist-boxes* nil "Checklist heading → current Markdown box, one per review loop.")
 (defvar *workflow* nil "The running or last workflow.")
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
@@ -366,6 +368,16 @@ for Codex, the one marked as the default)."
 
 ;;; The pane
 
+(defun wrapping-controls (&rest widgets)
+  "Let controls wrap without forcing the pane to fit a single wide row."
+  (let ((flow (make-instance 'gtk:flow-box :selection-mode :none
+                             :homogeneous nil :min-children-per-line 1
+                             :max-children-per-line 6 :row-spacing 4 :column-spacing 6
+                             :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 6)))
+    (dolist (widget widgets)
+      (gtk:flow-box-append flow widget))
+    flow))
+
 (defun make-agent-pane (agent)
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 0.0 :hexpand t :ellipsize :end :css-classes '("dim-label")
@@ -404,8 +416,7 @@ for Codex, the one marked as the default)."
                                    (gtk:button :label "New" :css-classes '("flat")
                                                :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
                                                :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
-                          (gtk:box :spacing 6 :margin-start 10 :margin-end 10 :margin-top 4 :margin-bottom 6
-                                   models efforts)
+                          (wrapping-controls models efforts)
                           (gtk:separator)
                           scroller
                           (gtk:separator)
@@ -790,6 +801,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
           (agent-new-conversation agent)
           (clear-agent-pane (agent-pane-of agent)))
         (clear-box (pane-messages *middle*))
+        (clear-checklist)
         (pane-note *middle* "New conversation."))))
 
 (defun replay-history (history)
@@ -815,7 +827,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                    (body (string-left-trim '(#\Newline) (subseq text end))))
               (cond
                 ((string= header "Check") (middle-check body))
-                ((string= header "Review checklist") (pane-append *middle* (markdown-box body "duet-checklist")))
+                ((string= header "Review checklist") (show-checklist body))
                 (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
                                         ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
                                         (t :user))
@@ -847,6 +859,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
         (agent-resume-conversation agent (history-handle history (agent-id agent)))
         (clear-agent-pane (agent-pane-of agent)))
       (clear-box (pane-messages *middle*))
+      (clear-checklist)
       (replay-history history)
       (setf *history* history)
       (pane-note *middle* (format nil "Carrying on the conversation from ~a. Each agent picks it up at its next message."
@@ -913,6 +926,67 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (:review "review")
     (t nil)))
 
+(defun clear-checklist ()
+  "Reset the checklist when changing conversations or folders."
+  (setf *checklist-boxes* nil)
+  (when *checklist*
+    (clear-box (pane-messages *checklist*))
+    (pane-note *checklist* "Review findings will appear here after a review." "dim-label")))
+
+(defun show-checklist (text)
+  "Update this loop's checklist in place, including when replaying history."
+  (when *checklist*
+    ;; Only the bold heading identifies the loop. Counts after its closing
+    ;; ** change between reviews and must not become part of the key.
+    (let* ((heading-end (search "**" text :start2 2))
+           (heading (subseq text 0 (if heading-end (+ heading-end 2)
+                                      (position #\Newline text))))
+           (box (cdr (assoc heading *checklist-boxes* :test #'string=))))
+      (if box
+          (progn (clear-box box) (render-markdown box text)
+                 (pane-scroll-to-end *checklist*))
+          (progn
+            ;; Clear the placeholder only when the first loop arrives.
+            (unless *checklist-boxes* (clear-box (pane-messages *checklist*)))
+            (setf box (markdown-box text "duet-checklist"))
+            (push (cons heading box) *checklist-boxes*)
+            (pane-append *checklist* box))))
+    (unless (gtk:widget-get-visible (control :checklist-panel))
+      (pane-note *middle* "Review checklist updated. Open Checklist to see the findings."
+                 "dim-label" "duet-note"))))
+
+(defun set-checklist-visible (visible)
+  "Show or hide the checklist and share the remaining width between agents."
+  (let ((panel (control :checklist-panel))
+        (content (control :checklist-split)))
+    (when (and panel content)
+      (let* ((width (gtk:widget-get-width content))
+             ;; Keep the user's checklist width when reopening the panel.
+             (panel-width (if (gtk:widget-get-visible panel)
+                              (max 260 (gtk:widget-get-width panel))
+                              (- width (gtk:paned-get-position content))))
+             (available (if visible (- width (max 260 panel-width)) width)))
+        (gtk:widget-set-visible panel visible)
+        (when (plusp available)
+          (when visible (gtk:paned-set-position content available))
+          (gtk:paned-set-position (control :agent-split) (round (* available 0.30)))
+          (gtk:paned-set-position (control :conversation-split) (round (* available 0.42))))))))
+
+(defun make-checklist-panel ()
+  (multiple-value-bind (messages scroller) (make-message-list)
+    (setf *checklist* (make-pane :messages messages :scroller scroller))
+    (clear-checklist)
+    (let ((panel (gtk:build
+                  (gtk:box :orientation :vertical :width-request 260
+                           (gtk:label :label "Review checklists" :xalign 0.0
+                                      :margin-start 12 :margin-top 8 :margin-bottom 8
+                                      :css-classes '("title-4"))
+                           (gtk:separator)
+                           scroller))))
+      (setf (getf *controls* :checklist-panel) panel)
+      (gtk:widget-set-visible panel (setting :checklist-visible t))
+      panel)))
+
 (defun middle-check (text)
   "The check command's progress or result, in the conversation."
   (pane-append *middle* (gtk:build
@@ -936,8 +1010,8 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun middle-message (from to text kind)
   (cond
     ((eq kind :findings)
-     ;; The review checklist: kept as a message, so it comes back with its header.
-     (pane-append *middle* (markdown-box text "duet-checklist"))
+     ;; Keep the history format compatible with earlier conversations.
+     (show-checklist text)
      (record :middle :text (format nil "Review checklist~%~%~a" text))
      (save-current-history))
     ((eq kind :check)
@@ -1283,12 +1357,15 @@ usage after the turn) brings the Wait button."
                 (gtk:separator)
                 scroller
                 (gtk:separator)
-                (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6
-                         mode lead
-                         (gtk:label :label "Rounds" :css-classes '("dim-label") :margin-start 6)
-                         rounds approve-plan worktrees
-                         (gtk:label :label "Check" :css-classes '("dim-label") :margin-start 6)
-                         check)
+                (wrapping-controls
+                 mode lead
+                 (gtk:build
+                  (gtk:box :spacing 6
+                           (gtk:label :label "Rounds" :css-classes '("dim-label")) rounds))
+                 approve-plan worktrees
+                 (gtk:build
+                  (gtk:box :spacing 6
+                           (gtk:label :label "Check" :css-classes '("dim-label")) check)))
                 (composer input send))))))
 
 ;;; The folder, what the agents may do, and the look
@@ -1313,6 +1390,7 @@ usage after the turn) brings the Wait button."
           (agent-cancel agent)
           (agent-shutdown agent)))
       (finish-history)
+      (clear-checklist)
       (setf *directory* directory)
       (note-recent-folder directory)
       (setf (setting :directory) (namestring directory))
@@ -1443,6 +1521,15 @@ usage after the turn) brings the Wait button."
       (gtk:header-bar-pack-start header terminal)
       (gtk:header-bar-pack-start header documents)
       (gtk:header-bar-pack-start header (make-history-button)))
+    (let ((checklist (make-instance 'gtk:toggle-button :label "Checklist"
+                                    :active (setting :checklist-visible t)
+                                    :tooltip-text "Show or hide review checklists on the right")))
+      (gobject:connect checklist :toggled
+                       (lambda (b)
+                         (let ((visible (gtk:toggle-button-get-active b)))
+                           (setf (setting :checklist-visible) visible)
+                           (set-checklist-visible visible))))
+      (gtk:header-bar-pack-start header checklist))
     (gtk:header-bar-pack-end header theme)
     (gtk:header-bar-pack-end header permission)
     header))
@@ -1580,22 +1667,35 @@ usage after the turn) brings the Wait button."
     (multiple-value-bind (claude-pane claude-widget) (make-agent-pane *claude*)
       (multiple-value-bind (codex-pane codex-widget) (make-agent-pane *codex*)
         (setf *panes* (list (cons :claude claude-pane) (cons :codex codex-pane)))
+        ;; Controls wrap within each pane, so the dividers can respect their
+        ;; actual minimum widths without forcing all options onto one row.
         (let* ((middle (make-middle-pane))
-               (inner (make-instance 'gtk:paned :orientation :horizontal :position 600
+               (inner (make-instance 'gtk:paned :orientation :horizontal
+                                     :position (if (setting :checklist-visible t) 470 600)
                                      :shrink-start-child nil :shrink-end-child nil))
-               (outer (make-instance 'gtk:paned :orientation :horizontal :position 420
+               (outer (make-instance 'gtk:paned :orientation :horizontal
+                                     :position (if (setting :checklist-visible t) 336 420)
                                      :shrink-start-child nil :shrink-end-child nil)))
           (gtk:paned-set-start-child inner middle)
           (gtk:paned-set-end-child inner codex-widget)
           (gtk:paned-set-start-child outer claude-widget)
           (gtk:paned-set-end-child outer inner)
-          ;; The Terminal panel below the three panes, hidden until asked for.
-          (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
-                                         :shrink-start-child nil :shrink-end-child nil
-                                         :resize-end-child nil)))
-            (gtk:paned-set-start-child vertical outer)
-            (gtk:paned-set-end-child vertical (make-terminal-panel))
-            (gtk:window-set-child window vertical)))))
+          ;; A separate, resizable checklist to the right of the agent panes.
+          (let ((content (make-instance 'gtk:paned :orientation :horizontal :position 1120
+                                        :shrink-start-child nil :shrink-end-child nil
+                                        :resize-end-child nil)))
+            (setf (getf *controls* :checklist-split) content
+                  (getf *controls* :agent-split) outer
+                  (getf *controls* :conversation-split) inner)
+            (gtk:paned-set-start-child content outer)
+            (gtk:paned-set-end-child content (make-checklist-panel))
+            ;; The Terminal panel below the panes, hidden until asked for.
+            (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
+                                           :shrink-start-child nil :shrink-end-child nil
+                                           :resize-end-child nil)))
+              (gtk:paned-set-start-child vertical content)
+              (gtk:paned-set-end-child vertical (make-terminal-panel))
+              (gtk:window-set-child window vertical))))))
     (setup-window-keys window)
     (let ((directory (or *directory*
                          (let ((saved (setting :directory)))

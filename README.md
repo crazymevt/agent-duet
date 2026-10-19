@@ -92,8 +92,11 @@ unresolved finding stays in view from one round to the next. A reviewer that
 approves with findings still open is asked once to settle them; if it
 leaves them open again, the part isn't approved, and **Continue** has the
 author pick them up. The checklist
-shows in the conversation after each review, and when the task finishes it
-says how many findings are still open.
+appears in a separate, resizable panel on the right, showing the latest checklist for each review loop. Use
+**Checklist** in the header to show or hide it; the app remembers your choice.
+Hidden updates leave a notice in the conversation. Saved conversations restore
+the latest checklist for each loop there too. When the task finishes,
+the conversation says how many findings are still open.
 
 If the window isn't in front, a desktop notification tells you when both
 agents finish, when one is waiting for your approval or an answer, when one
