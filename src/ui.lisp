@@ -956,21 +956,51 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                  "dim-label" "duet-note"))))
 
 (defun set-checklist-visible (visible)
-  "Show or hide the checklist and share the remaining width between agents."
+  "Show the checklist temporarily, restoring the conversation dividers on close."
   (let ((panel (control :checklist-panel))
-        (content (control :checklist-split)))
-    (when (and panel content)
+        (content (control :checklist-split))
+        (visible (if visible t nil)))
+    (when (and panel content
+               (not (eql visible (gtk:widget-get-visible panel))))
       (let* ((width (gtk:widget-get-width content))
+             (agent-split (control :agent-split))
+             (conversation-split (control :conversation-split))
+             (saved (control :pre-checklist-positions))
              ;; Keep the user's checklist width when reopening the panel.
              (panel-width (if (gtk:widget-get-visible panel)
                               (max 260 (gtk:widget-get-width panel))
                               (- width (gtk:paned-get-position content))))
              (available (if visible (- width (max 260 panel-width)) width)))
+        (when visible
+          (setf (getf *controls* :pre-checklist-positions)
+                (list (gtk:paned-get-position agent-split)
+                      (gtk:paned-get-position conversation-split))))
+        ;; Explicit positions must survive the allocation caused by this toggle.
+        ;; Restore proportional resizing after that frame's layout and paint,
+        ;; so window resizing and manual checklist drags still share the width.
+        (let ((clock (gtk:widget-get-frame-clock content))
+              (handler nil))
+          (when clock
+            (dolist (split (list agent-split conversation-split))
+              (gtk:paned-set-resize-start-child split nil))
+            (setf handler
+                  (gobject:connect clock :after-paint
+                    (lambda (clock)
+                      (gobject:disconnect clock handler)
+                      (dolist (split (list agent-split conversation-split))
+                        (gtk:paned-set-resize-start-child split t)))))))
         (gtk:widget-set-visible panel visible)
         (when (plusp available)
           (when visible (gtk:paned-set-position content available))
-          (gtk:paned-set-position (control :agent-split) (round (* available 0.30)))
-          (gtk:paned-set-position (control :conversation-split) (round (* available 0.42))))))))
+          ;; A window that starts with the checklist open has no saved layout.
+          (gtk:paned-set-position agent-split
+                                  (if (and (not visible) saved)
+                                      (first saved) (round (* available 0.30))))
+          (gtk:paned-set-position conversation-split
+                                  (if (and (not visible) saved)
+                                      (second saved) (round (* available 0.42)))))
+        (unless visible
+          (remf *controls* :pre-checklist-positions))))))
 
 (defun make-checklist-panel ()
   (multiple-value-bind (messages scroller) (make-message-list)
