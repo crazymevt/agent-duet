@@ -688,3 +688,45 @@ contains; the last of PAIRS (unpaired) otherwise."
     (ai:agent-cancel agent)
     (fail (ai:agent-send-now agent "too late"))
     (false (ai::agent-queue agent))))
+
+(define-test codex-stale-startup-error
+    :parent agent-duet
+  (with-fake-codex (agent directory)
+    (let ((deliveries nil)
+          (lock (sb-thread:make-mutex))
+          (results nil))
+      ;; Hold GUI deliveries until a failed startup's worker has returned.
+      (setf (ai::agent-deliver agent)
+            (lambda (thunk)
+              (sb-thread:with-mutex (lock) (push thunk deliveries))))
+      (touch directory "fail-thread-once")
+      (ai:agent-submit agent "old task")
+      (true (wait-until (lambda () (sb-thread:with-mutex (lock) (not (null deliveries))))))
+      (ai:agent-cancel agent)
+      (ai::agent-new-conversation agent)
+      (setf (ai::agent-deliver agent) #'funcall)
+      (touch directory "await-steer")
+      (ai:agent-submit agent "new task" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda ()
+                          (let ((server (ai::codex-agent-server agent)))
+                            (and server (ai::codex-turn-id server))))))
+      (dolist (thunk (sb-thread:with-mutex (lock) (reverse deliveries)))
+        (funcall thunk))
+      (true (ai:agent-busy agent))
+      (false results)
+      (ai:agent-send-now agent "finish new task")
+      (true (wait-until (lambda () results)))
+      (is equal '(("steered reply" nil)) results))))
+
+(define-test claude-running-permission
+    :parent agent-duet
+  (dolist (next-permission '(:edits :full))
+    (let* ((agent (make-instance 'ai:claude-agent :permission next-permission))
+           (cp (ai::make-claude-process)))
+      ;; The process started in Ask mode; a UI change is for its next turn.
+      (setf (ai::claude-agent-process agent) cp
+            (ai::claude-agent-config agent) (list "sonnet" nil :ask nil))
+      (ai::claude-agent-event agent cp
+                             (ai::make-claude-event :kind :permission :id "approval"
+                                                   :name "Bash" :input (ai:jobj "command" "make test")))
+      (true (assoc "approval" (ai::agent-approvals agent) :test #'equal)))))

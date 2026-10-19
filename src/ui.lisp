@@ -598,7 +598,8 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
                                          :css-classes '("duet-tool")))))))
 
 (defun pane-prompt (pane text)
-  (pane-finish-stream pane)
+  ;; A side-pane message can arrive halfway through an assistant block.
+  ;; Keep its widget so the remaining deltas and final text update it.
   (pane-append pane (gtk:build
                      (gtk:box :halign :end :css-classes '("duet-prompt")
                               (gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char)))))

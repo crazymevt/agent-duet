@@ -326,7 +326,7 @@ when it isn't running with the current settings."
                                                                  :message "The user declined to answer."))))))
           ;; The CLI asks here only so questions reach the user; outside Ask
           ;; mode, anything else needing approval is refused as before.
-          ((not (eq (agent-permission agent) :ask))
+          ((not (eq (third (claude-agent-config agent)) :ask))
            (claude-answer-permission cp id nil :message "Permission to use this tool hasn't been granted."))
           (t
            (agent-ask-approval agent id (claude-approval-title (event-name event) input) (event-text event)
@@ -548,7 +548,9 @@ rather than using a server with no thread."
                        (ignore-errors (codex-interrupt server :turn-id turn-id))))))
            (error (e)
                   (let ((why (princ-to-string e)))
-                    (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
+                    (funcall deliver (lambda ()
+                                       (when (eq token (agent-turn-token agent))
+                                         (agent-turn-finished agent why t))))))))
        :name "codex turn"))))
 
 (defmethod agent-steer ((agent codex-agent) prompt)
