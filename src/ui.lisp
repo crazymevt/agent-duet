@@ -16,7 +16,7 @@
 (defvar *workflow* nil "The running or last workflow.")
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
-(defvar *permission* :edits)
+(defvar *permission* :ask)
 
 (defun deliver (thunk)
   (glib:call-in-main-thread thunk))
@@ -202,9 +202,112 @@
 (defstruct (agent-pane (:include pane) (:constructor new-agent-pane))
   agent
   (stream-box nil) (stream-label nil) (stream-text "")
-  (tools (make-hash-table :test 'equal)))
+  (tools (make-hash-table :test 'equal))
+  (approvals (make-hash-table :test 'equal))  ; approval id → its card's button row
+  (ready "Checking…")                         ; what the status says when the agent is idle
+  (version nil)
+  model-dropdown effort-dropdown
+  (models '())                 ; the model dropdown's choices: names (Claude) or model/list entries (Codex)
+  (efforts '(nil))             ; the effort dropdown's choices, nil being the default
+  (refreshing nil))            ; true while the dropdowns are being refilled
 
 (defun agent-pane-of (agent) (cdr (assoc (agent-id agent) *panes*)))
+
+(defun agent-setting-key (agent what)
+  (intern (format nil "~a-~a" (agent-id agent) what) :keyword))
+
+;;; Models and thinking levels
+
+(defun model-choice-name (agent model)
+  (if (eq (agent-id agent) :claude)
+      model
+      (or (jget model "displayName") (codex-model-id model))))
+
+(defun model-choice-id (agent model)
+  (if (eq (agent-id agent) :claude) model (codex-model-id model)))
+
+(defun pane-current-model-entry (pane)
+  (nth (gtk:drop-down-get-selected (agent-pane-model-dropdown pane)) (agent-pane-models pane)))
+
+(defun pane-effort-choices (pane)
+  (let ((agent (agent-pane-agent pane)))
+    (cons nil (if (eq (agent-id agent) :claude)
+                  *claude-efforts*
+                  (let ((model (pane-current-model-entry pane)))
+                    (and model (codex-model-efforts model)))))))
+
+(defun effort-label (effort)
+  (format nil "Thinking: ~a" (if effort (string-capitalize effort) "Default")))
+
+(defun refresh-effort-dropdown (pane)
+  "Fill the effort dropdown with the current model's levels, keeping the
+agent's effort when the model has it."
+  (let* ((agent (agent-pane-agent pane))
+         (choices (pane-effort-choices pane))
+         (dropdown (agent-pane-effort-dropdown pane)))
+    (unless (member (agent-effort agent) choices :test #'equal)
+      (setf (agent-effort agent) nil))
+    (setf (agent-pane-refreshing pane) t)
+    (unwind-protect
+         (progn
+           (setf (agent-pane-efforts pane) choices)
+           (gtk:drop-down-set-model dropdown (gtk:string-list-new (mapcar #'effort-label choices)))
+           (gtk:drop-down-set-selected dropdown (or (position (agent-effort agent) choices :test #'equal) 0))
+           (gtk:widget-set-sensitive dropdown (> (length choices) 1)))
+      (setf (agent-pane-refreshing pane) nil))))
+
+(defun set-model-choices (pane models)
+  "Fill the model dropdown with MODELS, selecting the agent's model (or,
+for Codex, the one marked as the default)."
+  (let* ((agent (agent-pane-agent pane))
+         (dropdown (agent-pane-model-dropdown pane)))
+    (setf (agent-pane-refreshing pane) t)
+    (unwind-protect
+         (progn
+           (setf (agent-pane-models pane) models)
+           (gtk:drop-down-set-model dropdown
+                                    (gtk:string-list-new
+                                     (or (mapcar (lambda (m) (model-choice-name agent m)) models)
+                                         '("Default model"))))
+           (let ((i (or (position (agent-model agent) models
+                                  :key (lambda (m) (model-choice-id agent m)) :test #'equal)
+                        (and (eq (agent-id agent) :codex)
+                             (position-if (lambda (m) (eq (jget m "isDefault") t)) models))
+                        0)))
+             (gtk:drop-down-set-selected dropdown i)
+             (when models
+               (setf (agent-model agent) (model-choice-id agent (nth i models)))))
+           (gtk:widget-set-sensitive dropdown (not (null models))))
+      (setf (agent-pane-refreshing pane) nil))
+    (refresh-effort-dropdown pane)))
+
+(defun make-model-dropdowns (pane)
+  (let ((agent (agent-pane-agent pane))
+        (models (gtk:drop-down-new-from-strings '("Default model")))
+        (efforts (gtk:drop-down-new-from-strings '("Thinking: Default"))))
+    (setf (agent-pane-model-dropdown pane) models
+          (agent-pane-effort-dropdown pane) efforts)
+    (gtk:widget-set-tooltip-text models (format nil "~a's model, from its next message" (agent-name agent)))
+    (gtk:widget-set-tooltip-text efforts (format nil "How hard ~a thinks, from its next message" (agent-name agent)))
+    (gobject:connect models "notify::selected"
+                     (lambda (d pspec) (declare (ignore d pspec))
+                       (unless (agent-pane-refreshing pane)
+                         (let ((model (pane-current-model-entry pane)))
+                           (when model
+                             (setf (agent-model agent) (model-choice-id agent model)
+                                   (setting (agent-setting-key agent "MODEL")) (agent-model agent))))
+                         (refresh-effort-dropdown pane)
+                         (setf (setting (agent-setting-key agent "EFFORT")) (agent-effort agent)))))
+    (gobject:connect efforts "notify::selected"
+                     (lambda (d pspec) (declare (ignore pspec))
+                       (unless (agent-pane-refreshing pane)
+                         (setf (agent-effort agent) (nth (gtk:drop-down-get-selected d) (agent-pane-efforts pane))
+                               (setting (agent-setting-key agent "EFFORT")) (agent-effort agent)))))
+    (when (eq (agent-id agent) :claude)
+      (set-model-choices pane *claude-models*))
+    (values models efforts)))
+
+;;; The pane
 
 (defun make-agent-pane (agent)
   (multiple-value-bind (messages scroller) (make-message-list)
@@ -214,7 +317,7 @@
            (send (make-instance 'gtk:button :label "Send" :valign :end :css-classes '("suggested-action")
                                             :tooltip-text (format nil "Talk to ~a alone" (agent-name agent))))
            (pane (new-agent-pane :agent agent :messages messages :scroller scroller
-                                  :status status :input input :send send)))
+                                 :status status :input input :send send)))
       (flet ((send-it ()
                (if (agent-busy agent)
                    (agent-cancel agent)
@@ -224,29 +327,19 @@
                        (agent-submit agent text))))))
         (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (send-it)))
         (on-return input (lambda () (unless (agent-busy agent) (send-it)))))
-      (let ((header (gtk:build
-                      (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6 :margin-bottom 6
-                        (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
-                        status
-                        (gtk:button :icon-name "edit-clear-all-symbolic" :css-classes '("flat")
-                                    :tooltip-text "New conversation: forget this one"
-                                    :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent)))))))
-        (when (eq (agent-id agent) :claude)
-          (let ((models (gtk:drop-down-new-from-strings *claude-models*)))
-            (gtk:drop-down-set-selected models (or (position (claude-agent-model agent) *claude-models*
-                                                             :test #'equal)
-                                                   0))
-            (gtk:widget-set-tooltip-text models "Claude's model (from the next message)")
-            (gobject:connect models "notify::selected"
-                             (lambda (d pspec) (declare (ignore pspec))
-                               (setf (claude-agent-model agent) (nth (gtk:drop-down-get-selected d) *claude-models*))
-                               (unless (agent-busy agent) (agent-shutdown agent))))
-            (gtk:box-insert-child-after header models (gtk:widget-get-first-child header))))
-        (setf (agent-listener agent) #'agent-pane-event)
+      (setf (agent-listener agent) #'agent-pane-event)
+      (multiple-value-bind (models efforts) (make-model-dropdowns pane)
         (values pane
                 (gtk:build
                   (gtk:box :orientation :vertical :css-classes '("duet-pane")
-                    header
+                    (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6
+                      (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
+                      status
+                      (gtk:button :label "New" :css-classes '("flat")
+                                  :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
+                                  :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
+                    (gtk:box :spacing 6 :margin-start 10 :margin-end 10 :margin-top 4 :margin-bottom 6
+                      models efforts)
                     (gtk:separator)
                     scroller
                     (gtk:separator)
@@ -255,14 +348,73 @@
 (defun agent-css-class (agent)
   (if (eq (agent-id agent) :claude) "duet-claude" "duet-codex"))
 
+(defun pane-update-status (pane)
+  (let* ((agent (agent-pane-agent pane))
+         (waiting (plusp (hash-table-count (agent-pane-approvals pane))))
+         (usage (and (eq (agent-id agent) :codex) (codex-usage-summary (agent-usage agent)))))
+    (gtk:label-set-text (pane-status pane)
+                        (format nil "~a~@[ · ~a left~]"
+                                (cond (waiting "Waiting for your approval")
+                                      ((agent-busy agent) "Working…")
+                                      (t (agent-pane-ready pane)))
+                                usage))
+    (gtk:widget-set-tooltip-text (pane-status pane)
+                                 (format nil "~@[~a~]~@[~%Remaining usage: ~a~]"
+                                         (agent-pane-version pane) usage))))
+
 (defun pane-set-busy (pane busy)
   (let ((agent (agent-pane-agent pane)))
-    (gtk:label-set-text (pane-status pane) (if busy "Working…" "Ready"))
     (gtk:button-set-label (pane-send pane) (if busy "Stop" "Send"))
     (gtk:widget-set-css-classes (pane-send pane) (if busy '("destructive-action") '("suggested-action")))
     (gtk:widget-set-tooltip-text (pane-send pane)
                                  (if busy (format nil "Stop ~a" (agent-name agent))
-                                     (format nil "Talk to ~a alone" (agent-name agent))))))
+                                     (format nil "Talk to ~a alone" (agent-name agent))))
+    (pane-update-status pane)))
+
+;;; Approvals
+
+(defun decision-text (decision)
+  (ecase decision
+    (:allow "Allowed")
+    (:always "Allowed for the rest of this conversation")
+    (:deny "Denied")))
+
+(defun pane-approval (pane id title text)
+  (let* ((agent (agent-pane-agent pane))
+         (buttons (make-instance 'gtk:box :spacing 6 :halign :end)))
+    (flet ((choice (label decision classes tooltip)
+             (let ((button (make-instance 'gtk:button :label label :css-classes classes :tooltip-text tooltip)))
+               (gobject:connect button :clicked
+                                (lambda (b) (declare (ignore b)) (agent-answer-approval agent id decision)))
+               (gtk:box-append buttons button))))
+      (choice "Deny" :deny '("destructive-action") "Don't run it; the agent carries on without it")
+      (choice "Always allow" :always '() "Allow this, and things like it, for the rest of this conversation")
+      (choice "Allow" :allow '("suggested-action") "Run it this once"))
+    (pane-finish-stream pane)
+    (setf (gethash id (agent-pane-approvals pane)) buttons)
+    (pane-append pane (gtk:build
+                        (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                          (gtk:label :label (format nil "~a asks to run:" (agent-name agent))
+                                     :xalign 0.0 :css-classes '("heading"))
+                          (gtk:label :label title :xalign 0.0 :wrap t :wrap-mode :char :selectable t
+                                     :css-classes '("monospace"))
+                          (gtk:label :label (or text "") :xalign 0.0 :wrap t :visible (and text (plusp (length text)) t)
+                                     :css-classes '("dim-label"))
+                          buttons)))
+    (pane-update-status pane)
+    (when (workflow-running-p)
+      (pane-note *middle* (format nil "~a is waiting for you to approve a command (~a pane)." (agent-name agent)
+                                  (if (eq (agent-id agent) :claude) "left" "right"))
+                 "warning" "duet-note"))))
+
+(defun pane-approval-answered (pane id decision)
+  (let ((buttons (gethash id (agent-pane-approvals pane))))
+    (when buttons
+      (remhash id (agent-pane-approvals pane))
+      (clear-box buttons)
+      (gtk:box-append buttons (make-instance 'gtk:label :label (decision-text decision)
+                                                        :css-classes (if (eq decision :deny) '("error") '("dim-label"))))
+      (pane-update-status pane))))
 
 (defun pane-finish-stream (pane)
   (setf (agent-pane-stream-box pane) nil (agent-pane-stream-label pane) nil (agent-pane-stream-text pane) ""))
@@ -329,7 +481,7 @@
                       (gtk:box :halign :end :css-classes '("duet-prompt")
                         (gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char)))))
 
-(defun agent-pane-event (agent kind &key text title id error busy)
+(defun agent-pane-event (agent kind &key text title id error busy decision)
   (let ((pane (agent-pane-of agent)))
     (when pane
       (ecase kind
@@ -340,6 +492,9 @@
         (:thinking (pane-thinking pane text))
         (:tool (pane-tool pane id title))
         (:tool-result (pane-tool-result pane id text error))
+        (:approval (pane-approval pane id title text))
+        (:approval-answered (pane-approval-answered pane id decision))
+        (:usage (pane-update-status pane))
         (:note (pane-note pane text "error"))
         (:turn-done
          ;; A turn that streamed but never finished its block.
@@ -349,14 +504,14 @@
 
 (defun new-conversation (agent)
   (agent-cancel agent)
-  (if (typep agent 'claude-agent)
-      (claude-agent-new-conversation agent)
-      (codex-agent-new-conversation agent))
+  (agent-new-conversation agent)
   (let ((pane (agent-pane-of agent)))
     (clear-box (pane-messages pane))
     (clrhash (agent-pane-tools pane))
+    (clrhash (agent-pane-approvals pane))
     (pane-finish-stream pane)
-    (pane-note pane "New conversation.")))
+    (pane-note pane "New conversation.")
+    (pane-update-status pane)))
 
 ;;; The conversation between them
 
@@ -472,58 +627,123 @@
             rounds)
           (composer input send))))))
 
-;;; Settings: the folder and what the agents may do
+;;; The folder, what the agents may do, and the look
 
 (defun folder-label (directory)
   (let ((home (namestring (user-homedir-pathname)))
-        (path (namestring directory)))
+        (path (string-right-trim "/" (namestring directory))))
     (if (and (> (length path) (length home)) (string= home path :end2 (length home)))
         (format nil "~~/~a" (subseq path (length home)))
         path)))
 
 (defun set-directory (directory)
-  (setf *directory* (uiop:ensure-directory-pathname directory))
-  (dolist (agent (list *claude* *codex*))
-    (when agent
-      (agent-cancel agent)
-      ;; A new place, a new conversation.
-      (if (typep agent 'claude-agent)
-          (claude-agent-new-conversation agent)
-          (codex-agent-new-conversation agent))
-      (setf (agent-directory agent) *directory*)))
-  (when (control :folder)
-    (gtk:label-set-text (gtk:button-get-child (control :folder)) (folder-label *directory*))
-    (gtk:widget-set-tooltip-text (control :folder) (format nil "The agents work in ~a. Click to choose another folder."
-                                                           (namestring *directory*))))
-  (when *middle*
-    (pane-note *middle* (format nil "Working in ~a" (namestring *directory*)))))
+  "Have both agents work in DIRECTORY, in new conversations."
+  (let ((directory (uiop:ensure-directory-pathname directory))
+        (first-time (null *directory*)))
+    (unless (equal directory *directory*)
+      (setf *directory* directory)
+      (note-recent-folder directory)
+      (setf (setting :directory) (namestring directory))
+      (dolist (agent (list *claude* *codex*))
+        (when agent
+          (agent-cancel agent)
+          (agent-new-conversation agent)
+          (setf (agent-directory agent) directory)
+          (unless first-time
+            (pane-note (agent-pane-of agent) (format nil "Now working in ~a: a new conversation." (namestring directory))))))
+      (when *middle*
+        (pane-note *middle* (format nil "Working in ~a" (namestring directory)) "dim-label" "duet-note"))
+      (refresh-folder-menu))))
 
 (defun choose-directory ()
   (let ((dialog (gtk:file-dialog-new)))
-    (gtk:file-dialog-set-initial-folder dialog (gio:file-new-for-path (namestring *directory*)))
+    (gtk:file-dialog-set-title dialog "Choose the folder the agents work in")
+    (when *directory*
+      (gtk:file-dialog-set-initial-folder dialog (gio:file-new-for-path (namestring *directory*))))
     (gio:async (gtk:file-dialog-select-folder dialog *window*)
                (lambda (file) (set-directory (gio:file-get-path file)))
                :error (lambda (e) (declare (ignore e))))))
 
+(defun refresh-folder-menu ()
+  "Show the current folder on the folder button, and the recent ones in its menu."
+  (let ((button (control :folder)))
+    (when button
+      (gtk:label-set-text (control :folder-label) (folder-label *directory*))
+      (gtk:widget-set-tooltip-text button (format nil "Claude and ChatGPT work in ~a.~%Click to switch folders."
+                                                  (namestring *directory*)))
+      (let* ((popover (make-instance 'gtk:popover))
+             (list (make-instance 'gtk:box :orientation :vertical :spacing 2
+                                           :margin-start 4 :margin-end 4 :margin-top 4 :margin-bottom 4)))
+        (flet ((item (label tooltip action)
+                 (let ((b (make-instance 'gtk:button :css-classes '("flat")
+                                                     :child (make-instance 'gtk:label :label label :xalign 0.0
+                                                                                      :ellipsize :start
+                                                                                      :max-width-chars 60)
+                                                     :tooltip-text tooltip)))
+                   (gobject:connect b :clicked (lambda (b) (declare (ignore b))
+                                                 (gtk:popover-popdown popover)
+                                                 (funcall action)))
+                   (gtk:box-append list b))))
+          (gtk:box-append list (make-instance 'gtk:label :label "Recent folders" :xalign 0.0
+                                                         :margin-start 6 :css-classes '("caption-heading" "dim-label")))
+          (dolist (path (setting :recent-folders))
+            (unless (equal path (namestring *directory*))
+              (let ((path path))
+                (when (uiop:directory-exists-p path)
+                  (item (folder-label path) path (lambda () (set-directory path)))))))
+          (gtk:box-append list (make-instance 'gtk:separator))
+          (item "Choose folder…" "Pick any folder" #'choose-directory))
+        (gtk:popover-set-child popover list)
+        (gtk:menu-button-set-popover button popover)))))
+
+(defparameter *permission-choices*
+  '((:ask "Ask before commands"
+     "Both may edit files in the folder. Before running a command (tests, builds, scripts) they ask you: Allow, Always allow, or Deny.")
+    (:edits "Edits only, no prompts"
+     "Both may edit files in the folder without asking. Claude runs no commands but read-only git; ChatGPT runs commands in Codex's sandbox (no network) without asking.")
+    (:full "Full access"
+     "Neither is restricted or asks. Only in a folder you're happy for them to change.")))
+
 (defun set-permission (permission)
-  (setf *permission* permission)
+  (setf *permission* permission
+        (setting :permission) permission)
+  ;; Each picks it up at its next message.
   (dolist (agent (list *claude* *codex*))
-    (setf (agent-permission agent) permission)
-    ;; The next message restarts each, resuming its conversation.
-    (unless (agent-busy agent) (agent-shutdown agent))))
+    (setf (agent-permission agent) permission)))
+
+(defparameter *themes* '((:dark "Dark" :force-dark) (:light "Light" :force-light) (:system "System" :default)))
+
+(defun apply-theme (theme)
+  (setf (setting :theme) theme)
+  (setf (adw:color-scheme) (third (assoc theme *themes*))))
 
 (defun make-header ()
-  (let ((header (make-instance 'gtk:header-bar))
-        (folder (make-instance 'gtk:button :css-classes '("flat")
-                                           :child (make-instance 'gtk:label :ellipsize :start :max-width-chars 50)))
-        (permission (gtk:drop-down-new-from-strings '("Edit files in folder" "Full access"))))
-    (gtk:widget-set-tooltip-text permission "Edit files in folder: Claude may edit files (and run git to review); ChatGPT runs in Codex's workspace sandbox. Full access: neither is restricted.")
+  (let* ((header (make-instance 'gtk:header-bar))
+         (folder-label (make-instance 'gtk:label :ellipsize :start :max-width-chars 50))
+         (folder (make-instance 'gtk:menu-button
+                                :child (gtk:build
+                                         (gtk:box :spacing 6
+                                           (gtk:label :label "Folder:" :css-classes '("dim-label"))
+                                           folder-label
+                                           (gtk:label :label "▾" :css-classes '("dim-label"))))))
+         (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
+         (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*))))
+    (gtk:drop-down-set-selected permission (or (position *permission* *permission-choices* :key #'first) 0))
+    (gtk:widget-set-tooltip-text permission
+                                 (format nil "~{~a~^~%~%~}"
+                                         (mapcar (lambda (c) (format nil "~a: ~a" (second c) (third c)))
+                                                 *permission-choices*)))
     (gobject:connect permission "notify::selected"
                      (lambda (d pspec) (declare (ignore pspec))
-                       (set-permission (if (= 1 (gtk:drop-down-get-selected d)) :full :edits))))
-    (gobject:connect folder :clicked (lambda (b) (declare (ignore b)) (choose-directory)))
-    (setf *controls* (list* :folder folder :permission permission *controls*))
+                       (set-permission (first (nth (gtk:drop-down-get-selected d) *permission-choices*)))))
+    (gtk:drop-down-set-selected theme (or (position (setting :theme :dark) *themes* :key #'first) 0))
+    (gtk:widget-set-tooltip-text theme "Light or dark")
+    (gobject:connect theme "notify::selected"
+                     (lambda (d pspec) (declare (ignore pspec))
+                       (apply-theme (first (nth (gtk:drop-down-get-selected d) *themes*)))))
+    (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
     (gtk:header-bar-pack-start header folder)
+    (gtk:header-bar-pack-end header theme)
     (gtk:header-bar-pack-end header permission)
     header))
 
@@ -535,65 +755,95 @@
      (let ((status (check-claude)))
        (deliver (lambda () (show-claude-status status)))))
    :name "check claude")
-  (sb-thread:make-thread
-   (lambda ()
-     (let ((status (check-codex)))
-       (deliver (lambda () (show-codex-status status)))))
-   :name "check codex"))
+  (let ((agent *codex*))
+    (sb-thread:make-thread
+     (lambda ()
+       (let ((status (check-codex)))
+         (deliver (lambda () (show-codex-status status)))
+         (when (and (codex-status-program status) (codex-status-logged-in status))
+           (multiple-value-bind (models usage)
+               (ignore-errors (codex-agent-load-catalog agent (codex-status-program status)))
+             (deliver (lambda () (show-codex-catalog models usage)))))))
+     :name "check codex")))
+
+(defun set-pane-ready (pane ready &optional version)
+  (setf (agent-pane-ready pane) ready
+        (agent-pane-version pane) version)
+  (pane-update-status pane))
 
 (defun show-claude-status (status)
   (let ((pane (agent-pane-of *claude*)))
     (cond ((claude-status-error status)
-           (gtk:label-set-text (pane-status pane) "Not available")
+           (set-pane-ready pane "Not available")
            (pane-note pane (format nil "~a~%~%Install Claude Code (https://claude.com/claude-code), then restart."
                                    (claude-status-error status)) "error"))
           ((not (claude-status-logged-in status))
-           (gtk:label-set-text (pane-status pane) "Not signed in")
+           (set-pane-ready pane "Not signed in")
            (pane-note pane "Claude Code is not signed in. Run `claude auth login` in a terminal, then send a message." "error"))
-          (t (unless (agent-busy *claude*)
-               (gtk:label-set-text (pane-status pane) (format nil "Ready · ~a" (claude-status-version status))))))))
+          (t (set-pane-ready pane "Ready" (claude-status-version status))))))
 
 (defun show-codex-status (status)
   (let ((pane (agent-pane-of *codex*)))
     (when (codex-status-program status)
       (setf (codex-agent-program *codex*) (codex-status-program status)))
     (cond ((null (codex-status-program status))
-           (gtk:label-set-text (pane-status pane) "Not available")
+           (set-pane-ready pane "Not available")
            (pane-note pane (format nil "~a~%~%Install the Codex CLI or the ChatGPT desktop app, then restart."
                                    (codex-status-error status)) "error"))
           ((not (codex-status-logged-in status))
-           (gtk:label-set-text (pane-status pane) "Not signed in")
+           (set-pane-ready pane "Not signed in")
            (pane-note pane (format nil "Codex is not signed in~@[ (~a)~]. Run `codex login` in a terminal, then send a message."
                                    (codex-status-error status)) "error"))
-          (t (unless (agent-busy *codex*)
-               (gtk:label-set-text (pane-status pane) (format nil "Ready · ~a" (codex-status-version status))))))))
+          (t (set-pane-ready pane "Ready" (codex-status-version status))))))
+
+(defun show-codex-catalog (models usage)
+  (let ((pane (agent-pane-of *codex*)))
+    (when usage
+      (setf (agent-usage *codex*) usage))
+    (when models
+      (setf (codex-agent-models *codex*) models)
+      (set-model-choices pane models))
+    (pane-update-status pane)))
 
 ;;; The window
 
 (defparameter *css*
-  '((".duet-pane" :background-color "@view_bg_color")
-    (".duet-middle" :background-color "alpha(@view_fg_color, 0.02)")
-    (".duet-prompt" :background-color "alpha(@accent_bg_color, 0.15)" :border-radius "8px" :padding ("6px" "10px"))
-    (".duet-code" :background-color "alpha(@view_fg_color, 0.06)" :border-radius "6px" :padding "6px")
+  '((".duet-middle" :background-color "alpha(@view_fg_color, 0.02)")
+    (".duet-pane" :background-color "@view_bg_color")
+    (".duet-prompt" :background-color "alpha(@accent_bg_color, 0.18)" :border-radius "8px" :padding ("6px" "10px"))
+    (".duet-code" :background-color "alpha(@view_fg_color, 0.07)" :border-radius "6px" :padding "6px")
     (".duet-tool" :opacity "0.8")
+    (".duet-approval" :background-color "alpha(@warning_bg_color, 0.22)" :border-radius "8px" :padding "10px"
+                      :border "1px solid alpha(@warning_color, 0.5)")
     (".duet-message" :border-radius "10px" :padding ("8px" "12px"))
-    (".duet-from-user" :background-color "alpha(@accent_bg_color, 0.15)")
-    (".duet-from-claude" :background-color "alpha(#d97757, 0.14)" :margin-right "40px")
-    (".duet-from-codex" :background-color "alpha(#10a37f, 0.14)" :margin-left "40px")
-    (".duet-claude" :color "#d97757")
-    (".duet-codex" :color "#10a37f")
+    (".duet-from-user" :background-color "alpha(@accent_bg_color, 0.18)")
+    (".duet-from-claude" :background-color "alpha(#d97757, 0.16)" :margin-right "40px")
+    (".duet-from-codex" :background-color "alpha(#10a37f, 0.16)" :margin-left "40px")
+    (".duet-claude" :color "#e08a6a")
+    (".duet-codex" :color "#19b98f")
     (".duet-note" :font-size "smaller")))
+
+(defun apply-settings-to (agent)
+  (setf (agent-permission agent) *permission*)
+  (let ((model (setting (agent-setting-key agent "MODEL")))
+        (effort (setting (agent-setting-key agent "EFFORT"))))
+    (when model (setf (agent-model agent) model))
+    (setf (agent-effort agent) effort)))
 
 (defun activate (app)
   "Open the main window."
   (gtk:add-css *css*)
-  (setf *controls* '())
+  (apply-theme (setting :theme :dark))
+  (setf *controls* '()
+        *permission* (or (setting :permission) :ask))
   (let ((window (make-instance 'gtk:application-window
                                :application app :title "Agent Duet"
                                :default-width 1440 :default-height 900)))
     (setf *window* window
-          *claude* (make-instance 'claude-agent :deliver #'deliver :permission *permission*)
-          *codex* (make-instance 'codex-agent :deliver #'deliver :permission *permission*))
+          *claude* (make-instance 'claude-agent :deliver #'deliver)
+          *codex* (make-instance 'codex-agent :deliver #'deliver))
+    (apply-settings-to *claude*)
+    (apply-settings-to *codex*)
     (gtk:window-set-titlebar window (make-header))
     (multiple-value-bind (claude-pane claude-widget) (make-agent-pane *claude*)
       (multiple-value-bind (codex-pane codex-widget) (make-agent-pane *codex*)
@@ -608,7 +858,12 @@
           (gtk:paned-set-start-child outer claude-widget)
           (gtk:paned-set-end-child outer inner)
           (gtk:window-set-child window outer))))
-    (set-directory (or *directory* (uiop:getcwd)))
+    (let ((directory (or *directory*
+                         (let ((saved (setting :directory)))
+                           (and saved (uiop:directory-exists-p saved)))
+                         (uiop:getcwd))))
+      (setf *directory* nil)
+      (set-directory directory))
     (update-controls)
     (check-agents)
     (gobject:connect window :close-request
@@ -621,14 +876,21 @@
 
 (defun main (&optional directory)
   "Run the application; returns when its window closes. DIRECTORY is where
-the agents work (by default, the current directory). On macOS it must run
-on the first thread: in Cadre, use Run GTK App."
-  (when directory (setf *directory* (uiop:ensure-directory-pathname directory)))
-  (let ((app (gtk:application-new "org.example.agent_integration" '(:default-flags))))
+the agents work (by default, the last folder used, or else the current
+directory). On macOS it must run on the first thread: in Cadre, use Run GTK App."
+  (load-settings)
+  (setf *directory* (and directory (uiop:ensure-directory-pathname directory)))
+  (let ((app (adw:application-new "org.example.agent_integration" '(:default-flags))))
     (gobject:connect app :window-removed
                      (lambda (application window)
                        (declare (ignore window))
                        (when (null (gtk:application-get-windows application))
                          (gio:application-quit application))))
-    (gobject:connect app :activate 'activate)
+    (gobject:connect app :activate
+                     (lambda (app)
+                       ;; Errors here would otherwise leave no window and no word why.
+                       (handler-bind ((error (lambda (e)
+                                               (format *error-output* "~&Agent Duet couldn't start: ~a~%" e)
+                                               (finish-output *error-output*))))
+                         (activate app))))
     (gio:application-run app nil)))

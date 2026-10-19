@@ -130,6 +130,7 @@ then the copy inside the Claude desktop app.")
   :tool-use  NAME, ID, INPUT (a JSON object)
   :tool-result  ID, TEXT, ERROR
   :result    TEXT, ERROR, COST, DURATION, SESSION-ID, DATA: usage
+  :permission  ID (the request's), NAME, INPUT, TEXT (why), DATA: the request
   :other     DATA: the JSON"
   kind text name id input error cost duration session-id model data subagent)
 
@@ -182,6 +183,15 @@ since a message can hold several blocks. Nil for lines that are not JSON."
                                      (not (equal (jget json "subtype") "success")))
                           :cost (jget json "total_cost_usd") :duration (jget json "duration_ms")
                           :session-id (jget json "session_id") :data (jget json "usage"))))
+            ;; With --permission-prompt-tool stdio, a tool that needs
+            ;; permission asks here; CLAUDE-ANSWER-PERMISSION answers.
+            ((and (equal type "control_request") (equal (jget json "request" "subtype") "can_use_tool"))
+             (list (event :kind :permission :id (jget json "request_id")
+                          :name (jget json "request" "tool_name") :input (jget json "request" "input")
+                          :text (let ((d (or (jget json "request" "description")
+                                             (jget json "request" "decision_reason"))))
+                                  (and (stringp d) d))
+                          :data (jget json "request"))))
             (t (list (event :kind :other :data json)))))))))
 
 ;;; The process
@@ -238,6 +248,30 @@ stopped process may run a little longer, finishing up.)"
 (defun claude-send (cp text)
   "Send TEXT as the next user message."
   (claude-write-line cp (user-message-line text)))
+
+(defun session-rule (suggestion)
+  "SUGGESTION, a permission suggestion from the CLI, kept for this session only."
+  (cons :object (cons (cons "destination" "session")
+                      (remove "destination" (cdr suggestion) :key #'car :test #'equal))))
+
+(defun permission-response-line (request-id allow &key input always-rules message)
+  "The stdin line answering permission request REQUEST-ID. ALWAYS-RULES, the
+request's permission_suggestions, are added for the rest of the session."
+  (json-string
+   (jobj "type" "control_response"
+         "response" (jobj "subtype" "success" "request_id" request-id
+                          "response" (if allow
+                                         (jobj "behavior" "allow"
+                                               "updatedInput" (or input (jobj))
+                                               "updatedPermissions" (if always-rules
+                                                                        (map 'vector #'session-rule always-rules)
+                                                                        :omit))
+                                         (jobj "behavior" "deny"
+                                               "message" (or message "The user denied this.")))))))
+
+(defun claude-answer-permission (cp request-id allow &rest options)
+  "Answer the CLI's permission request REQUEST-ID (see PERMISSION-RESPONSE-LINE)."
+  (claude-write-line cp (apply #'permission-response-line request-id allow options)))
 
 (defun claude-interrupt (cp)
   "Ask the CLI to stop the current turn."

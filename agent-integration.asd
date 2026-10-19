@@ -13,6 +13,7 @@
                (:file "markdown")
                (:file "claude")
                (:file "codex")
+               (:file "settings")
                (:file "agents")
                (:file "workflow")))
 
@@ -21,7 +22,7 @@
   :author "Jessie Hughart"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("agent-integration/core" "gtk4")
+  :depends-on ("agent-integration/core" "gtk4" "gtk4-adwaita")
   :pathname "src/"
   :components ((:file "ui"))
   :entry-point "agent-integration:main"

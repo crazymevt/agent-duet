@@ -47,6 +47,82 @@
       (ai::codex-item-summary
        (ai:parse-json "{\"type\":\"fileChange\",\"changes\":[{\"path\":\"/x/a.lisp\"},{\"path\":\"/x/b.lisp\"}]}"))))
 
+;;; Approvals
+
+(define-test claude-permission
+  :parent agent-integration
+  (let ((event (first (ai::parse-claude-event
+                       "{\"type\":\"control_request\",\"request_id\":\"r1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"make test\"},\"description\":\"Run the tests\",\"permission_suggestions\":[{\"type\":\"addRules\",\"rules\":[{\"toolName\":\"Bash\",\"ruleContent\":\"make test\"}],\"behavior\":\"allow\",\"destination\":\"localSettings\"}]}}"))))
+    (is eq :permission (ai::event-kind event))
+    (is string= "r1" (ai::event-id event))
+    (is string= "Run the tests" (ai::event-text event))
+    (is string= "$ make test" (ai::claude-approval-title "Bash" (ai::event-input event)))
+    ;; Allowing always adds the suggested rules for this session only.
+    (let ((answer (ai:parse-json (ai::permission-response-line
+                                  "r1" t :input (ai::event-input event)
+                                  :always-rules (ai::jlist (ai:jget (ai::event-data event) "permission_suggestions"))))))
+      (is string= "allow" (ai:jget answer "response" "response" "behavior"))
+      (is string= "make test" (ai:jget answer "response" "response" "updatedInput" "command"))
+      (is string= "session" (ai:jget answer "response" "response" "updatedPermissions" 0 "destination")))
+    (let ((answer (ai:parse-json (ai::permission-response-line "r1" nil))))
+      (is string= "deny" (ai:jget answer "response" "response" "behavior"))
+      (false (ai:jget answer "response" "response" "updatedPermissions")))))
+
+(define-test approvals
+  :parent agent-integration
+  (let* ((seen '())
+         (answers '())
+         (agent (make-instance 'fake-agent :id :claude :name "Claude" :replies '())))
+    (setf (ai:agent-listener agent) (lambda (a kind &rest plist) (declare (ignore a)) (push (cons kind plist) seen)))
+    (ai::agent-ask-approval agent "a1" "$ make test" nil (lambda (d) (push d answers)))
+    (ai::agent-ask-approval agent "a2" "$ rm -rf build" nil (lambda (d) (push d answers)))
+    (is eq :approval (car (second seen)))
+    (ai::agent-answer-approval agent "a1" :always)
+    (is equal '(:always) answers)
+    ;; Answered once only.
+    (ai::agent-answer-approval agent "a1" :allow)
+    (is equal '(:always) answers)
+    ;; Cancelling denies what's still waiting.
+    (ai:agent-cancel agent)
+    (is equal '(:deny :always) answers)))
+
+;;; Codex models and usage
+
+(define-test codex-catalog
+  :parent agent-integration
+  (let ((model (ai:parse-json "{\"id\":\"gpt-x\",\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"high\"}]}")))
+    (is equal '("low" "high") (ai::codex-model-efforts model)))
+  (let ((buckets (ai::codex-rate-limits-from-response
+                  (ai:parse-json "{\"rateLimits\":{\"limitId\":\"codex\",\"primary\":{\"usedPercent\":28,\"windowDurationMins\":300},\"secondary\":{\"usedPercent\":60.4,\"windowDurationMins\":10080}}}"))))
+    (is string= "72% 5h / 40% 7d" (ai::codex-usage-summary buckets))
+    (let ((updated (ai::merge-rate-limits buckets (ai:parse-json "{\"limitId\":\"codex\",\"primary\":{\"usedPercent\":50,\"windowDurationMins\":300}}"))))
+      (is = 1 (length updated))
+      (is string= "50% 5h" (ai::codex-usage-summary updated)))))
+
+;;; Settings
+
+(define-test settings
+  :parent agent-integration
+  (let ((file (merge-pathnames (format nil "duet-settings-~d.lisp" (random 1000000)) (uiop:temporary-directory)))
+        (ai::*settings* '()))
+    (unwind-protect
+         (progn
+           (setf (getf ai::*settings* :theme) :dark
+                 (getf ai::*settings* :recent-folders) '("/a/" "/b/"))
+           (setf (getf ai::*settings* :directory) (coerce "/c/" 'base-string))
+           (ai::save-settings file)
+           (false (search "#A" (uiop:read-file-string file)))
+           (setf ai::*settings* '())
+           (ai::load-settings file)
+           (is eq :dark (ai::setting :theme))
+           (is equal '("/a/" "/b/") (ai::setting :recent-folders))
+           (is equal "/c/" (ai::setting :directory)))
+      (ignore-errors (delete-file file)))
+    ;; Unreadable settings are no settings, not an error.
+    (with-open-file (out file :direction :output :if-exists :supersede) (write-string "(:theme #.(oops" out))
+    (unwind-protect (is equal '() (ai::load-settings file))
+      (ignore-errors (delete-file file)))))
+
 ;;; Reading replies
 
 (define-test verdicts

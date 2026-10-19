@@ -66,7 +66,8 @@ call it off the GUI thread."
   :activity        NAME (the item type), ID, TEXT: a command or file change starting
   :activity-completed  ID, TEXT (its output), ERROR
   :result          ERROR, TEXT (the error message), TURN-ID: the turn ended
-  :permission-denied  NAME, DATA
+  :approval        ID (the request's), NAME (its method), TEXT (what it asks), DATA: its params
+  :rate-limits     DATA: a rate-limit snapshot
   :stderr, :protocol-error  TEXT"
   kind text name id input error thread-id turn-id data)
 
@@ -144,20 +145,40 @@ call it off the GUI thread."
         (remhash id (codex-pending server))
         (setf (codex-pending-result pending) object (codex-pending-done pending) t)))))
 
+(defparameter *codex-approval-methods*
+  '("item/commandExecution/requestApproval" "item/fileChange/requestApproval"))
+
 (defun codex-server-request (server object)
-  "Answer a request from the app-server. With the \"never\" approval policy
-none should come; any that do are declined."
+  "Answer a request from the app-server. An approval request goes to the
+client as an :approval event, answered later with CODEX-ANSWER-APPROVAL."
   (let ((method (jget object "method"))
         (params (jget object "params")))
-    (if (member method '("item/commandExecution/requestApproval" "item/fileChange/requestApproval")
-                :test #'equal)
-        (progn
-          (codex-deliver-event server (make-codex-event :kind :permission-denied :name method :data params))
-          (codex-send-json server (jobj "jsonrpc" "2.0" "id" (jget object "id")
-                                        "result" (jobj "decision" "decline"))))
+    (if (member method *codex-approval-methods* :test #'equal)
+        (codex-deliver-event server (make-codex-event :kind :approval :id (jget object "id") :name method
+                                                      :text (codex-approval-summary method params)
+                                                      :data params
+                                                      :thread-id (jget params "threadId")
+                                                      :turn-id (jget params "turnId")))
         (codex-send-json server (jobj "jsonrpc" "2.0" "id" (jget object "id")
                                       "error" (jobj "code" -32601
                                                     "message" (format nil "Unsupported request: ~a" method)))))))
+
+(defun codex-approval-summary (method params)
+  (if (equal method "item/commandExecution/requestApproval")
+      (let ((command (jget params "command")))
+        (format nil "$ ~a" (cond ((stringp command) command)
+                                 ((vectorp command) (format nil "~{~a~^ ~}" (coerce command 'list)))
+                                 (t "(a command)"))))
+      (format nil "Change files~@[ under ~a~]" (let ((root (jget params "grantRoot"))) (and (stringp root) root)))))
+
+(defun codex-answer-approval (server request-id decision)
+  "Answer approval request REQUEST-ID with DECISION: :allow, :always (for
+the rest of the session) or :deny."
+  (codex-send-json server (jobj "jsonrpc" "2.0" "id" request-id
+                                "result" (jobj "decision" (ecase decision
+                                                            (:allow "accept")
+                                                            (:always "acceptForSession")
+                                                            (:deny "decline"))))))
 
 (defun codex-item-summary (item)
   "A one-line description of a command or file change ITEM."
@@ -237,6 +258,8 @@ none should come; any that do are declined."
                                                                         (format nil "Turn ~a" status))))
                                                        :turn-id (jget turn "id") :thread-id thread-id
                                                        :data turn))))
+      ((equal method "account/rateLimits/updated")
+       (codex-deliver-event server (make-codex-event :kind :rate-limits :data (jget params "rateLimits"))))
       ((equal method "error")
        (codex-deliver-event server (make-codex-event :kind :stderr
                                                      :text (format nil "~a" (or (jget params "error" "message")
@@ -320,7 +343,8 @@ none should come; any that do are declined."
   (unless (codex-initialized server)
     (codex-request server "initialize"
                    (jobj "clientInfo" (jobj "name" "agent-integration" "title" "Agent Duet" "version" "0.1")
-                         "capabilities" (jobj)))
+                         ;; The extended surface: rate limits, among others.
+                         "capabilities" (jobj "experimentalApi" t)))
     (codex-notify server "initialized")
     (setf (codex-initialized server) t))
   server)
@@ -340,14 +364,77 @@ none should come; any that do are declined."
     (codex-deliver-event server (make-codex-event :kind :thread-started :thread-id thread-id))
     thread-id))
 
-(defun codex-start-turn (server text &key model effort)
+(defun codex-start-turn (server text &key model effort approval-policy)
   "Start a user turn on SERVER's thread."
   (unless (codex-thread-id server) (error "Codex thread has not been started"))
   (codex-request server "turn/start"
                  (jobj "threadId" (codex-thread-id server)
                        "input" (vector (jobj "type" "text" "text" text))
                        "model" (or model :null)
-                       "effort" (or effort :null))))
+                       "effort" (or effort :null)
+                       "approvalPolicy" (or approval-policy :omit))))
+
+;;; Models and usage
+
+(defun codex-models-from-response (response)
+  "The visible model choices in a `model/list` response."
+  (remove-if (lambda (model) (eq (jget model "hidden") t))
+             (jlist (jget response "data"))))
+
+(defun codex-list-models (server)
+  (codex-models-from-response (codex-request server "model/list" (jobj))))
+
+(defun codex-model-efforts (model)
+  "The reasoning efforts MODEL (from model/list) supports."
+  (remove-duplicates
+   (loop for entry in (jlist (jget model "supportedReasoningEfforts"))
+         for effort = (if (stringp entry) entry (jget entry "reasoningEffort"))
+         when (stringp effort) collect effort)
+   :test #'equal :from-end t))
+
+(defun codex-rate-limits-from-response (response)
+  "Rate-limit buckets, (limit-id . snapshot)s, from `account/rateLimits/read`."
+  (let ((buckets (jget response "rateLimitsByLimitId")))
+    (cond ((and (jobject-p buckets) (cdr buckets)) (cdr buckets))
+          ((jget response "rateLimits")
+           (list (cons (or (jget response "rateLimits" "limitId") "codex")
+                       (jget response "rateLimits"))))
+          (t nil))))
+
+(defun codex-read-rate-limits (server)
+  (codex-rate-limits-from-response (codex-request server "account/rateLimits/read" (jobj))))
+
+(defun merge-rate-limits (buckets snapshot)
+  "BUCKETS with SNAPSHOT (from account/rateLimits/updated) in place of its bucket."
+  (let ((id (or (jget snapshot "limitId") "codex")))
+    (append (remove id buckets :key #'car :test #'equal) (list (cons id snapshot)))))
+
+(defun rate-window-label (minutes)
+  (cond ((and (integerp minutes) (zerop (mod minutes 1440))) (format nil "~dd" (/ minutes 1440)))
+        ((and (integerp minutes) (zerop (mod minutes 60))) (format nil "~dh" (/ minutes 60)))
+        ((integerp minutes) (format nil "~dm" minutes))
+        (t nil)))
+
+(defun codex-usage-summary (buckets)
+  "What is left in each of BUCKETS' windows, as \"72% 5h / 40% 7d\", or nil."
+  (let ((windows
+          (loop for (bucket-id . bucket) in buckets
+                for several = (> (length buckets) 1)
+                append (loop for window-name in '("primary" "secondary")
+                             for window = (jget bucket window-name)
+                             for used = (jget window "usedPercent")
+                             when (numberp used)
+                               collect (format nil "~@[~a ~]~d%~@[ ~a~]"
+                                               (and several bucket-id)
+                                               (round (max 0 (min 100 (- 100 used))))
+                                               (rate-window-label (jget window "windowDurationMins")))))))
+    (and windows (format nil "~{~a~^ / ~}" windows))))
+
+(defun call-with-codex-server (program directory function)
+  "Call FUNCTION with a fresh, initialized app-server, stopped afterwards."
+  (let ((server (start-codex-app-server program directory)))
+    (unwind-protect (funcall function (codex-initialize-app-server server))
+      (stop-codex-app-server server))))
 
 (defun codex-interrupt (server &key (thread-id (codex-thread-id server))
                                    (turn-id (codex-turn-id server)))

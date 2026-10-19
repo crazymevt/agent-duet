@@ -29,14 +29,34 @@ Type a request in the middle and press Return. Choose how they work:
 *Claude leads* / *ChatGPT leads* picks the lead. Start becomes Stop while they
 work.
 
+## Folder, models and look
+
+- **Folder** (top left): where both agents work. Its menu lists recent folders
+  and *Choose folder…*. Switching starts new conversations with both, in the
+  new folder.
+- **Model and thinking** (under each agent's name): Claude's model (sonnet,
+  opus, haiku) and effort; ChatGPT's models as Codex lists them, with the
+  thinking levels each supports. A change applies from that agent's next
+  message, carrying on the same conversation.
+- **ChatGPT's remaining usage** shows in its status line (for example
+  `65% 5h / 56% 7d left`), refreshed after each turn.
+- **Dark / Light / System** (top right).
+
+These, the permission setting and the recent folders are remembered in
+`~/.config/agent-duet/settings.lisp`.
+
 ## What they may do
 
-The folder button (top left) is where both work; changing it starts new
-conversations. The menu at the top right sets what they may do:
+The menu at the top right:
 
-- **Edit files in folder** (the default): Claude may edit files and run
-  read-only git commands (`acceptEdits`); Codex runs in its `workspace-write`
-  sandbox, so it can run commands such as tests, without network access.
+- **Ask before commands** (the default): both may edit files in the folder.
+  Before running a command — tests, builds, scripts — they ask, with a card in
+  their pane: *Allow*, *Always allow* (for the rest of that conversation) or
+  *Deny*. During a workflow, the middle pane says who is waiting. (Read-only
+  commands such as `git diff` or `ls` run without asking.)
+- **Edits only, no prompts**: both edit without asking. Claude runs no commands
+  except read-only git; ChatGPT runs commands in Codex's `workspace-write`
+  sandbox (no network) without asking.
 - **Full access**: Claude with `bypassPermissions`, Codex with
   `danger-full-access`. Use it only in a folder you're happy for them to change.
 
@@ -48,7 +68,7 @@ On macOS, GTK must run on the process's first thread. In Cadre, **Run GTK App**
 starts it there and keeps the REPL. From a terminal:
 
 ```sh
-make run      # the agents work in the current directory
+make run      # the agents work in the last folder used, or the current directory
 make dev      # with a Swank server on port 4005 for another editor's REPL
 make build    # bin/agent-integration
 ```
@@ -61,7 +81,10 @@ Or `(agent-integration:main "/path/to/project/")` to choose the folder.
   taken from Cadre, with its fixes (UTF-8 replacement on Codex's output, polled
   JSON-RPC waits, draining stderr when Codex exits, resuming Claude sessions).
 - `src/agents.lisp`: both CLIs behind one `agent` class that takes one prompt at
-  a time and queues the rest.
+  a time and queues the rest, and asks the user for approvals (Claude through
+  `--permission-prompt-tool stdio`, Codex through the app-server's approval
+  requests).
+- `src/settings.lisp`: what's remembered between runs.
 - `src/workflow.lisp`: the two ways of working together. No GTK.
 - `src/ui.lisp`: the window.
 

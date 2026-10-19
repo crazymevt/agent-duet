@@ -10,24 +10,40 @@
 ;;;;   :thinking TEXT
 ;;;;   :tool ID TITLE        a tool call (a command, an edit, a read…)
 ;;;;   :tool-result ID TEXT ERROR
+;;;;   :approval ID TITLE TEXT  the agent asks to do something; answer
+;;;;                         with AGENT-ANSWER-APPROVAL
+;;;;   :approval-answered ID DECISION
 ;;;;   :turn-done TEXT ERROR the turn ended; TEXT is the final reply
 ;;;;   :note TEXT            something to tell the user (the CLI exited…)
 ;;;;   :busy BUSY            the agent started or stopped working
+;;;;   :usage                the agent's usage changed (Codex: AGENT-USAGE)
 ;;;; Everything is called through DELIVER, on the GUI thread in the app.
+;;;;
+;;;; The model, effort and permission can change at any time; a turn uses
+;;;; the ones in force when it starts.
 
 (in-package #:agent-integration)
+
+(defparameter *permissions* '(:ask :edits :full)
+  ":ask — edit files in the directory; ask before running commands.
+:edits — edit files in the directory; Claude runs no commands (but git's
+read-only ones), Codex runs them in its sandbox without asking.
+:full — no restrictions.")
 
 (defclass agent ()
   ((id :initarg :id :reader agent-id :documentation ":claude or :codex")
    (name :initarg :name :reader agent-name)
+   (partner-name :initarg :partner-name :accessor agent-partner-name)
    (directory :initarg :directory :initform nil :accessor agent-directory)
-   (permission :initarg :permission :initform :edits :accessor agent-permission
-               :documentation ":edits (edit files in the directory) or :full (no restrictions)")
+   (permission :initarg :permission :initform :ask :accessor agent-permission)
+   (model :initarg :model :initform nil :accessor agent-model :documentation "Nil: the CLI's default")
+   (effort :initarg :effort :initform nil :accessor agent-effort :documentation "Nil: the model's default")
    (deliver :initarg :deliver :initform #'funcall :accessor agent-deliver)
    (listener :initarg :listener :initform nil :accessor agent-listener)
    (busy :initform nil :accessor agent-busy)
    (queue :initform '() :accessor agent-queue :documentation "Waiting (prompt . callback)s, oldest first")
    (callback :initform nil :accessor agent-callback :documentation "The running turn's")
+   (approvals :initform '() :accessor agent-approvals :documentation "Unanswered (id . answer-function)s")
    (stderr :initform '() :accessor agent-stderr :documentation "The last lines of standard error, newest first")))
 
 (defgeneric agent-begin-turn (agent prompt)
@@ -37,10 +53,14 @@
   (:documentation "Ask the running turn to stop; it still ends with AGENT-TURN-FINISHED."))
 
 (defgeneric agent-shutdown (agent)
-  (:documentation "End the agent's process. The conversation can resume later."))
+  (:documentation "End the agent's process. The conversation resumes with the next prompt."))
+
+(defgeneric agent-new-conversation (agent)
+  (:documentation "End the agent's process and forget its conversation."))
 
 (defmethod agent-interrupt ((agent agent)) nil)
 (defmethod agent-shutdown ((agent agent)) nil)
+(defmethod agent-new-conversation ((agent agent)) (agent-shutdown agent))
 
 (defun agent-emit (agent kind &rest plist)
   (when (agent-listener agent)
@@ -68,6 +88,7 @@ says why)."
   (when (agent-busy agent)
     (let ((callback (agent-callback agent)))
       (setf (agent-busy agent) nil (agent-callback agent) nil)
+      (agent-deny-approvals agent)
       (agent-emit agent :turn-done :text text :error error)
       (agent-emit agent :busy :busy nil)
       (when callback
@@ -78,9 +99,33 @@ says why)."
 (defun agent-cancel (agent)
   "Drop the waiting prompts and interrupt the running turn."
   (setf (agent-queue agent) '())
+  (agent-deny-approvals agent)
   (when (agent-busy agent)
     (setf (agent-callback agent) nil)
     (ignore-errors (agent-interrupt agent))))
+
+;;; Approvals
+
+(defun agent-ask-approval (agent id title text answer)
+  "Ask the user whether AGENT may do TITLE. ANSWER gets the decision:
+:allow, :always (for the rest of the conversation) or :deny."
+  (push (cons id answer) (agent-approvals agent))
+  (agent-emit agent :approval :id id :title title :text text))
+
+(defun agent-answer-approval (agent id decision)
+  "Answer AGENT's approval request ID with DECISION (see AGENT-ASK-APPROVAL)."
+  (let ((entry (assoc id (agent-approvals agent) :test #'equal)))
+    (when entry
+      (setf (agent-approvals agent) (remove entry (agent-approvals agent)))
+      (handler-case (funcall (cdr entry) decision)
+        (error (e) (agent-emit agent :note :text (format nil "Couldn't answer ~a: ~a" (agent-name agent) e))))
+      (agent-emit agent :approval-answered :id id :decision decision))))
+
+(defun agent-deny-approvals (agent)
+  (dolist (entry (agent-approvals agent))
+    (agent-answer-approval agent (car entry) :deny)))
+
+;;; Small things
 
 (defun agent-note-stderr (agent line)
   (push line (agent-stderr agent))
@@ -94,52 +139,66 @@ says why)."
   (let ((deliver (agent-deliver agent)))
     (lambda (thunk) (funcall deliver thunk))))
 
-;;; What each agent is told about working here
-
-(defun collaboration-instructions (agent partner-name)
-  (format nil "You are ~a, one of two coding agents (the other is ~a) working together on the user's ~
+(defun collaboration-instructions (agent)
+  (let ((partner (agent-partner-name agent)))
+    (format nil "You are ~a, one of two coding agents (the other is ~a) working together on the user's ~
 request in the same working directory. Prompts may come from the user directly or be relayed from ~a: ~
 they may ask you to implement something, to review ~a's work, or to address its review of yours. ~
 When you review, inspect the files themselves (and `git diff` if the directory is a git repository) ~
 rather than trusting a summary, and don't change files unless asked to. When you implement, finish your ~
-reply with a short summary of what you changed and in which files, since that summary is what ~a sees."
-          (agent-name agent) partner-name partner-name partner-name partner-name))
+reply with a short summary of what you changed and in which files, since that summary is what ~a sees. ~
+Running a command may need the user's approval; if one is denied, carry on without it and say so."
+            (agent-name agent) partner partner partner partner)))
 
 ;;; Claude
 
 (defparameter *claude-review-tools*
   '("Bash(git diff:*)" "Bash(git status:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(ls:*)")
-  "Commands Claude may run when it may only edit files: enough to review.")
+  "Commands Claude may run without asking: enough to review.")
+
+(defparameter *claude-efforts* '("low" "medium" "high" "xhigh" "max"))
 
 (defclass claude-agent (agent)
   ((process :initform nil :accessor claude-agent-process)
+   (config :initform nil :accessor claude-agent-config :documentation "What the process was started with")
    (session-id :initform nil :accessor claude-agent-session-id)
-   (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume")
-   (model :initarg :model :initform *claude-model* :accessor claude-agent-model)
-   (partner-name :initarg :partner-name :initform "ChatGPT" :accessor agent-partner-name))
-  (:default-initargs :id :claude :name "Claude"))
+   (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume"))
+  (:default-initargs :id :claude :name "Claude" :partner-name "ChatGPT" :model *claude-model*))
+
+(defun claude-agent-wanted-config (agent)
+  (list (agent-model agent) (agent-effort agent) (agent-permission agent) (agent-directory agent)))
 
 (defun claude-agent-ensure-process (agent)
-  (let ((cp (claude-agent-process agent)))
+  "The agent's CLI process, started (or restarted, resuming the conversation)
+when it isn't running with the current settings."
+  (let ((cp (claude-agent-process agent))
+        (config (claude-agent-wanted-config agent)))
+    (when (and (claude-alive-p cp) (not (equal config (claude-agent-config agent))))
+      (setf (claude-agent-process agent) nil)
+      (stop-claude cp)
+      (setf cp nil))
     (if (claude-alive-p cp)
         cp
         (let* ((resume (and (claude-agent-started agent) (claude-agent-session-id agent)))
                (session (or (claude-agent-session-id agent)
                             (setf (claude-agent-session-id agent) (make-uuid))))
+               (permission (agent-permission agent))
                (arguments (claude-arguments
                            :session-id (unless resume session) :resume resume
-                           :model (claude-agent-model agent)
-                           :permission-mode (if (eq (agent-permission agent) :full) "bypassPermissions" "acceptEdits")
-                           :allowed-tools (unless (eq (agent-permission agent) :full) *claude-review-tools*)
-                           :system-prompt (collaboration-instructions agent (agent-partner-name agent))))
+                           :model (agent-model agent) :effort (agent-effort agent)
+                           :permission-mode (if (eq permission :full) "bypassPermissions" "acceptEdits")
+                           :permission-tool (and (eq permission :ask) "stdio")
+                           :allowed-tools (unless (eq permission :full) *claude-review-tools*)
+                           :system-prompt (collaboration-instructions agent)))
                (new nil))
           (setf new (start-claude arguments
                                   :directory (agent-directory agent)
                                   :deliver (make-deliver-thunk agent)
-                                  :on-event (lambda (event) (claude-agent-event agent event))
+                                  :on-event (lambda (event) (claude-agent-event agent new event))
                                   :on-stderr (lambda (line) (agent-note-stderr agent line))
                                   :on-exit (lambda (code) (claude-agent-exited agent new code))))
           (setf (claude-agent-process agent) new
+                (claude-agent-config agent) config
                 (claude-agent-started agent) t)
           new))))
 
@@ -150,8 +209,14 @@ reply with a short summary of what you changed and in which files, since that su
                        (and (stringp v) (substitute #\Space #\Newline (if (> (length v) 120) (subseq v 0 120) v)))))))
     (format nil "~a~@[  ~a~]" name detail)))
 
-(defun claude-agent-event (agent event)
-  (unless (event-subagent event)
+(defun claude-approval-title (name input)
+  (let ((command (and (jobject-p input) (jget input "command"))))
+    (if (stringp command)
+        (format nil "$ ~a" command)
+        (claude-tool-title name input))))
+
+(defun claude-agent-event (agent cp event)
+  (when (and (eq cp (claude-agent-process agent)) (not (event-subagent event)))
     (case (event-kind event)
       (:init (when (event-session-id event)
                (setf (claude-agent-session-id agent) (event-session-id event))))
@@ -163,6 +228,15 @@ reply with a short summary of what you changed and in which files, since that su
                                          :title (claude-tool-title (event-name event) (event-input event))))
       (:tool-result (agent-emit agent :tool-result :id (event-id event) :text (event-text event)
                                                    :error (event-error event)))
+      (:permission
+       (let ((id (event-id event)) (input (event-input event))
+             (suggestions (jlist (jget (event-data event) "permission_suggestions"))))
+         (agent-ask-approval agent id (claude-approval-title (event-name event) input) (event-text event)
+                             (lambda (decision)
+                               (when (claude-alive-p cp)
+                                 (claude-answer-permission cp id (not (eq decision :deny))
+                                                           :input input
+                                                           :always-rules (and (eq decision :always) suggestions)))))))
       (:result (agent-turn-finished agent (event-text event) (event-error event))))))
 
 (defun claude-agent-exited (agent cp code)
@@ -184,10 +258,11 @@ reply with a short summary of what you changed and in which files, since that su
 (defmethod agent-shutdown ((agent claude-agent))
   (let ((cp (claude-agent-process agent)))
     (setf (claude-agent-process agent) nil)
+    (agent-deny-approvals agent)
     (when cp (stop-claude cp))
     (when (agent-busy agent) (agent-turn-finished agent "Stopped." t))))
 
-(defun claude-agent-new-conversation (agent)
+(defmethod agent-new-conversation ((agent claude-agent))
   (agent-shutdown agent)
   (setf (claude-agent-session-id agent) nil (claude-agent-started agent) nil))
 
@@ -195,19 +270,29 @@ reply with a short summary of what you changed and in which files, since that su
 
 (defclass codex-agent (agent)
   ((server :initform nil :accessor codex-agent-server)
+   (config :initform nil :accessor codex-agent-config :documentation "What the server was started with")
    (program :initarg :program :initform nil :accessor codex-agent-program)
    (thread-id :initform nil :accessor codex-agent-thread-id)
    (last-text :initform nil :accessor codex-agent-last-text :documentation "The turn's last agent message")
-   (model :initarg :model :initform *codex-model* :accessor codex-agent-model)
-   (partner-name :initarg :partner-name :initform "Claude" :accessor agent-partner-name))
-  (:default-initargs :id :codex :name "ChatGPT"))
+   (models :initform '() :accessor codex-agent-models :documentation "From model/list")
+   (usage :initform nil :accessor agent-usage :documentation "Rate-limit buckets, (id . snapshot)s"))
+  (:default-initargs :id :codex :name "ChatGPT" :partner-name "Claude" :model *codex-model*))
 
 (defun codex-agent-sandbox (agent)
   (if (eq (agent-permission agent) :full) "danger-full-access" "workspace-write"))
 
+(defun codex-agent-approval-policy (agent)
+  (if (eq (agent-permission agent) :ask) "untrusted" "never"))
+
 (defun codex-agent-ensure-server (agent)
-  "The agent's app-server with its thread started. Blocks: call it off the GUI thread."
-  (let ((server (codex-agent-server agent)))
+  "The agent's app-server with its thread started, (re)started when it isn't
+running in the current directory and sandbox. Blocks: call it off the GUI thread."
+  (let ((server (codex-agent-server agent))
+        (config (list (codex-agent-sandbox agent) (agent-directory agent))))
+    (when (and (codex-alive-p server) (not (equal config (codex-agent-config agent))))
+      (setf (codex-agent-server agent) nil)
+      (stop-codex-app-server server)
+      (setf server nil))
     (unless (codex-alive-p server)
       (let ((program (or (codex-agent-program agent) (find-codex-program)
                          (error "The Codex CLI was not found")))
@@ -216,20 +301,24 @@ reply with a short summary of what you changed and in which files, since that su
                                           :deliver (make-deliver-thunk agent)
                                           :on-event (lambda (event) (codex-agent-event agent new event))
                                           :on-exit (lambda (code) (codex-agent-exited agent new code))))
-        (setf server new (codex-agent-server agent) new)
-        (let ((instructions (collaboration-instructions agent (agent-partner-name agent))))
+        (setf server new
+              (codex-agent-server agent) new
+              (codex-agent-config agent) config)
+        (let ((instructions (collaboration-instructions agent)))
           (if (codex-agent-thread-id agent)
               (progn
                 (codex-initialize-app-server server)
                 (codex-request server "thread/resume"
                                (jobj "threadId" (codex-agent-thread-id agent)
                                      "cwd" (uiop:native-namestring (codex-directory server))
-                                     "sandbox" (codex-agent-sandbox agent) "approvalPolicy" "never"
+                                     "sandbox" (codex-agent-sandbox agent)
+                                     "approvalPolicy" (codex-agent-approval-policy agent)
                                      "developerInstructions" instructions))
                 (setf (codex-thread-id server) (codex-agent-thread-id agent)))
               (setf (codex-agent-thread-id agent)
-                    (codex-start-thread server :model (codex-agent-model agent) :instructions instructions
-                                               :sandbox (codex-agent-sandbox agent)))))))
+                    (codex-start-thread server :model (agent-model agent) :instructions instructions
+                                               :sandbox (codex-agent-sandbox agent)
+                                               :approval-policy (codex-agent-approval-policy agent)))))))
     server))
 
 (defun codex-agent-event (agent server event)
@@ -242,16 +331,26 @@ reply with a short summary of what you changed and in which files, since that su
       (:activity-completed (agent-emit agent :tool :id (codex-event-id event) :title (codex-event-name event))
        (agent-emit agent :tool-result :id (codex-event-id event) :text (codex-event-text event)
                                       :error (codex-event-error event)))
-      (:permission-denied (agent-emit agent :note :text (format nil "Declined: ~a" (codex-event-name event))))
+      (:approval
+       (let ((id (codex-event-id event)) (params (codex-event-data event)))
+         (agent-ask-approval agent id (codex-event-text event)
+                             (let ((reason (jget params "reason"))) (and (stringp reason) reason))
+                             (lambda (decision)
+                               (when (codex-alive-p server)
+                                 (codex-answer-approval server id decision))))))
+      (:rate-limits (setf (agent-usage agent) (merge-rate-limits (agent-usage agent) (codex-event-data event)))
+       (agent-emit agent :usage))
       ((:stderr :protocol-error) (agent-note-stderr agent (codex-event-text event)))
       (:result (agent-turn-finished agent (if (codex-event-error event)
                                               (or (codex-event-text event) "The turn failed.")
                                               (or (codex-agent-last-text agent) ""))
-                                    (codex-event-error event))))))
+                                    (codex-event-error event))
+       (codex-agent-refresh-usage agent)))))
 
 (defun codex-agent-exited (agent server code)
   (when (eq server (codex-agent-server agent))
     (setf (codex-agent-server agent) nil)
+    (agent-deny-approvals agent)
     (when (agent-busy agent)
       (let ((why (format nil "Codex exited (status ~a).~@[~%~a~]" code
                          (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s)))))
@@ -260,12 +359,16 @@ reply with a short summary of what you changed and in which files, since that su
 
 (defmethod agent-begin-turn ((agent codex-agent) prompt)
   (setf (codex-agent-last-text agent) nil)
-  (let ((deliver (agent-deliver agent)))
+  (let ((deliver (agent-deliver agent))
+        (model (agent-model agent))
+        (effort (agent-effort agent))
+        (policy (codex-agent-approval-policy agent)))
     ;; Starting the app-server and the turn wait for replies: not on the GUI thread.
     (sb-thread:make-thread
      (lambda ()
        (handler-case
-           (codex-start-turn (codex-agent-ensure-server agent) prompt :model (codex-agent-model agent))
+           (codex-start-turn (codex-agent-ensure-server agent) prompt
+                             :model model :effort effort :approval-policy policy)
          (error (e)
            (let ((why (princ-to-string e)))
              (funcall deliver (lambda () (agent-turn-finished agent why t)))))))
@@ -279,9 +382,35 @@ reply with a short summary of what you changed and in which files, since that su
 (defmethod agent-shutdown ((agent codex-agent))
   (let ((server (codex-agent-server agent)))
     (setf (codex-agent-server agent) nil)
+    (agent-deny-approvals agent)
     (when server (stop-codex-app-server server))
     (when (agent-busy agent) (agent-turn-finished agent "Stopped." t))))
 
-(defun codex-agent-new-conversation (agent)
+(defmethod agent-new-conversation ((agent codex-agent))
   (agent-shutdown agent)
   (setf (codex-agent-thread-id agent) nil))
+
+(defun codex-agent-refresh-usage (agent)
+  "Read the account's rate limits again, in the background."
+  (let ((server (codex-agent-server agent))
+        (deliver (agent-deliver agent)))
+    (when (codex-alive-p server)
+      (sb-thread:make-thread
+       (lambda ()
+         (let ((usage (ignore-errors (codex-read-rate-limits server))))
+           (when usage
+             (funcall deliver (lambda ()
+                                (setf (agent-usage agent) usage)
+                                (agent-emit agent :usage))))))
+       :name "codex usage"))))
+
+(defun codex-agent-load-catalog (agent program)
+  "Fetch the models and the usage with a short-lived app-server. Blocks:
+call it off the GUI thread. Returns the models and the usage."
+  (call-with-codex-server program (or (agent-directory agent) (user-homedir-pathname))
+                          (lambda (server)
+                            (values (ignore-errors (codex-list-models server))
+                                    (ignore-errors (codex-read-rate-limits server))))))
+
+(defun codex-model-id (model)
+  (or (jget model "id") (jget model "model")))
