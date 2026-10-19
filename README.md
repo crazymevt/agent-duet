@@ -1,27 +1,69 @@
-# agent-integration
+# agent-integration (Agent Duet)
 
-A Common Lisp project.
+Claude and ChatGPT working on the same code, side by side, through their
+command-line tools: Claude Code (`claude -p`, stream-json) and Codex
+(`codex app-server`, the CLI bundled with the ChatGPT app or on PATH).
 
-## Usage
+The window has three panes:
 
-```lisp
-(ql:quickload :agent-integration)
-(agent-integration:hello "Lisp")   ; => "Hello, Lisp!"
-```
+- **Left: Claude.** Everything Claude does: the prompts it gets, its reply as it
+  streams, its tool calls (expand one to see its output).
+- **Middle: the conversation between them.** Your request, each plan, each
+  report of work done, and each review, passed from one agent to the other.
+- **Right: ChatGPT.** The same, for Codex.
+
+Each side pane also has its own box for talking to that agent alone.
+
+## Working together
+
+Type a request in the middle and press Return. Choose how they work:
+
+- **Write & review.** The lead does the work. The other reviews it, reading the
+  files and `git diff`, and ends with `VERDICT: APPROVED` or
+  `VERDICT: CHANGES REQUESTED`. The lead addresses the review, and so on, until
+  it's approved or *Rounds* reviews have been done.
+- **Split the work.** The lead splits the request into its part and the
+  other's (parts that don't touch the same files). Both work at once; then each
+  reviews the other's part, and each part goes round its own review loop.
+
+*Claude leads* / *ChatGPT leads* picks the lead. Start becomes Stop while they
+work.
+
+## What they may do
+
+The folder button (top left) is where both work; changing it starts new
+conversations. The menu at the top right sets what they may do:
+
+- **Edit files in folder** (the default): Claude may edit files and run
+  read-only git commands (`acceptEdits`); Codex runs in its `workspace-write`
+  sandbox, so it can run commands such as tests, without network access.
+- **Full access**: Claude with `bypassPermissions`, Codex with
+  `danger-full-access`. Use it only in a folder you're happy for them to change.
+
+Both must be signed in first: `claude auth login` and `codex login`.
 
 ## Running
 
 On macOS, GTK must run on the process's first thread. In Cadre, **Run GTK App**
-starts it there and keeps the REPL; while it runs, what you evaluate runs on the
-GTK thread. From a terminal:
+starts it there and keeps the REPL. From a terminal:
 
 ```sh
-make run      # just the program
+make run      # the agents work in the current directory
 make dev      # with a Swank server on port 4005 for another editor's REPL
 make build    # bin/agent-integration
 ```
 
-With `make dev`, wrap GTK calls you evaluate in `(glib:in-main-thread (:wait t) …)`.
+Or `(agent-integration:main "/path/to/project/")` to choose the folder.
+
+## Layout of the code
+
+- `src/json.lisp`, `src/claude.lisp`, `src/codex.lisp`, `src/markdown.lisp`:
+  taken from Cadre, with its fixes (UTF-8 replacement on Codex's output, polled
+  JSON-RPC waits, draining stderr when Codex exits, resuming Claude sessions).
+- `src/agents.lisp`: both CLIs behind one `agent` class that takes one prompt at
+  a time and queues the rest.
+- `src/workflow.lisp`: the two ways of working together. No GTK.
+- `src/ui.lisp`: the window.
 
 ## Tests
 
@@ -29,4 +71,4 @@ With `make dev`, wrap GTK calls you evaluate in `(glib:in-main-thread (:wait t) 
 make test
 ```
 
-Or, in a Lisp: `(asdf:test-system :agent-integration)`.
+They run without GTK or the CLIs: the workflows are driven by scripted agents.

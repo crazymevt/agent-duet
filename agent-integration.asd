@@ -1,23 +1,37 @@
 ;;;; agent-integration.asd
 
-(defsystem "agent-integration"
-  :description "A Common Lisp project."
+(defsystem "agent-integration/core"
+  :description "Claude Code and Codex driven through their CLIs, and the workflows that have them work together. No GTK."
   :author "Jessie Hughart"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("gtk4")
-  :components ((:module "src"
-                :serial t
-                :components ((:file "package")
-                             (:file "main"))))
+  :depends-on ("uiop")
+  :pathname "src/"
+  :serial t
+  :components ((:file "package")
+               (:file "json")
+               (:file "markdown")
+               (:file "claude")
+               (:file "codex")
+               (:file "agents")
+               (:file "workflow")))
+
+(defsystem "agent-integration"
+  :description "Agent Duet: Claude and ChatGPT (Codex) side by side, writing and reviewing each other's code."
+  :author "Jessie Hughart"
+  :license "MIT"
+  :version "0.1.0"
+  :depends-on ("agent-integration/core" "gtk4")
+  :pathname "src/"
+  :components ((:file "ui"))
   :entry-point "agent-integration:main"
   :in-order-to ((test-op (test-op "agent-integration/tests"))))
 
 (defsystem "agent-integration/tests"
-  :description "Tests for agent-integration."
+  :description "Tests for agent-integration (headless: no GTK)."
   :author "Jessie Hughart"
   :license "MIT"
-  :depends-on ("agent-integration" "parachute")
+  :depends-on ("agent-integration/core" "parachute")
   :components ((:module "tests"
                 :components ((:file "main"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-integration/tests)))
