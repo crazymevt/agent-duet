@@ -45,6 +45,25 @@ work.
 These, the permission setting and the recent folders are remembered in
 `~/.config/agent-duet/settings.lisp`.
 
+## Terminal
+
+**Terminal** in the header (or Ctrl+`) opens a panel below the three panes with
+a shell in the agents' folder. *+ New* opens another (each gets a tab), *Clear*
+(⌘K) clears one, *Kill* ends one, and *Hide* closes the panel while the shells
+keep running. ⌘C and ⌘V copy and paste. New shells start in the current folder;
+ones already open stay where they are. It needs VTE, GNOME's terminal widget:
+`brew install vte3` on macOS.
+
+## Documents
+
+**Documents** in the header opens a window listing the folder's Markdown files
+(type to filter) with a read-only preview of the one you pick: headings,
+emphasis, code, lists and task lists, quotes, tables, rules, local images and
+links. Links to other Markdown files open in the preview, `#anchors` scroll to
+their heading, and web links open in the browser. The preview redraws itself
+when the file changes, so you can watch a design document as an agent writes
+it. Hidden folders and build folders (`node_modules`, `build`, …) are skipped.
+
 ## What they may do
 
 The menu at the top right:
@@ -77,7 +96,8 @@ Or `(agent-integration:main "/path/to/project/")` to choose the folder.
 
 ## Layout of the code
 
-- `src/json.lisp`, `src/claude.lisp`, `src/codex.lisp`, `src/markdown.lisp`:
+- `src/json.lisp`, `src/claude.lisp`, `src/codex.lisp`, `src/markdown.lisp`
+  (inline and block Markdown parsing):
   taken from Cadre, with its fixes (UTF-8 replacement on Codex's output, polled
   JSON-RPC waits, draining stderr when Codex exits, resuming Claude sessions).
 - `src/agents.lisp`: both CLIs behind one `agent` class that takes one prompt at
@@ -87,6 +107,8 @@ Or `(agent-integration:main "/path/to/project/")` to choose the folder.
 - `src/settings.lisp`: what's remembered between runs.
 - `src/workflow.lisp`: the two ways of working together. No GTK.
 - `src/ui.lisp`: the window.
+- `src/terminal.lisp`: the Terminal panel (VTE through CFFI, from Cadre).
+- `src/preview.lisp`: the Documents window (Cadre's Markdown preview, read-only).
 
 ## Tests
 

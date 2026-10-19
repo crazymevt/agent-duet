@@ -123,6 +123,32 @@
     (unwind-protect (is equal '() (ai::load-settings file))
       (ignore-errors (delete-file file)))))
 
+;;; Markdown
+
+(define-test markdown-blocks
+  :parent agent-integration
+  (let ((blocks (ai::markdown-blocks (format nil "# Title~%~%Some *text*.~%~%- [x] done~%- [ ] open~%~%| a | b |~%|:-:|--:|~%| 1 | 2 |~%~%```py~%x = 1~%```"))))
+    (is equal '(:heading :paragraph :list :table :code) (mapcar #'first blocks))
+    (is equal '(:done :open) (mapcar #'first (fourth (third blocks))))
+    (is equal '(:center :right) (second (fourth blocks)))
+    (is string= "x = 1" (third (fifth blocks))))
+  (is string= "risks-and-open-questions" (ai::heading-anchor "Risks and open questions?"))
+  (is string= "  ab  " (ai::pad-cell "ab" 4 :center))
+  (is string= " ab" (ai::pad-cell "ab" 1 :right))
+  (is string= "ab " (ai::pad-cell "ab" 1 :left)))
+
+(define-test markdown-files
+  :parent agent-integration
+  (let ((root (merge-pathnames (format nil "duet-md-~d/" (random 1000000)) (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (dolist (f '("README.md" "notes.txt" "docs/DESIGN.md" "docs/deep/x.markdown" ".hidden/no.md" "node_modules/p/no.md"))
+             (let ((path (merge-pathnames f root)))
+               (ensure-directories-exist path)
+               (with-open-file (out path :direction :output :if-exists :supersede) (write-line "# x" out))))
+           (is equal '("README.md" "docs/deep/x.markdown" "docs/DESIGN.md") (ai::markdown-files root)))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 ;;; Reading replies
 
 (define-test verdicts

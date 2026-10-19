@@ -653,7 +653,8 @@ for Codex, the one marked as the default)."
             (pane-note (agent-pane-of agent) (format nil "Now working in ~a: a new conversation." (namestring directory))))))
       (when *middle*
         (pane-note *middle* (format nil "Working in ~a" (namestring directory)) "dim-label" "duet-note"))
-      (refresh-folder-menu))))
+      (refresh-folder-menu)
+      (documents-folder-changed))))
 
 (defun choose-directory ()
   (let ((dialog (gtk:file-dialog-new)))
@@ -715,7 +716,8 @@ for Codex, the one marked as the default)."
 
 (defun apply-theme (theme)
   (setf (setting :theme) theme)
-  (setf (adw:color-scheme) (third (assoc theme *themes*))))
+  (setf (adw:color-scheme) (third (assoc theme *themes*)))
+  (restyle-terminals))
 
 (defun make-header ()
   (let* ((header (make-instance 'gtk:header-bar))
@@ -743,6 +745,19 @@ for Codex, the one marked as the default)."
                        (apply-theme (first (nth (gtk:drop-down-get-selected d) *themes*)))))
     (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
     (gtk:header-bar-pack-start header folder)
+    (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
+                                                      :tooltip-text "Show or hide the terminal panel (Ctrl+`)"))
+          (documents (make-instance 'gtk:button :label "Documents"
+                                                :tooltip-text "Preview the folder's Markdown files")))
+      (gobject:connect terminal :toggled
+                       (lambda (b)
+                         (let ((active (gtk:toggle-button-get-active b)))
+                           (unless (eq active (terminal-visible-p))
+                             (set-terminal-visible active)))))
+      (gobject:connect documents :clicked (lambda (b) (declare (ignore b)) (show-documents)))
+      (setf *controls* (list* :terminal terminal *controls*))
+      (gtk:header-bar-pack-start header terminal)
+      (gtk:header-bar-pack-start header documents))
     (gtk:header-bar-pack-end header theme)
     (gtk:header-bar-pack-end header permission)
     header))
@@ -821,7 +836,22 @@ for Codex, the one marked as the default)."
     (".duet-from-codex" :background-color "alpha(#10a37f, 0.16)" :margin-left "40px")
     (".duet-claude" :color "#e08a6a")
     (".duet-codex" :color "#19b98f")
-    (".duet-note" :font-size "smaller")))
+    (".duet-note" :font-size "smaller")
+    (".duet-terminal-panel" :background-color "@view_bg_color")
+    (".duet-terminal" :padding ("2px" "6px") :font-family "Menlo, Monaco, monospace")))
+
+(defun setup-window-keys (window)
+  "Ctrl+` shows or hides the Terminal panel, wherever the focus is."
+  (let ((keys (gtk:event-controller-key-new)))
+    (gtk:event-controller-set-propagation-phase keys :capture)
+    (gobject:connect keys :key-pressed
+                     (lambda (c keyval keycode state)
+                       (declare (ignore c keycode))
+                       (when (and (member (gdk:keyval-name keyval) '("grave" "dead_grave") :test #'string=)
+                                  (member :control-mask (modifier-list state)))
+                         (toggle-terminal)
+                         t)))
+    (gtk:widget-add-controller window keys)))
 
 (defun apply-settings-to (agent)
   (setf (agent-permission agent) *permission*)
@@ -857,7 +887,14 @@ for Codex, the one marked as the default)."
           (gtk:paned-set-end-child inner codex-widget)
           (gtk:paned-set-start-child outer claude-widget)
           (gtk:paned-set-end-child outer inner)
-          (gtk:window-set-child window outer))))
+          ;; The Terminal panel below the three panes, hidden until asked for.
+          (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
+                                                    :shrink-start-child nil :shrink-end-child nil
+                                                    :resize-end-child nil)))
+            (gtk:paned-set-start-child vertical outer)
+            (gtk:paned-set-end-child vertical (make-terminal-panel))
+            (gtk:window-set-child window vertical)))))
+    (setup-window-keys window)
     (let ((directory (or *directory*
                          (let ((saved (setting :directory)))
                            (and saved (uiop:directory-exists-p saved)))
@@ -871,6 +908,8 @@ for Codex, the one marked as the default)."
                        (dolist (agent (list *claude* *codex*))
                          (ignore-errors (agent-cancel agent))
                          (ignore-errors (agent-shutdown agent)))
+                       (ignore-errors (kill-all-terminals))
+                       (ignore-errors (close-documents))
                        nil))
     (gtk:window-present window)))
 

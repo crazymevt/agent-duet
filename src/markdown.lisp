@@ -176,3 +176,324 @@
       (flush end))
     (nreverse nodes)))
 
+
+;;; Blocks (from Cadre): MARKDOWN-BLOCKS reads a whole document into blocks
+;;; for the preview. Each block ends with its first line in the source.
+;;;   (:heading level inlines line)  (:paragraph inlines line)
+;;;   (:code info text line)  (:quote blocks line)  (:rule line)
+;;;   (:list ordered start ((task blocks) …) line)  — task: nil, :open, :done
+;;;   (:table aligns header-inlines rows-of-inlines line)
+
+(defun split-text-lines (text)
+  (loop with start = 0
+        for nl = (position #\Newline text :start start)
+        collect (string-right-trim '(#\Return) (subseq text start (or nl (length text))))
+        while nl do (setf start (1+ nl))))
+
+(defun leading-spaces (line)
+  (or (position-if-not (lambda (c) (char= c #\Space)) line) (length line)))
+
+
+(defun fence-open (line)
+  "If LINE opens a fenced code block: the fence character, its length, and the info string."
+  (let ((indent (leading-spaces line)))
+    (when (and (< indent 4) (< indent (length line)) (member (char line indent) '(#\` #\~)))
+      (let* ((c (char line indent))
+             (n (run-length line indent c))
+             (info (string-trim " " (subseq line (+ indent n)))))
+        (when (and (>= n 3) (not (and (char= c #\`) (find #\` info))))
+          (values c n info))))))
+
+(defun fence-close-p (line char count)
+  (let ((indent (leading-spaces line)))
+    (and (< indent 4) (< indent (length line)) (char= (char line indent) char)
+         (let ((n (run-length line indent char)))
+           (and (>= n count) (string= "" (string-trim " " (subseq line (+ indent n)))))))))
+
+(defun heading-level (line)
+  "The level of the ATX heading LINE (# … ######), and where its text starts; nil if not one."
+  (let ((indent (leading-spaces line)))
+    (when (and (< indent 4) (< indent (length line)) (char= (char line indent) #\#))
+      (let ((n (run-length line indent #\#)))
+        (when (and (<= n 6) (or (= (+ indent n) (length line)) (char= (char line (+ indent n)) #\Space)))
+          (values n (min (length line) (+ indent n 1))))))))
+
+(defun thematic-break-p (line)
+  (let ((chars (remove #\Space line)))
+    (and (< (leading-spaces line) 4) (>= (length chars) 3)
+         (member (char chars 0) '(#\- #\* #\_))
+         (every (lambda (c) (char= c (char chars 0))) chars))))
+
+(defun setext-underline (line)
+  "1 for a === line, 2 for ---, else nil."
+  (let ((s (string-trim " " line)))
+    (and (< (leading-spaces line) 4) (plusp (length s))
+         (cond ((every (lambda (c) (char= c #\=)) s) 1)
+               ((every (lambda (c) (char= c #\-)) s) 2)))))
+
+(defun list-marker (line)
+  "If LINE starts a list item: the marker's start and end, where the content
+starts, and :ordered with its number or :bullet."
+  (let ((indent (leading-spaces line)))
+    (when (< indent (length line))
+      (let ((c (char line indent)))
+        (cond ((and (member c '(#\- #\* #\+))
+                    (or (= (1+ indent) (length line)) (char= (char line (1+ indent)) #\Space))
+                    (not (thematic-break-p line)))
+               (values indent (1+ indent) (min (length line) (+ indent 2)) :bullet))
+              ((digit-char-p c)
+               (let ((e (or (position-if-not #'digit-char-p line :start indent) (length line))))
+                 (when (and (< e (length line)) (<= (- e indent) 9) (member (char line e) '(#\. #\)))
+                            (or (= (1+ e) (length line)) (char= (char line (1+ e)) #\Space)))
+                   (values indent (1+ e) (min (length line) (+ e 2)) :ordered
+                           (parse-integer line :start indent :end e))))))))))
+
+(defun table-row-p (line) (and (find #\| line) (not (fence-open line))))
+
+(defun table-delimiter-p (line)
+  (let ((s (string-trim " |" line)))
+    (and (find #\- s) (find #\| line) (every (lambda (c) (member c '(#\- #\: #\| #\Space))) s))))
+
+;;; Inlines are nodes over the string they came with: (string . nodes).
+
+(defun inlines-of (string)
+  (cons string (markdown-inlines string)))
+
+(defun strip-indent (line n)
+  "LINE without up to N leading spaces."
+  (subseq line (min (leading-spaces line) n (length line))))
+
+(defun blank-line-p (line) (string= "" (string-trim '(#\Space #\Tab) line)))
+
+(defun paragraph-text (lines)
+  "LINES joined into a paragraph's text: a line ending in two spaces or \\
+breaks the line there; otherwise lines run together."
+  (with-output-to-string (out)
+    (loop for (line . more) on lines
+          do (let* ((trimmed (string-left-trim " " line))
+                    (hard (and more (or (and (>= (length trimmed) 2)
+                                             (string= "  " trimmed :start2 (- (length trimmed) 2)))
+                                        (and (plusp (length trimmed))
+                                             (char= #\\ (char trimmed (1- (length trimmed)))))))))
+               (write-string (string-right-trim " \\" trimmed) out)
+               (when more (write-char (if hard #\Newline #\Space) out))))))
+
+(defun split-table-row (line)
+  (let* ((s (string-trim " " line))
+         (s (if (and (plusp (length s)) (char= (char s 0) #\|)) (subseq s 1) s))
+         (s (if (and (plusp (length s)) (char= (char s (1- (length s))) #\|)
+                     (or (< (length s) 2) (char/= (char s (- (length s) 2)) #\\)))
+                (subseq s 0 (1- (length s))) s)))
+    (loop with cells = '() with start = 0
+          for i from 0 to (length s)
+          do (when (or (= i (length s)) (and (char= (char s i) #\|) (or (zerop i) (char/= (char s (1- i)) #\\))))
+               (push (string-trim " " (subseq s start i)) cells)
+               (setf start (1+ i)))
+          finally (return (nreverse cells)))))
+
+(defun table-alignments (line)
+  (mapcar (lambda (cell)
+            (let ((left (and (plusp (length cell)) (char= (char cell 0) #\:)))
+                  (right (and (plusp (length cell)) (char= (char cell (1- (length cell))) #\:))))
+              (cond ((and left right) :center) (right :right) (t :left))))
+          (split-table-row line)))
+
+(defun parse-blocks (lines first-line)
+  "The blocks in LINES (a list of strings), the first being line FIRST-LINE of the document."
+  (let ((blocks '())
+        (paragraph '())
+        (paragraph-line nil)
+        (lines (coerce lines 'vector))
+        (i 0))
+    (labels ((line (k) (aref lines k))
+             (end-paragraph ()
+               (when paragraph
+                 (push (list :paragraph (inlines-of (paragraph-text (reverse paragraph))) paragraph-line) blocks)
+                 (setf paragraph '())))
+             (add (block) (end-paragraph) (push block blocks)))
+      (loop while (< i (length lines))
+            do (let* ((line (line i))
+                      (n (+ first-line i)))
+                 (cond
+                   ((blank-line-p line) (end-paragraph) (incf i))
+                   ;; ``` fenced code
+                   ((fence-open line)
+                    (multiple-value-bind (char count info) (fence-open line)
+                      (let* ((indent (leading-spaces line))
+                             (end (or (loop for k from (1+ i) below (length lines)
+                                            when (fence-close-p (line k) char count) return k)
+                                      (length lines)))
+                             (code (loop for k from (1+ i) below end collect (strip-indent (line k) indent))))
+                        (add (list :code info (format nil "~{~a~^~%~}" code) n))
+                        (setf i (1+ end)))))
+                   ;; # heading
+                   ((heading-level line)
+                    (multiple-value-bind (level start) (heading-level line)
+                      (let ((text (string-right-trim " #" (subseq line start))))
+                        (add (list :heading level (inlines-of text) n)))
+                      (incf i)))
+                   ;; Text, then === or ---: a heading
+                   ((and paragraph (setext-underline line))
+                    (let ((level (setext-underline line))
+                          (text (paragraph-text (reverse paragraph)))
+                          (at paragraph-line))
+                      (setf paragraph '())
+                      (add (list :heading level (inlines-of text) at))
+                      (incf i)))
+                   ((thematic-break-p line) (add (list :rule n)) (incf i))
+                   ;; > quote
+                   ((and (< (leading-spaces line) 4) (< (leading-spaces line) (length line))
+                         (char= (char line (leading-spaces line)) #\>))
+                    (let ((inner '()) (start i))
+                      (loop while (and (< i (length lines)) (not (blank-line-p (line i))))
+                            do (let* ((l (line i)) (indent (leading-spaces l)))
+                                 (push (if (and (< indent (length l)) (char= (char l indent) #\>))
+                                           (let ((rest (subseq l (1+ indent))))
+                                             (if (and (plusp (length rest)) (char= (char rest 0) #\Space)) (subseq rest 1) rest))
+                                           l)
+                                       inner))
+                               (incf i))
+                      (add (list :quote (parse-blocks (nreverse inner) (+ first-line start)) n))))
+                   ;; - item, 1. item
+                   ((and (list-marker line) (or (null paragraph) (not (blank-line-p (subseq line (nth-value 2 (list-marker line)))))))
+                    (multiple-value-bind (ms me content kind number) (list-marker line)
+                      (declare (ignore ms me content))
+                      (let ((items '()))
+                        (loop while (and (< i (length lines)) (eq (nth-value 3 (list-marker (line i))) kind))
+                              do (multiple-value-bind (ims ime icontent) (list-marker (line i))
+                                   (declare (ignore ims ime))
+                                   (let ((item-lines (list (subseq (line i) icontent)))
+                                         (item-line (+ first-line i)))
+                                     (incf i)
+                                     ;; Following lines: indented to the content, blank, or lazy text.
+                                     (loop while (< i (length lines))
+                                           do (let ((l (line i)))
+                                                (cond ((blank-line-p l)
+                                                       (if (and (< (1+ i) (length lines))
+                                                                (>= (leading-spaces (line (1+ i))) icontent)
+                                                                (not (blank-line-p (line (1+ i)))))
+                                                           (progn (push "" item-lines) (incf i))
+                                                           (return)))
+                                                      ((>= (leading-spaces l) icontent)
+                                                       (push (strip-indent l icontent) item-lines) (incf i))
+                                                      ((or (list-marker l) (fence-open l) (heading-level l)
+                                                           (thematic-break-p l)
+                                                           (blank-line-p (first item-lines)))
+                                                       (return))
+                                                      (t (push l item-lines) (incf i)))))
+                                     (let* ((item-lines (nreverse item-lines))
+                                            (first (first item-lines))
+                                            (task (and (>= (length first) 3) (char= (char first 0) #\[)
+                                                       (char= (char first 2) #\])
+                                                       (or (= (length first) 3) (char= (char first 3) #\Space))
+                                                       (case (char first 1)
+                                                         (#\Space :open) ((#\x #\X) :done)))))
+                                       (when task
+                                         (setf (first item-lines) (subseq first (min (length first) 4))))
+                                       (push (list task (parse-blocks item-lines item-line)) items))))
+                                 ;; A blank line between items keeps the list going.
+                                 (when (and (< (1+ i) (length lines)) (blank-line-p (line i))
+                                            (eq (nth-value 3 (list-marker (line (1+ i)))) kind))
+                                   (incf i)))
+                        (add (list :list (eq kind :ordered) (or number 1) (nreverse items) n)))))
+                   ;; | table |
+                   ((and (table-row-p line) (< (1+ i) (length lines)) (table-delimiter-p (line (1+ i))))
+                    (let ((header (split-table-row line))
+                          (aligns (table-alignments (line (1+ i))))
+                          (rows '()))
+                      (incf i 2)
+                      (loop while (and (< i (length lines)) (table-row-p (line i)) (not (blank-line-p (line i))))
+                            do (push (mapcar #'inlines-of (split-table-row (line i))) rows)
+                               (incf i))
+                      (add (list :table aligns (mapcar #'inlines-of header) (nreverse rows) n))))
+                   ;; Indented code
+                   ((and (null paragraph) (>= (leading-spaces line) 4))
+                    (let ((code '()))
+                      (loop while (and (< i (length lines))
+                                       (or (>= (leading-spaces (line i)) 4) (blank-line-p (line i))))
+                            do (push (strip-indent (line i) 4) code) (incf i))
+                      (loop while (and code (blank-line-p (first code))) do (pop code))
+                      (add (list :code "" (format nil "~{~a~^~%~}" (nreverse code)) n))))
+                   (t (unless paragraph (setf paragraph-line n))
+                      (push line paragraph)
+                      (incf i)))))
+      (end-paragraph))
+    (nreverse blocks)))
+
+(defun markdown-blocks (text)
+  "The blocks of the Markdown document TEXT."
+  (parse-blocks (split-text-lines text) 0))
+
+(defun inline-plain-text (inlines)
+  "The text of INLINES ((string . nodes)) without markup."
+  (let ((string (car inlines)))
+    (with-output-to-string (out)
+      (labels ((walk (node)
+                 (destructuring-bind (kind s e cs ce children &rest more) node
+                   (declare (ignore s e more))
+                   (if children (mapc #'walk children) (write-string string out :start cs :end ce))
+                   (when (and (eq kind :image) (null children)) nil))))
+        (mapc #'walk (cdr inlines))))))
+
+(defun markdown-headings (text)
+  "The headings of the Markdown document TEXT, as (level title line)."
+  (let ((headings '()))
+    (labels ((walk (blocks)
+               (dolist (b blocks)
+                 (case (first b)
+                   (:heading (push (list (second b) (inline-plain-text (third b)) (fourth b)) headings))
+                   (:quote (walk (second b)))))))
+      (walk (markdown-blocks text)))
+    (nreverse headings)))
+
+
+(defun heading-anchor (title)
+  "The #anchor GitHub gives a heading titled TITLE."
+  (with-output-to-string (out)
+    (loop for c across (string-downcase title)
+          do (cond ((or (alphanumericp c) (char= c #\-) (char= c #\_)) (write-char c out))
+                   ((char= c #\Space) (write-char #\- out))))))
+
+(defun pad-cell (text pad align)
+  "TEXT with PAD spaces placed for ALIGN (:left, :right or :center)."
+  (flet ((spaces (n) (make-string (max 0 n) :initial-element #\Space)))
+    (ecase align
+      (:left (concatenate 'string text (spaces pad)))
+      (:right (concatenate 'string (spaces pad) text))
+      (:center (concatenate 'string (spaces (floor pad 2)) text (spaces (ceiling pad 2)))))))
+
+;;; Finding documents
+
+(defparameter *markdown-types* '("md" "markdown" "mdown" "mkd"))
+
+(defparameter *skipped-folders* '("node_modules" "target" "build" "dist" "vendor" "__pycache__")
+  "Folders not searched for documents (besides hidden ones).")
+
+(defun markdown-file-p (path)
+  (and (pathname-name path)
+       (member (pathname-type path) *markdown-types* :test #'equalp)))
+
+(defun markdown-files (directory &key (max-depth 6) (limit 2000))
+  "The Markdown files under DIRECTORY, as paths relative to it (strings),
+sorted: top-level files first, then by path. Hidden and build folders are
+skipped."
+  (let ((root (let ((dir (uiop:ensure-directory-pathname directory)))
+                ;; As DIRECTORY-FILES names them, so they can be made relative.
+                (or (ignore-errors (truename dir)) dir)))
+        (found '())
+        (count 0))
+    (labels ((walk (dir depth)
+               (dolist (file (ignore-errors (uiop:directory-files dir)))
+                 (when (and (< count limit) (markdown-file-p file))
+                   (incf count)
+                   (push (enough-namestring file root) found)))
+               (when (< depth max-depth)
+                 (dolist (sub (ignore-errors (uiop:subdirectories dir)))
+                   (let ((name (car (last (pathname-directory sub)))))
+                     (unless (or (not (stringp name)) (zerop (length name)) (char= (char name 0) #\.)
+                                 (member name *skipped-folders* :test #'string=))
+                       (walk sub (1+ depth))))))))
+      (walk root 0))
+    (sort found (lambda (a b)
+                  (let ((da (count #\/ a)) (db (count #\/ b)))
+                    (if (= (min da 1) (min db 1)) (string-lessp a b) (< da db)))))))

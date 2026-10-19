@@ -22,9 +22,12 @@
   :author "Jessie Hughart"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("agent-integration/core" "gtk4" "gtk4-adwaita")
+  :depends-on ("agent-integration/core" "gtk4" "gtk4-adwaita" "cffi" "sb-posix")
   :pathname "src/"
-  :components ((:file "ui"))
+  :serial t
+  :components ((:file "ui")
+               (:file "terminal")
+               (:file "preview"))
   :entry-point "agent-integration:main"
   :in-order-to ((test-op (test-op "agent-integration/tests"))))
 
