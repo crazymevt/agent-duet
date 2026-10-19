@@ -220,10 +220,41 @@
   (make-instance 'gtk:text-view :wrap-mode :word-char :top-margin 6 :bottom-margin 6
                  :left-margin 8 :right-margin 8 :accepts-tab nil))
 
+;;; Files dropped on a message box
+
+(defun dropped-paths (value)
+  "The local paths of the files in a drop's VALUE: a GValue holding a GdkFileList."
+  (let ((files (if (typep value 'gtk4.runtime:boxed)
+                   (gtk4.runtime:gvalue-get (gtk4.runtime:object-pointer value))
+                   value)))
+    (remove nil (mapcar #'gio:file-get-path (gdk:file-list-get-files files)))))
+
+(defun on-file-drop (widget function)
+  "Call FUNCTION with the paths of the files dropped on WIDGET. It sees the
+drop before WIDGET's children, so a text view doesn't take it as text."
+  (let ((target (gtk:drop-target-new (gtk4.runtime:gtype-from-name "GdkFileList" "gdk_file_list_get_type")
+                                     '(:copy))))
+    (gtk:event-controller-set-propagation-phase target :capture)
+    (gobject:connect target :drop
+                     (lambda (target value x y)
+                       (declare (ignore target x y))
+                       (let ((paths (ignore-errors (dropped-paths value))))
+                         (when paths (funcall function paths))
+                         (and paths t))))
+    (gtk:widget-add-controller widget target)))
+
+(defun insert-paths (view paths)
+  "Type PATHS into VIEW where its cursor is, quoted for a shell when they need it."
+  (gtk:text-buffer-insert-at-cursor (gtk:text-view-get-buffer view)
+                                    (format nil "~{~a~^ ~}" (mapcar #'shell-quote paths))
+                                    -1))
+
 ;;; An agent's pane
 
 (defstruct (agent-pane (:include pane) (:constructor new-agent-pane))
   agent stop
+  (attachments '())                           ; the paths of the files dropped on its message box
+  chips                                       ; the box showing them
   (stream-box nil) (stream-label nil) (stream-text "")
   (tools (make-hash-table :test 'equal))
   (approvals (make-hash-table :test 'equal))  ; approval id → its card's button row
@@ -345,13 +376,19 @@ for Codex, the one marked as the default)."
            (stop (make-instance 'gtk:button :label "Stop" :valign :end :visible nil
                                 :css-classes '("destructive-action")
                                 :tooltip-text (format nil "Stop ~a" (agent-name agent))))
+           (chips (make-instance 'gtk:flow-box :selection-mode :none :visible nil :row-spacing 4
+                                 :column-spacing 4 :margin-start 8 :margin-end 8 :margin-top 6))
            (pane (new-agent-pane :agent agent :stop stop :messages messages :scroller scroller
-                                 :status status :input input :send send)))
+                                 :status status :input input :send send :chips chips)))
       (flet ((send-it ()
-               (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text input))))
-                 (when (plusp (length text))
+               (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text input)))
+                     (attachments (agent-pane-attachments pane)))
+                 (when (or (plusp (length text)) attachments)
                    (handler-case
-                       (progn (agent-send-now agent text) (clear-text-view input))
+                       (progn (agent-send-now agent (if (plusp (length text)) text "Take a look at these.")
+                                              attachments)
+                              (clear-text-view input)
+                              (set-attachments pane '()))
                      (error (e) (pane-note pane (princ-to-string e) "error")))))))
         (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (send-it)))
         (gobject:connect stop :clicked (lambda (b) (declare (ignore b)) (agent-cancel agent)))
@@ -372,9 +409,41 @@ for Codex, the one marked as the default)."
                           (gtk:separator)
                           scroller
                           (gtk:separator)
-                          (composer input
-                                    (gtk:build (gtk:box :orientation :vertical :spacing 6
-                                                       :valign :end send stop))))))))))
+                          (let ((box (gtk:build
+                                      (gtk:box :orientation :vertical
+                                               chips
+                                               (composer input
+                                                         (gtk:build (gtk:box :orientation :vertical :spacing 6
+                                                                             :valign :end send stop)))))))
+                            (gtk:widget-set-tooltip-text
+                             input (format nil "Drop files or images here to attach them to the message to ~a"
+                                           (agent-name agent)))
+                            (on-file-drop box (lambda (paths)
+                                                (set-attachments pane (append (agent-pane-attachments pane)
+                                                                              (set-difference paths (agent-pane-attachments pane)
+                                                                                              :test #'equal)))))
+                            box))))))))
+
+(defun set-attachments (pane paths)
+  "Attach PATHS to the next message from PANE's box, each shown as a removable chip."
+  (let ((chips (agent-pane-chips pane)))
+    (setf (agent-pane-attachments pane) paths)
+    (gtk:flow-box-remove-all chips)
+    (dolist (path paths)
+      (let* ((path path)
+             (remove (make-instance 'gtk:button :label "×" :css-classes '("flat" "circular")
+                                                :tooltip-text "Don't attach it")))
+        (gobject:connect remove :clicked
+                         (lambda (b) (declare (ignore b))
+                           (set-attachments pane (remove path (agent-pane-attachments pane) :test #'equal))))
+        (gtk:flow-box-append chips
+                             (gtk:build
+                              (gtk:box :spacing 2 :css-classes '("duet-chip") :tooltip-text path
+                                       (gtk:label :label (format nil "~:[📄~;🖼~] ~a" (image-media-type path)
+                                                                 (file-namestring path))
+                                                  :ellipsize :middle :max-width-chars 28 :margin-start 6)
+                                       remove)))))
+    (gtk:widget-set-visible chips (and paths t))))
 
 (defun agent-css-class (agent)
   (if (eq (agent-id agent) :claude) "duet-claude" "duet-codex"))
@@ -742,11 +811,15 @@ comes without one (a turn stopped as the folder changes) isn't kept."
            (:text
             ;; The header, as MIDDLE-MESSAGE wrote it, says whose it was.
             (let* ((end (or (search (format nil "~%~%") text) (length text)))
-                   (header (subseq text 0 end)))
-              (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
-                                   ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
-                                   (t :user))
-                             header (string-left-trim '(#\Newline) (subseq text end)))))
+                   (header (subseq text 0 end))
+                   (body (string-left-trim '(#\Newline) (subseq text end))))
+              (cond
+                ((string= header "Check") (middle-check body))
+                ((string= header "Review checklist") (pane-append *middle* (markdown-box body "duet-checklist")))
+                (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
+                                        ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
+                                        (t :user))
+                                  header body)))))
            (:error (pane-note *middle* text "error"))
            (t (pane-note *middle* text "dim-label" "duet-note"))))))))
 
@@ -840,6 +913,13 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (:review "review")
     (t nil)))
 
+(defun middle-check (text)
+  "The check command's progress or result, in the conversation."
+  (pane-append *middle* (gtk:build
+                         (gtk:box :orientation :vertical :spacing 4 :css-classes '("duet-checklist")
+                                  (gtk:label :label "Check" :xalign 0.0 :css-classes '("caption-heading"))
+                                  (markdown-box text)))))
+
 (defun middle-bubble (side header text)
   "A message in the conversation, from SIDE: :user, :claude or :codex."
   (pane-append *middle*
@@ -859,6 +939,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
      ;; The review checklist: kept as a message, so it comes back with its header.
      (pane-append *middle* (markdown-box text "duet-checklist"))
      (record :middle :text (format nil "Review checklist~%~%~a" text))
+     (save-current-history))
+    ((eq kind :check)
+     (middle-check text)
+     (record :middle :text (format nil "Check~%~%~a" text))
      (save-current-history))
     ((eq from :system)
      (pane-note *middle* text "dim-label" "duet-note")
@@ -896,7 +980,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (let ((running (workflow-running-p)))
       (gtk:button-set-label (control :send) (if running "Stop" "Start"))
       (gtk:widget-set-css-classes (control :send) (if running '("destructive-action") '("suggested-action")))
-      (dolist (name '(:mode :lead :rounds :folder :permission))
+      (dolist (name '(:mode :lead :rounds :check :folder :permission))
         (gtk:widget-set-sensitive (control name) (not running)))
       ;; Only the modes that make a plan wait for one.
       (dolist (name '(:approve-plan :worktrees))
@@ -1149,6 +1233,7 @@ usage after the turn) brings the Wait button."
                                                                   (gtk:check-button-get-active (control :approve-plan)))
                                                :on-plan #'show-plan-card
                                                :worktrees (worktrees-wanted-p)
+                                               :check-command (folder-check-command *directory*)
                                                :on-finish #'workflow-finished))
                (start-workflow *workflow*)
                (update-controls))))))))
@@ -1165,7 +1250,8 @@ usage after the turn) brings the Wait button."
            (approve-plan (make-instance 'gtk:check-button :label "Approve plan" :active (setting :approve-plan nil)))
            (worktrees (make-instance 'gtk:check-button :label "Own worktrees" :active (setting :worktrees nil)))
            (lead (gtk:drop-down-new-from-strings '("Claude leads" "ChatGPT leads")))
-           (rounds (gtk:spin-button-new-with-range 1d0 10d0 1d0)))
+           (rounds (gtk:spin-button-new-with-range 1d0 10d0 1d0))
+           (check (make-instance 'gtk:entry :placeholder-text "Check command" :width-chars 14 :hexpand t)))
       (setf *middle* (make-pane :messages messages :scroller scroller :status status :input input :send send))
       (gtk:spin-button-set-value rounds (coerce *default-max-rounds* 'double-float))
       (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part. Compare proposals: both propose an approach on their own, the lead reconciles them into a plan, and then the work is split.")
@@ -1178,7 +1264,13 @@ usage after the turn) brings the Wait button."
                        (lambda (b) (setf (setting :worktrees) (gtk:check-button-get-active b))))
       (gtk:widget-set-tooltip-text lead "Who does the work (or splits it)")
       (gtk:widget-set-tooltip-text rounds "Most review rounds before stopping")
-      (setf *controls* (list* :input input :send send :mode mode :lead lead :rounds rounds
+      (gtk:widget-set-tooltip-text check "A shell command run in the folder after each round of work, such as `make test`. If it fails, the author gets its output to fix before the review; the reviewer is told how it went. Kept for this folder; leave it empty for none.")
+      (gobject:connect check :changed
+                       (lambda (e) (when *directory*
+                                     (setf (folder-check-command *directory*) (gtk:editable-get-text e)))))
+      (gtk:widget-set-tooltip-text input "Drop files here to put their paths in the request")
+      (on-file-drop input (lambda (paths) (insert-paths input paths)))
+      (setf *controls* (list* :input input :send send :mode mode :lead lead :rounds rounds :check check
                               :approve-plan approve-plan :worktrees worktrees *controls*))
       (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (start-request)))
       (on-return input (lambda () (unless (workflow-running-p) (start-request))))
@@ -1194,7 +1286,9 @@ usage after the turn) brings the Wait button."
                 (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6
                          mode lead
                          (gtk:label :label "Rounds" :css-classes '("dim-label") :margin-start 6)
-                         rounds approve-plan worktrees)
+                         rounds approve-plan worktrees
+                         (gtk:label :label "Check" :css-classes '("dim-label") :margin-start 6)
+                         check)
                 (composer input send))))))
 
 ;;; The folder, what the agents may do, and the look
@@ -1231,7 +1325,14 @@ usage after the turn) brings the Wait button."
       (when *middle*
         (pane-note *middle* (format nil "Working in ~a" (namestring directory)) "dim-label" "duet-note"))
       (refresh-folder-menu)
+      (refresh-check-command)
       (documents-folder-changed))))
+
+(defun refresh-check-command ()
+  "Show the current folder's check command."
+  (let ((entry (control :check)))
+    (when entry
+      (gtk:editable-set-text entry (or (folder-check-command *directory*) "")))))
 
 (defun choose-directory ()
   (let ((dialog (gtk:file-dialog-new)))
@@ -1321,6 +1422,12 @@ usage after the turn) brings the Wait button."
                      (lambda (d pspec) (declare (ignore pspec))
                        (apply-theme (first (nth (gtk:drop-down-get-selected d) *themes*)))))
     (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
+    (let ((notes (make-instance 'gtk:check-button :label "Shared notes" :active *shared-notes*
+                                :tooltip-text "Give Claude the folder's AGENTS.md, and ChatGPT its CLAUDE.md, with their instructions (each reads its own already), so both follow the project's conventions. Read again in a new conversation.")))
+      (gobject:connect notes :toggled
+                       (lambda (b) (setf *shared-notes* (gtk:check-button-get-active b)
+                                         (setting :shared-notes) *shared-notes*)))
+      (gtk:header-bar-pack-end header notes))
     (gtk:header-bar-pack-start header folder)
     (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
                                    :tooltip-text "Show or hide the terminal panel (Ctrl+`)"))
@@ -1419,6 +1526,7 @@ usage after the turn) brings the Wait button."
     (".duet-claude" :color "#e08a6a")
     (".duet-codex" :color "#19b98f")
     (".duet-note" :font-size "smaller")
+    (".duet-chip" :background-color "alpha(@view_fg_color, 0.08)" :border-radius "12px")
     (".duet-checklist" :background-color "alpha(@view_fg_color, 0.05)" :border-radius "8px" :padding ("8px" "12px"))
     (".duet-terminal-panel" :background-color "@view_bg_color")
     (".duet-terminal" :padding ("2px" "6px") :font-family "Menlo, Monaco, monospace")))
@@ -1458,7 +1566,8 @@ usage after the turn) brings the Wait button."
   (gtk:add-css *css*)
   (apply-theme (setting :theme :dark))
   (setf *controls* '()
-        *permission* (or (setting :permission) :ask))
+        *permission* (or (setting :permission) :ask)
+        *shared-notes* (setting :shared-notes t))
   (let ((window (make-instance 'gtk:application-window
                                :application app :title "Agent Duet"
                                :default-width 1440 :default-height 900)))

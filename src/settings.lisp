@@ -51,3 +51,17 @@
     (setf (setting :recent-folders)
           (let ((list (cons path (remove path (setting :recent-folders) :test #'equal))))
             (subseq list 0 (min *recent-folders-kept* (length list)))))))
+
+(defun folder-check-command (directory)
+  "The check command (see the workflow's :check-command) set for DIRECTORY, or nil."
+  (cdr (assoc (namestring directory) (setting :check-commands) :test #'equal)))
+
+(defun (setf folder-check-command) (command directory)
+  "Remember COMMAND as DIRECTORY's check command; a blank one forgets it."
+  (let* ((path (namestring directory))
+         (command (and command (string-trim '(#\Space #\Tab #\Newline) command)))
+         (others (remove path (setting :check-commands) :key #'car :test #'equal)))
+    (unless (equal command (folder-check-command directory))
+      (setf (setting :check-commands)
+            (if (plusp (length command)) (acons path command others) others)))
+    command))

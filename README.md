@@ -20,6 +20,13 @@ working use the current turn's model and permissions. If Codex is still starting
 wait for it to begin responding and send again; a delivery failure is shown with
 the message text so you can retry.
 
+Drop files or images on a side pane's message box to attach them to your next
+message to that agent. Each shows as a chip above the box (× takes it off).
+The message lists their paths, so the agent can read them, and images (PNG,
+JPEG, GIF, WebP, up to 3 MB) are also shown to it: as image blocks for Claude,
+as local images for Codex. Dropping files on the middle request box types
+their paths into the request instead.
+
 ## Working together
 
 Type a request in the middle and press Return. Choose how they work:
@@ -62,6 +69,19 @@ worktree for its part, so the parts can't get in each other's way:
 - If the task is stopped, a part fails, or the merge can't be finished (or
   is aborted), nothing more is merged: the worktrees and their branches are
   kept, and the conversation says where.
+
+**Check** (next to the mode controls) is a shell command for this folder,
+such as `make test` or `npm test`, remembered per folder; leave it empty for
+none. After each round of work, before the reviewer is asked, it runs in the
+author's folder (its worktree, with *Own worktrees*; the main folder for the
+merged result), and the conversation shows whether it passed, with the end
+of its output. If it fails, the author is given the command, its exit code
+and output to fix, and it runs again, up to twice a round; then the review
+goes ahead anyway. The review prompt says how the check went (and, if it
+still fails, includes its output). An approval doesn't mean the check passed:
+after the fix attempts, the reviewer may approve work whose check still fails,
+so look at the last check result in the conversation. A check that runs over 10 minutes is stopped as failed; **Stop** stops
+it too.
 
 Each review lists its findings in a checklist, `F1`, `F2`, … with the file
 and line where there is one. The next review marks each finding fixed,
@@ -109,10 +129,15 @@ it turns prompts away without trying; its status line says until when.
 - **Remaining usage** for both shows in their status lines (for example
   `65% 5h / 56% 7d left`; hover for the reset times), turning orange when
   under 10% is left.
+- **Shared notes** (top right): each CLI reads its own notes file (Claude
+  `CLAUDE.md`, Codex `AGENTS.md`); with this on, each is also given the
+  other's, from the folder, with its instructions, so a project's
+  conventions needn't be restated each task. It's read when a conversation
+  starts (a new one, or in another folder), and cut at 20,000 characters.
 - **Dark / Light / System** (top right).
 
-These, the permission setting and the recent folders are remembered in
-`~/.config/agent-duet/settings.lisp`.
+These, the permission setting, the recent folders and each folder's check
+command are remembered in `~/.config/agent-duet/settings.lisp`.
 
 ## Terminal
 
@@ -191,7 +216,8 @@ used (your home folder the first time). Its output goes to
 - `src/settings.lisp`: what's remembered between runs.
 - `src/usage.lisp`: both accounts' usage windows, and recognizing a turn that
   failed because one ran out.
-- `src/workflow.lisp`: the two ways of working together. No GTK.
+- `src/check.lisp`: running a folder's check command in the background.
+- `src/workflow.lisp`: the ways of working together. No GTK.
 - `src/ui.lisp`: the window.
 - `src/terminal.lisp`: the Terminal panel (VTE through CFFI, from Cadre).
 - `src/preview.lisp`: the Documents window (Cadre's Markdown preview, read-only).

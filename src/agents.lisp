@@ -1,8 +1,8 @@
 ;;;; agents.lisp — Claude and Codex behind one interface
 ;;;;
 ;;;; An AGENT takes one prompt at a time. AGENT-SUBMIT queues a prompt with a
-;;;; function to call with the turn's final reply; while a turn runs, later
-;;;; prompts wait their turn. What happens during a turn goes to the agent's
+;;;; function to call with the turn's final reply, and any files attached
+;;;; to it; while a turn runs, later prompts wait their turn. What happens during a turn goes to the agent's
 ;;;; LISTENER as (listener agent kind &rest plist):
 ;;;;   :prompt TEXT          a prompt the agent is starting on
 ;;;;   :delta TEXT           more of a reply being written
@@ -45,8 +45,10 @@ read-only ones), Codex runs them in its sandbox without asking.
    (deliver :initarg :deliver :initform #'funcall :accessor agent-deliver)
    (listener :initarg :listener :initform nil :accessor agent-listener)
    (busy :initform nil :accessor agent-busy)
-   (queue :initform '() :accessor agent-queue :documentation "Waiting (prompt . callback)s, oldest first")
+   (queue :initform '() :accessor agent-queue :documentation "Waiting (prompt callback attachments)s, oldest first")
    (callback :initform nil :accessor agent-callback :documentation "The running turn's")
+   (turn-images :initform '() :accessor agent-turn-images
+                :documentation "The images (paths) to show the agent with the running turn's prompt")
    (turn-token :initform (list nil) :accessor agent-turn-token
                :documentation "(t) while the running turn may go on; AGENT-CANCEL makes it (nil)")
    (approvals :initform '() :accessor agent-approvals :documentation "Unanswered (id . answer-function)s")
@@ -107,43 +109,49 @@ read-only ones), Codex runs them in its sandbox without asking.
   (when (agent-listener agent)
     (apply (agent-listener agent) agent kind plist)))
 
-(defun agent-submit (agent prompt &optional callback)
+(defun agent-submit (agent prompt &optional callback attachments)
   "Have AGENT work on PROMPT, now or after the turns before it. CALLBACK
 gets the final reply's text and whether the turn failed (then the text
-says why)."
-  (setf (agent-queue agent) (append (agent-queue agent) (list (cons prompt callback))))
+says why). ATTACHMENTS are the paths of files given with PROMPT (see
+PROMPT-WITH-ATTACHMENTS)."
+  (setf (agent-queue agent) (append (agent-queue agent) (list (list prompt callback attachments))))
   (unless (agent-busy agent) (agent-next agent)))
 
-(defgeneric agent-steer (agent prompt)
-  (:documentation "Deliver PROMPT to the running turn without interrupting it."))
+(defgeneric agent-steer (agent prompt &optional images)
+  (:documentation "Deliver PROMPT, with IMAGES (paths) attached, to the running turn without interrupting it."))
 
-(defmethod agent-steer ((agent agent) prompt)
-  (declare (ignore prompt))
+(defmethod agent-steer ((agent agent) prompt &optional images)
+  (declare (ignore prompt images))
   (error "This agent does not support sending while working."))
 
-(defun agent-send-now (agent prompt)
-  "Send a side-pane message, steering if busy. Preserve the running callback."
+(defun agent-send-now (agent prompt &optional attachments)
+  "Send a side-pane message, with ATTACHMENTS (paths), steering if busy.
+Preserve the running callback."
   (if (agent-busy agent)
       (progn
         (unless (car (agent-turn-token agent))
           (error "The agent is stopping; wait for it to finish."))
-        (agent-steer agent prompt)
-        (agent-emit agent :prompt :text prompt))
-      (agent-submit agent prompt)))
+        (let ((text (prompt-with-attachments prompt attachments)))
+          (agent-steer agent text (attachment-images attachments))
+          (agent-emit agent :prompt :text text)))
+      (agent-submit agent prompt nil attachments)))
 
 (defun agent-next (agent)
   (let ((next (pop (agent-queue agent))))
     (when next
-      (setf (agent-busy agent) t
-            (agent-callback agent) (cdr next)
-            (agent-turn-token agent) (list t))
-      (agent-emit agent :busy :busy t)
-      (agent-emit agent :prompt :text (car next))
-      (if (agent-out-of-usage-p agent)
-          ;; Known to be out: don't spend a request finding out again.
-          (agent-turn-finished agent (agent-out-message agent) :out-of-usage)
-          (handler-case (agent-begin-turn agent (car next))
-            (error (e) (agent-turn-finished agent (princ-to-string e) t)))))))
+      (destructuring-bind (prompt callback attachments) next
+        (let ((text (prompt-with-attachments prompt attachments)))
+          (setf (agent-busy agent) t
+                (agent-callback agent) callback
+                (agent-turn-images agent) (attachment-images attachments)
+                (agent-turn-token agent) (list t))
+          (agent-emit agent :busy :busy t)
+          (agent-emit agent :prompt :text text)
+          (if (agent-out-of-usage-p agent)
+              ;; Known to be out: don't spend a request finding out again.
+              (agent-turn-finished agent (agent-out-message agent) :out-of-usage)
+              (handler-case (agent-begin-turn agent text)
+                (error (e) (agent-turn-finished agent (princ-to-string e) t)))))))))
 
 (defun agent-turn-finished (agent text error)
   "The running turn ended with TEXT, its final reply, or with an ERROR (true;
@@ -166,7 +174,7 @@ says why)."
   "Drop the waiting prompts and interrupt the running turn. Whoever is
 waiting on them (a workflow) hears that they were stopped: told nothing,
 it would wait for ever."
-  (let ((waiting (mapcar #'cdr (agent-queue agent)))
+  (let ((waiting (mapcar #'second (agent-queue agent)))
         (running (and (agent-busy agent) (agent-callback agent))))
     (setf (agent-queue agent) '())
     (setf (car (agent-turn-token agent)) nil)
@@ -207,6 +215,38 @@ with \", \" when several were chosen."
   (dolist (entry (agent-approvals agent))
     (agent-answer-approval agent (car entry) :deny)))
 
+;;; Attachments: files dropped on a message box
+
+(defparameter *attached-image-limit* (* 3 1024 1024)
+  "The largest image file shown to an agent, in bytes. Larger ones are sent
+by their path only (Claude takes at most about 5 MB of base64).")
+
+(defun attachment-images (attachments)
+  "Those of ATTACHMENTS (paths) the agents can be shown as images."
+  (remove-if-not (lambda (path)
+                   (and (image-media-type path)
+                        (let ((size (ignore-errors
+                                     (with-open-file (in path :element-type '(unsigned-byte 8))
+                                       (file-length in)))))
+                          (and size (<= size *attached-image-limit*)))))
+                 attachments))
+
+(defun shell-quote (string)
+  "STRING as one word for a shell: as it is when every character is safe
+there, otherwise in single quotes (in which a single quote is '\\'')."
+  (if (and (plusp (length string))
+           (every (lambda (c) (or (alphanumericp c) (find c "/._-+,:@%="))) string))
+      string
+      (format nil "'~{~a~^'\\''~}'" (uiop:split-string string :separator "'"))))
+
+(defun prompt-with-attachments (prompt attachments)
+  "PROMPT, followed by the paths of the files attached to it. Images are
+also shown to the agent (ATTACHMENT-IMAGES); other files it reads itself."
+  (if attachments
+      (format nil "~a~%~%Attached file~p:~%~{- ~a~%~}" prompt (length attachments)
+              (mapcar #'uiop:native-namestring attachments))
+      prompt))
+
 ;;; Small things
 
 (defun agent-note-stderr (agent line)
@@ -221,16 +261,48 @@ with \", \" when several were chosen."
   (let ((deliver (agent-deliver agent)))
     (lambda (thunk) (funcall deliver thunk))))
 
+;;; Shared project notes: each agent reads its own notes file (Claude
+;;; CLAUDE.md, Codex AGENTS.md), and is given the other's in its
+;;; instructions, so both follow the same conventions. They are read when
+;;; the agent's process starts: a new conversation, or another folder.
+
+(defvar *shared-notes* t "Whether the agents' instructions include the folder's notes for the other agent.")
+
+(defparameter *shared-notes-limit* 20000 "The most of a notes file put in the instructions, in characters.")
+
+(defun shared-notes-file (agent)
+  "The notes file AGENT doesn't read by itself: the other agent's."
+  (if (eq (agent-id agent) :claude) "AGENTS.md" "CLAUDE.md"))
+
+(defun shared-notes (agent)
+  "The text of the notes file in AGENT's folder that AGENT doesn't read by
+itself, cut to *SHARED-NOTES-LIMIT*; nil when off, missing or empty."
+  (let* ((directory (agent-directory agent))
+         (file (and *shared-notes* directory
+                    (probe-file (merge-pathnames (shared-notes-file agent)
+                                                 (uiop:ensure-directory-pathname directory)))))
+         (text (and file (not (uiop:directory-pathname-p file))
+                    (ignore-errors (uiop:read-file-string file :external-format '(:utf-8 :replacement #\?))))))
+    (when (and text (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) text))))
+      (if (> (length text) *shared-notes-limit*)
+          (format nil "~a~%~%[… cut: the file is ~:d characters long; read it for the rest.]"
+                  (subseq text 0 *shared-notes-limit*) (length text))
+          text))))
+
 (defun collaboration-instructions (agent)
-  (let ((partner (agent-partner-name agent)))
+  (let ((partner (agent-partner-name agent))
+        (notes (shared-notes agent)))
     (format nil "You are ~a, one of two coding agents (the other is ~a) working together on the user's ~
 request in the same working directory. Prompts may come from the user directly or be relayed from ~a: ~
 they may ask you to implement something, to review ~a's work, or to address its review of yours. ~
 When you review, inspect the files themselves (and `git diff` if the directory is a git repository) ~
 rather than trusting a summary, and don't change files unless asked to. When you implement, finish your ~
 reply with a short summary of what you changed and in which files, since that summary is what ~a sees. ~
-Running a command may need the user's approval; if one is denied, carry on without it and say so."
-            (agent-name agent) partner partner partner partner)))
+Running a command may need the user's approval; if one is denied, carry on without it and say so.~
+~@[~%~%The project's notes for coding agents, from its `~a` (written for ~a, but they apply to you too):~
+~%~%~a~]"
+            (agent-name agent) partner partner partner partner
+            (and notes (shared-notes-file agent)) partner notes)))
 
 ;;; Claude
 
@@ -247,13 +319,17 @@ Running a command may need the user's approval; if one is denied, carry on witho
    (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume")
    (limits :initform nil :accessor claude-agent-limits :documentation "The last rate_limit_info")
    (prompts :initform '() :accessor claude-agent-prompts
-            :documentation "The running turn's prompt and what was sent while it ran, to send again")
+            :documentation "The running turn's prompt and what was sent while it ran, to send again:
+(text . images)s")
+   (sender :initform nil :accessor claude-agent-sender
+           :documentation "The thread writing the last message sent in the background, while it runs")
    (limit-hit :initform nil :accessor claude-agent-limit-hit
               :documentation "Set when this turn's rate_limit_event said rejected: its reset, or :unknown"))
   (:default-initargs :id :claude :name "Claude" :partner-name "ChatGPT" :model *claude-model*))
 
 (defun claude-agent-wanted-config (agent)
-  (list (agent-model agent) (agent-effort agent) (agent-permission agent) (agent-directory agent)))
+  (list (agent-model agent) (agent-effort agent) (agent-permission agent) (agent-directory agent)
+        *shared-notes*))
 
 (defun claude-agent-ensure-process (agent)
   "The agent's CLI process, started (or restarted, resuming the conversation)
@@ -373,7 +449,9 @@ folder): carry on the turn in a new conversation."
             ((null prompts) (agent-turn-finished agent why t))
             ;; The prompt, then what was sent while it ran, in order.
             (t (handler-case (let ((new (claude-agent-ensure-process agent)))
-                               (dolist (prompt prompts) (claude-send new prompt)))
+                               (loop for (prompt . images) in prompts
+                                     do (claude-agent-send agent new prompt images
+                                                           :on-error (turn-failure agent))))
                  (error (e) (agent-turn-finished agent (princ-to-string e) t))))))))
 
 (defun claude-agent-result (agent event)
@@ -404,20 +482,69 @@ folder): carry on the turn in a new conversation."
         (unless (cp-stopped cp) (agent-emit agent :note :text why))
         (agent-turn-finished agent why t)))))
 
-(defmethod agent-begin-turn ((agent claude-agent) prompt)
-  (setf (claude-agent-prompts agent) (list prompt))
-  (claude-send (claude-agent-ensure-process agent) prompt))
+(defun claude-agent-send (agent cp text images &key on-error)
+  "Send TEXT, with IMAGES, to CP, after what was sent before. A message with
+images is read, encoded and written on another thread, since a big one
+could block the GUI thread while the CLI isn't reading; so is anything sent
+while that is still going on, to keep the order. A message sent in the
+background is dropped if the turn it was for is stopped (AGENT-CANCEL) or
+over before it is written. Then ON-ERROR, if the write fails, gets why
+through DELIVER; otherwise the error is signalled."
+  (let ((previous (claude-agent-sender agent)))
+    (if (and (null images) (not (claude-agent-sending-p agent)))
+        (claude-send cp text)
+        (let ((deliver (agent-deliver agent))
+              (token (agent-turn-token agent)))
+          (setf (claude-agent-sender agent)
+                (sb-thread:make-thread
+                 (lambda ()
+                   (when previous (sb-thread:join-thread previous :default nil))
+                   (handler-case (when (car token)
+                                   (claude-send cp text images
+                                                (lambda () (and (car token) (eq token (agent-turn-token agent))))))
+                     (error (e)
+                       (let ((why (princ-to-string e)))
+                         (when on-error (funcall deliver (lambda () (funcall on-error why))))))))
+                 :name "claude send"))))))
 
-(defmethod agent-steer ((agent claude-agent) prompt)
+(defun claude-agent-sending-p (agent)
+  "Whether a message is still being sent in the background."
+  (let ((sender (claude-agent-sender agent)))
+    (and sender (sb-thread:thread-alive-p sender))))
+
+(defun turn-failure (agent)
+  "A function ending AGENT's running turn as failed with the text it's given,
+unless that turn is over by then."
+  (let ((token (agent-turn-token agent)))
+    (lambda (why)
+      (when (eq token (agent-turn-token agent))
+        (agent-turn-finished agent why t)))))
+
+(defmethod agent-begin-turn ((agent claude-agent) prompt)
+  (let ((images (agent-turn-images agent)))
+    (setf (claude-agent-prompts agent) (list (cons prompt images)))
+    (claude-agent-send agent (claude-agent-ensure-process agent) prompt images
+                       :on-error (turn-failure agent))))
+
+(defmethod agent-steer ((agent claude-agent) prompt &optional images)
   ;; Use the current process: changing settings must not restart a busy CLI.
   (let ((cp (claude-agent-process agent)))
     (unless (claude-alive-p cp) (error "Claude is not ready to receive a message yet."))
-    (claude-send cp prompt)
-    (setf (claude-agent-prompts agent) (append (claude-agent-prompts agent) (list prompt)))))
+    (claude-agent-send agent cp prompt images
+                       :on-error (lambda (why)
+                                   (agent-emit agent :note
+                                               :text (format nil "Could not send while working: ~a~%Message: ~a"
+                                                             why prompt))))
+    (setf (claude-agent-prompts agent) (append (claude-agent-prompts agent) (list (cons prompt images))))))
 
 (defmethod agent-interrupt ((agent claude-agent))
   (let ((cp (claude-agent-process agent)))
-    (when (claude-alive-p cp) (claude-interrupt cp))))
+    (when (claude-alive-p cp)
+      (if (claude-agent-sending-p agent)
+          ;; The input is busy with a message the CLI may be slow to take:
+          ;; don't wait for it here. Queued ones see the turn stopped.
+          (sb-thread:make-thread (lambda () (claude-interrupt cp)) :name "claude interrupt")
+          (claude-interrupt cp)))))
 
 (defmethod agent-shutdown ((agent claude-agent))
   (setf (car (agent-turn-token agent)) nil)
@@ -461,7 +588,7 @@ folder): carry on the turn in a new conversation."
   "The agent's app-server with its thread started, (re)started when it isn't
 running in the current directory and sandbox. Blocks: call it off the GUI thread."
   (let ((server (codex-agent-server agent))
-        (config (list (codex-agent-sandbox agent) (agent-directory agent))))
+        (config (list (codex-agent-sandbox agent) (agent-directory agent) *shared-notes*)))
     (when (and (codex-alive-p server) (not (equal config (codex-agent-config agent))))
       (setf (codex-agent-server agent) nil)
       (stop-codex-app-server server)
@@ -576,6 +703,7 @@ rather than using a server with no thread."
         (model (agent-model agent))
         (effort (agent-effort agent))
         (policy (codex-agent-approval-policy agent))
+        (images (agent-turn-images agent))
         (token (agent-turn-token agent)))
     ;; Starting the app-server and the turn wait for replies: not on the GUI
     ;; thread. A Stop meanwhile finds no turn to interrupt, so the token is
@@ -591,7 +719,7 @@ rather than using a server with no thread."
                (if (not (car token))
                    (stopped)
                    (let ((turn-id (jget (codex-start-turn server prompt :model model :effort effort
-                                                          :approval-policy policy)
+                                                          :approval-policy policy :images images)
                                         "turn" "id")))
                      (unless (car token)
                        (ignore-errors (codex-interrupt server :turn-id turn-id))))))
@@ -602,7 +730,7 @@ rather than using a server with no thread."
                                          (agent-turn-finished agent why t))))))))
        :name "codex turn"))))
 
-(defmethod agent-steer ((agent codex-agent) prompt)
+(defmethod agent-steer ((agent codex-agent) prompt &optional images)
   (let* ((server (codex-agent-server agent))
          (turn-id (and server (codex-turn-id server)))
          (thread-id (and server (codex-thread-id server)))
@@ -613,7 +741,7 @@ rather than using a server with no thread."
     ;; Capture both IDs: never steer a later workflow turn by accident.
     (sb-thread:make-thread
      (lambda ()
-       (handler-case (codex-steer-turn server prompt :thread-id thread-id :turn-id turn-id)
+       (handler-case (codex-steer-turn server prompt :thread-id thread-id :turn-id turn-id :images images)
          (error (e)
            (let ((why (format nil "Could not send while working: ~a~%Message: ~a" e prompt)))
              (funcall deliver (lambda () (agent-emit agent :note :text why)))))))

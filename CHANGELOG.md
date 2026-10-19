@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- *Check* command per folder (`make test`, `npm test`, …): it runs after
+  each round of work, before the review. A failure goes back to the author
+  with its output (up to twice a round), and the review prompt says how the
+  check went. The reviewer can still approve work whose check fails after
+  the fix attempts, so look at the last check result too. The conversation
+  shows each run and its result.
+- *Shared notes*: Claude is given the folder's `AGENTS.md`, and ChatGPT its
+  `CLAUDE.md`, with their instructions, so both follow the project's
+  conventions. Read when a conversation starts; can be switched off in the
+  header.
+- Drop files or images on an agent's message box to attach them to the next
+  message: their paths are listed, and images are shown to the agent. On the
+  middle request box, dropped files' paths are typed in.
+
 - The panes no longer leave a new message, card or question just below the
   visible area until you scroll: following the end now waits until the
   content has been laid out.

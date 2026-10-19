@@ -372,25 +372,32 @@ the rest of the session) or :deny."
     (codex-deliver-event server (make-codex-event :kind :thread-started :thread-id thread-id))
     thread-id))
 
-(defun codex-start-turn (server text &key model effort approval-policy)
-  "Start a user turn on SERVER's thread."
+(defun codex-input (text images)
+  "A turn's input: TEXT, then each of IMAGES (paths) as a local image."
+  (coerce (cons (jobj "type" "text" "text" text)
+                (loop for image in images
+                      collect (jobj "type" "localImage" "path" (uiop:native-namestring image))))
+          'vector))
+
+(defun codex-start-turn (server text &key model effort approval-policy images)
+  "Start a user turn on SERVER's thread, with IMAGES (paths) attached."
   (unless (codex-thread-id server) (error "Codex thread has not been started"))
   (codex-request server "turn/start"
                  (jobj "threadId" (codex-thread-id server)
-                       "input" (vector (jobj "type" "text" "text" text))
+                       "input" (codex-input text images)
                        "model" (or model :null)
                        "effort" (or effort :null)
                        "approvalPolicy" (or approval-policy :omit))))
 
-(defun codex-steer-params (thread-id turn-id text)
+(defun codex-steer-params (thread-id turn-id text &optional images)
   (unless (and thread-id turn-id) (error "Codex has no active turn"))
   (jobj "threadId" thread-id "expectedTurnId" turn-id
-        "input" (vector (jobj "type" "text" "text" text))))
+        "input" (codex-input text images)))
 
 (defun codex-steer-turn (server text &key (thread-id (codex-thread-id server))
-                                        (turn-id (codex-turn-id server)))
+                                        (turn-id (codex-turn-id server)) images)
   "Append input to exactly this active turn; never interrupt or start another."
-  (codex-request server "turn/steer" (codex-steer-params thread-id turn-id text)))
+  (codex-request server "turn/steer" (codex-steer-params thread-id turn-id text images)))
 
 ;;; Models and usage
 

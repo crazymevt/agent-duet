@@ -152,11 +152,45 @@ then the copy inside the Claude desktop app.")
           (and system-prompt (list "--append-system-prompt" system-prompt))
           (and isolated (list "--strict-mcp-config" "--setting-sources" "project"))))
 
-(defun user-message-line (text)
-  "The stdin line that sends TEXT as a user message."
+(defun base64-encode (octets)
+  "OCTETS (a vector of bytes) in base64."
+  (let ((alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        (n (length octets)))
+    (with-output-to-string (out)
+      (loop for i from 0 below n by 3
+            do (let* ((count (min 3 (- n i)))
+                      (bits (loop for j below 3
+                                  sum (ash (if (< j count) (aref octets (+ i j)) 0) (* 8 (- 2 j))))))
+                 (dotimes (j 4)
+                   (write-char (if (<= j count) (char alphabet (ldb (byte 6 (* 6 (- 3 j))) bits)) #\=)
+                               out)))))))
+
+(defun image-media-type (path)
+  "The media type of an image file Claude can be shown, from its name, or nil."
+  (let ((type (string-downcase (or (pathname-type (pathname path)) ""))))
+    (cdr (assoc type '(("png" . "image/png") ("jpg" . "image/jpeg") ("jpeg" . "image/jpeg")
+                       ("gif" . "image/gif") ("webp" . "image/webp"))
+                :test #'string=))))
+
+(defun read-file-octets (path)
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((octets (make-array (file-length in) :element-type '(unsigned-byte 8))))
+      (read-sequence octets in)
+      octets)))
+
+(defun image-block (path)
+  "A content block showing the image at PATH."
+  (jobj "type" "image"
+        "source" (jobj "type" "base64" "media_type" (image-media-type path)
+                       "data" (base64-encode (read-file-octets path)))))
+
+(defun user-message-line (text &optional images)
+  "The stdin line that sends TEXT as a user message, with IMAGES (paths) attached."
   (json-string (jobj "type" "user"
                      "message" (jobj "role" "user"
-                                     "content" (vector (jobj "type" "text" "text" text))))))
+                                     "content" (coerce (cons (jobj "type" "text" "text" text)
+                                                             (mapcar #'image-block images))
+                                                       'vector)))))
 
 (defun interrupt-line (request-id)
   (json-string (jobj "type" "control_request" "request_id" request-id
@@ -293,15 +327,20 @@ stopped process may run a little longer, finishing up.)"
        (sb-ext:process-alive-p (cp-process cp))
        (open-stream-p (sb-ext:process-input (cp-process cp)))))
 
-(defun claude-write-line (cp line)
+(defun claude-write-line (cp line &optional wanted)
+  "Write LINE to CP's input; with WANTED, only if it still returns true once
+the input is ours (so nothing can come between it and the write). True if written."
   (sb-thread:with-mutex ((cp-lock cp))
-    (let ((stream (sb-ext:process-input (cp-process cp))))
-      (write-line line stream)
-      (force-output stream))))
+    (when (or (null wanted) (funcall wanted))
+      (let ((stream (sb-ext:process-input (cp-process cp))))
+        (write-line line stream)
+        (force-output stream)
+        t))))
 
-(defun claude-send (cp text)
-  "Send TEXT as the next user message."
-  (claude-write-line cp (user-message-line text)))
+(defun claude-send (cp text &optional images wanted)
+  "Send TEXT as the next user message, with IMAGES (paths) attached; with
+WANTED, only if it's still wanted (see CLAUDE-WRITE-LINE)."
+  (claude-write-line cp (user-message-line text images) wanted))
 
 (defun session-rule (suggestion)
   "SUGGESTION, a permission suggestion from the CLI, kept for this session only."
@@ -335,5 +374,7 @@ request's permission_suggestions, are added for the rest of the session."
   "End the conversation's process."
   (when (claude-alive-p cp)
     (setf (cp-stopped cp) t)
-    (ignore-errors (close (sb-ext:process-input (cp-process cp))))
+    ;; Without flushing: a message being written in the background (see
+    ;; CLAUDE-AGENT-SEND) can fill the pipe, and a flush would wait on it.
+    (ignore-errors (close (sb-ext:process-input (cp-process cp)) :abort t))
     (sb-ext:process-kill (cp-process cp) 15)))
