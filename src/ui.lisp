@@ -311,7 +311,10 @@ for Codex, the one marked as the default)."
                          (setf (agent-effort agent) (nth (gtk:drop-down-get-selected d) (agent-pane-efforts pane))
                                (setting (agent-setting-key agent "EFFORT")) (agent-effort agent)))))
     (when (eq (agent-id agent) :claude)
-      (set-model-choices pane *claude-models*))
+      ;; The CLI catalog arrives asynchronously. Its IDs can include choices
+      ;; absent from the built-in aliases (for example "default" or a full
+      ;; versioned name). Keep the restored model until that catalog arrives.
+      (set-model-choices pane (claude-startup-models (agent-model agent))))
     (values models efforts)))
 
 ;;; The pane

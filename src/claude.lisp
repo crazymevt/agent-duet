@@ -16,6 +16,12 @@ then the copy inside the Claude desktop app.")
 
 (defparameter *claude-models* '("sonnet" "opus" "haiku"))
 
+(defun claude-startup-models (selected)
+  "The provisional catalog, including a previously selected model."
+  (if (and selected (not (member selected *claude-models* :test #'equal)))
+      (cons selected *claude-models*)
+      *claude-models*))
+
 (defun claude-model-id (model)
   (if (stringp model) model (jget model "value")))
 
@@ -23,11 +29,12 @@ then the copy inside the Claude desktop app.")
   "The CLI's versioned model name, without pricing or other description text."
   (if (stringp model)
       (string-capitalize model)
-      (let* ((description (jget model "description"))
-             (name (jget model "displayName")))
-        (if (and (stringp description) (not (equal (claude-model-id model) "default")))
-            (string-trim " " (subseq description 0 (position #\· description)))
-            (format nil "~a~@[ (~a)~]" name (jget model "resolvedModel"))))))
+      (let ((name (or (jget model "displayName")
+                      (jget model "resolvedModel")
+                      (claude-model-id model))))
+        (if (equal (claude-model-id model) "default")
+            (format nil "~a~@[ (~a)~]" name (jget model "resolvedModel"))
+            name))))
 
 (defun claude-list-models (program)
   "Read the CLI's initialization catalog without submitting a model turn."

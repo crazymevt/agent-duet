@@ -32,6 +32,22 @@
     (is eq :text-delta (ai::event-kind (first events)))
     (is string= "Hi" (ai::event-text (first events)))))
 
+(define-test claude-model-labels
+    :parent agent-duet
+  (is string= "Sonnet 5.5"
+      (ai::claude-model-label
+       (ai:jobj "value" "sonnet" "displayName" "Sonnet 5.5"
+                "resolvedModel" "claude-sonnet-5-5"
+                "description" "Most efficient for simpler tasks")))
+  (is string= "Default (recommended) (claude-opus-5-5)"
+      (ai::claude-model-label
+       (ai:jobj "value" "default" "displayName" "Default (recommended)"
+                "resolvedModel" "claude-opus-5-5"
+                "description" "Opus 5.5 · Best for everyday, complex tasks")))
+  (is string= "claude-sonnet-5-5"
+      (ai::claude-model-label (ai:jobj "value" "sonnet" "resolvedModel" "claude-sonnet-5-5")))
+  (is string= "Sonnet" (ai::claude-model-label "sonnet")))
+
 (define-test claude-arguments
     :parent agent-duet
   (let ((args (ai::claude-arguments :session-id "s" :permission-mode "acceptEdits" :model "opus")))
@@ -113,6 +129,12 @@
       (is = 1 (length updated))
       (is string= "50% 5h" (ai::codex-usage-summary updated)))))
 
+(define-test restored-claude-model
+    :parent agent-duet
+  (dolist (model '("opus" "default" "claude-sonnet-5-5"))
+    (true (member model (ai::claude-startup-models model) :test #'equal)))
+  (is equal ai::*claude-models* (ai::claude-startup-models nil)))
+
 ;;; Settings
 
 (define-test settings
@@ -122,13 +144,21 @@
     (unwind-protect
         (progn
           (setf (getf ai::*settings* :theme) :dark
-                (getf ai::*settings* :recent-folders) '("/a/" "/b/"))
+                (getf ai::*settings* :recent-folders) '("/a/" "/b/")
+                (getf ai::*settings* :claude-model) "default"
+                (getf ai::*settings* :claude-effort) "high"
+                (getf ai::*settings* :codex-model) "gpt-5.4"
+                (getf ai::*settings* :codex-effort) "xhigh")
           (setf (getf ai::*settings* :directory) (coerce "/c/" 'base-string))
           (ai::save-settings file)
           (false (search "#A" (uiop:read-file-string file)))
           (setf ai::*settings* '())
           (ai::load-settings file)
           (is eq :dark (ai::setting :theme))
+          (is equal "default" (ai::setting :claude-model))
+          (is equal "high" (ai::setting :claude-effort))
+          (is equal "gpt-5.4" (ai::setting :codex-model))
+          (is equal "xhigh" (ai::setting :codex-effort))
           (is equal '("/a/" "/b/") (ai::setting :recent-folders))
           (is equal "/c/" (ai::setting :directory)))
       (ignore-errors (delete-file file)))
