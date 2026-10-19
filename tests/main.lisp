@@ -132,6 +132,16 @@
     (is equal '(:done :open) (mapcar #'first (fourth (third blocks))))
     (is equal '(:center :right) (second (fourth blocks)))
     (is string= "x = 1" (third (fifth blocks))))
+  ;; A quote ends where an unquoted line starts another block...
+  (is equal '(:quote :heading) (mapcar #'first (ai::markdown-blocks (format nil "> quoted~%# Outside"))))
+  (is equal '(:quote :list) (mapcar #'first (ai::markdown-blocks (format nil "> quoted~%- item"))))
+  (is equal '(:quote :code) (mapcar #'first (ai::markdown-blocks (format nil "> quoted~%```~%x~%```"))))
+  ;; ...but a plain line carries on its paragraph.
+  (let ((blocks (ai::markdown-blocks (format nil "> one~%two~%~%after"))))
+    (is equal '(:quote :paragraph) (mapcar #'first blocks))
+    (is string= "one two" (car (second (first (second (first blocks)))))))
+  ;; Not after a heading inside the quote.
+  (is equal '(:quote :paragraph) (mapcar #'first (ai::markdown-blocks (format nil "> # Title~%text"))))
   (is string= "risks-and-open-questions" (ai::heading-anchor "Risks and open questions?"))
   (is string= "  ab  " (ai::pad-cell "ab" 4 :center))
   (is string= " ab" (ai::pad-cell "ab" 1 :right))

@@ -298,6 +298,16 @@ breaks the line there; otherwise lines run together."
               (cond ((and left right) :center) (right :right) (t :left))))
           (split-table-row line)))
 
+(defun starts-block-p (line)
+  "Whether LINE begins a block other than a paragraph."
+  (or (heading-level line) (fence-open line) (thematic-break-p line) (list-marker line)))
+
+(defun lazy-continuation-p (line previous)
+  "Whether LINE, without a >, still belongs to a quote whose last line was
+PREVIOUS: only when it carries on PREVIOUS's paragraph."
+  (and previous (not (blank-line-p previous)) (not (starts-block-p previous))
+       (not (starts-block-p line))))
+
 (defun parse-blocks (lines first-line)
   "The blocks in LINES (a list of strings), the first being line FIRST-LINE of the document."
   (let ((blocks '())
@@ -347,11 +357,14 @@ breaks the line there; otherwise lines run together."
                     (let ((inner '()) (start i))
                       (loop while (and (< i (length lines)) (not (blank-line-p (line i))))
                             do (let* ((l (line i)) (indent (leading-spaces l)))
-                                 (push (if (and (< indent (length l)) (char= (char l indent) #\>))
-                                           (let ((rest (subseq l (1+ indent))))
-                                             (if (and (plusp (length rest)) (char= (char rest 0) #\Space)) (subseq rest 1) rest))
-                                           l)
-                                       inner))
+                                 (cond ((and (< indent 4) (< indent (length l)) (char= (char l indent) #\>))
+                                        (push (let ((rest (subseq l (1+ indent))))
+                                                (if (and (plusp (length rest)) (char= (char rest 0) #\Space)) (subseq rest 1) rest))
+                                              inner))
+                                       ;; A line without > belongs to the quote only as
+                                       ;; more of its paragraph ("lazy" continuation).
+                                       ((lazy-continuation-p l (first inner)) (push l inner))
+                                       (t (return))))
                                (incf i))
                       (add (list :quote (parse-blocks (nreverse inner) (+ first-line start)) n))))
                    ;; - item, 1. item

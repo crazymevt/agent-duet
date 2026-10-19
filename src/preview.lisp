@@ -15,6 +15,7 @@
   (shown '())                           ; those the filter lets through, in the list's order
   file                                  ; the document shown, a pathname
   (modified nil)                        ; its write date when drawn
+  (text nil)                            ; its contents when drawn
   (links '())                           ; (start end url) in the preview
   (block-lines '())                     ; (source line . offset)
   (timer nil)
@@ -194,37 +195,74 @@ paragraphs (in a list item); QUOTE styles them as quoted."
   (handler-case (uiop:read-file-string path :external-format '(:utf-8 :replacement #\?))
     (error (e) (format nil "Couldn't read ~a: ~a" (namestring path) e))))
 
-(defun render-document (docs &key keep-scroll)
-  "Draw DOCS's file into its view, keeping the scroll position with KEEP-SCROLL."
+(defun render-document (docs &key keep-scroll anchor text)
+  "Draw DOCS's file into its view (from TEXT, its contents, if given). Then
+scroll to the heading ANCHOR names, or keep the scroll position with
+KEEP-SCROLL, or go to the top."
   (let* ((view (docs-view docs))
          (gtk-buffer (gtk:text-view-get-buffer view))
          (path (docs-file docs))
+         (text (or text (read-document path)))
          (adjustment (gtk:scrollable-get-vadjustment view))
          (scroll (and keep-scroll (gtk:adjustment-get-value adjustment))))
     (ensure-preview-tags gtk-buffer)
-    (setf (docs-modified docs) (ignore-errors (file-write-date path)))
+    (setf (docs-modified docs) (ignore-errors (file-write-date path))
+          (docs-text docs) text)
     (let ((*preview* (list gtk-buffer '() '() (uiop:pathname-directory-pathname path))))
       (gtk:text-buffer-set-text gtk-buffer "" -1)
-      (handler-case (preview-blocks (markdown-blocks (read-document path)) 0)
+      (handler-case (preview-blocks (markdown-blocks text) 0)
         (error (e) (preview-insert (format nil "Couldn't show the preview: ~a~%" e) nil)))
       (gtk:text-buffer-apply-tag-by-name gtk-buffer "md-p-body" (gtk:text-buffer-get-start-iter gtk-buffer)
                                          (gtk:text-buffer-get-end-iter gtk-buffer))
       (setf (docs-links docs) (second *preview*)
             (docs-block-lines docs) (sort (third *preview*) #'< :key #'car)))
     (gtk:text-buffer-place-cursor gtk-buffer (gtk:text-buffer-get-start-iter gtk-buffer))
+    ;; After GTK has laid out the new text.
     (glib:idle-add glib:+priority-default-idle+
-                   (lambda () (gtk:adjustment-set-value adjustment (or scroll 0d0)) nil))))
+                   (lambda ()
+                     (unless (and anchor (scroll-to-anchor docs anchor))
+                       (gtk:adjustment-set-value adjustment (or scroll 0d0)))
+                     nil))))
+
+(defparameter *largest-watched-document* (* 4 1024 1024)
+  "Documents bigger than this (in bytes) are redrawn only when their write date changes.")
+
+(defun document-changed-p (docs)
+  "Whether DOCS's file differs from what was drawn; its new contents too, when read.
+Write dates count only whole seconds, so the contents are compared as well:
+a save in the same second as the last drawing would be missed otherwise."
+  (let* ((file (docs-file docs))
+         (date (ignore-errors (file-write-date file)))
+         (size (ignore-errors (with-open-file (in file) (file-length in)))))
+    (cond ((null date) nil)                     ; gone, or unreadable for now
+          ((and size (> size *largest-watched-document*))
+           (not (eql date (docs-modified docs))))
+          (t (let ((text (read-document file)))
+               (values (not (equal text (docs-text docs))) text))))))
 
 ;;; Following links
 
-(defun scroll-preview-to-offset (docs offset)
-  (let* ((view (docs-view docs))
-         (iter (iter-at (gtk:text-view-get-buffer view) offset)))
-    (gtk:text-view-scroll-to-iter view iter 0d0 t 0d0 0d0)))
+(defun anchor-offset (docs anchor)
+  "Where the heading ANCHOR (as in #anchor, without the #) starts in the preview, or nil."
+  (let ((heading (find anchor (markdown-headings (or (docs-text docs) ""))
+                       :key (lambda (h) (heading-anchor (second h))) :test #'string-equal)))
+    (and heading (cdr (assoc (third heading) (docs-block-lines docs))))))
+
+(defun scroll-to-anchor (docs anchor)
+  "Scroll to the heading ANCHOR names; true if there is one."
+  (let ((offset (anchor-offset docs anchor)))
+    (when offset
+      (let* ((view (docs-view docs))
+             (gtk-buffer (gtk:text-view-get-buffer view))
+             (mark (gtk:text-buffer-create-mark gtk-buffer nil (iter-at gtk-buffer offset) t)))
+        ;; A mark, not an iter: GTK scrolls to it once the lines are measured.
+        (gtk:text-view-scroll-to-mark view mark 0d0 t 0d0 0d0)
+        (gtk:text-buffer-delete-mark gtk-buffer mark)
+        t))))
 
 (defun follow-link (docs url)
-  "Web links in the browser; #anchors to the heading; Markdown files in the
-preview; other files with their default application."
+  "Web links in the browser; #anchors to the heading; Markdown files (and
+their #anchors) in the preview; other files with their default application."
   (let ((base (uiop:pathname-directory-pathname (docs-file docs))))
     (flet ((launch-uri (uri)
              (gio:async (gtk:uri-launcher-launch (gtk:uri-launcher-new uri) (docs-window docs))
@@ -233,16 +271,14 @@ preview; other files with their default application."
       (cond ((or (search "://" url) (string-equal "mailto:" url :end2 (min 7 (length url))))
              (launch-uri url))
             ((and (plusp (length url)) (char= (char url 0) #\#))
-             (let* ((anchor (subseq url 1))
-                    (heading (find anchor (markdown-headings (read-document (docs-file docs)))
-                                   :key (lambda (h) (heading-anchor (second h))) :test #'string=))
-                    (offset (and heading (cdr (assoc (third heading) (docs-block-lines docs))))))
-               (when offset (scroll-preview-to-offset docs offset))))
+             (scroll-to-anchor docs (subseq url 1)))
             (t
-             (let* ((file (subseq url 0 (or (position #\# url) (length url))))
+             (let* ((hash (position #\# url))
+                    (file (subseq url 0 (or hash (length url))))
+                    (anchor (and hash (< (1+ hash) (length url)) (subseq url (1+ hash))))
                     (path (probe-file (merge-pathnames file base))))
                (cond ((null path))
-                     ((markdown-file-p path) (show-document docs path))
+                     ((markdown-file-p path) (show-document docs path :anchor anchor))
                      (t (launch-uri (format nil "file://~a" (uiop:native-namestring path)))))))))))
 
 (defun setup-link-clicks (docs)
@@ -320,12 +356,13 @@ preview; other files with their default application."
              (gtk:list-box-unselect-all (docs-list docs)))
       (setf (docs-selecting docs) nil))))
 
-(defun show-document (docs path)
+(defun show-document (docs path &key anchor)
+  "Show the document at PATH, at the heading ANCHOR names if given."
   (setf (docs-file docs) (pathname path))
   (select-shown-document docs)
   (gtk:label-set-text (docs-title docs) (enough-namestring path (uiop:ensure-directory-pathname *directory*)))
   (gtk:widget-set-tooltip-text (docs-title docs) (namestring path))
-  (render-document docs))
+  (render-document docs :anchor anchor))
 
 (defun watch-document (docs)
   "Every second, while the window shows: draw the document again if it changed."
@@ -334,9 +371,9 @@ preview; other files with their default application."
                           (lambda ()
                             (let ((file (docs-file docs)))
                               (when (and file (gtk:widget-get-visible (docs-window docs)))
-                                (let ((date (ignore-errors (file-write-date file))))
-                                  (when (and date (not (eql date (docs-modified docs))))
-                                    (render-document docs :keep-scroll t)))))
+                                (multiple-value-bind (changed text) (document-changed-p docs)
+                                  (when changed
+                                    (render-document docs :keep-scroll t :text text)))))
                             t))))
 
 ;;; The window
