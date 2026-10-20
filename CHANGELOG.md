@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Long prompts in the agent panes (reviews quote whole diffs) show their
+  first 2,000 characters, with *Show all*. Resizing the window rewrapped
+  them in full every frame, which made it lag.
 - A turn with no events for 5 minutes (`:stall-minutes` in the settings)
   gets a card: *Keep waiting*, *Interrupt and retry* (the same prompt is
   sent again only once the interrupted turn has ended; if it doesn't end,

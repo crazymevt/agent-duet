@@ -695,12 +695,39 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
                                          :child (markdown-box text "dim-label")
                                          :css-classes '("duet-tool")))))))
 
+(defparameter *prompt-preview-length* 2000
+  "Prompts longer than this many characters (reviews quote whole diffs) show
+their beginning until expanded: GTK rewraps every label on each resize, and a
+few such prompts made resizing take a large part of a second.")
+
+(defun prompt-preview (text)
+  "TEXT's beginning, cut at a line break near *PROMPT-PREVIEW-LENGTH* if there's one."
+  (let* ((limit (min (length text) *prompt-preview-length*))
+         (break (position #\Newline text :end limit :from-end t)))
+    (subseq text 0 (if (and break (> break (floor limit 2))) break limit))))
+
 (defun pane-prompt (pane text)
   ;; A side-pane message can arrive halfway through an assistant block.
   ;; Keep its widget so the remaining deltas and final text update it.
-  (pane-append pane (gtk:build
-                     (gtk:box :halign :end :css-classes '("duet-prompt")
-                              (gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char)))))
+  (let ((label (make-instance 'gtk:label :label text :wrap t :xalign 0.0 :selectable t :wrap-mode :word-char))
+        (box (make-instance 'gtk:box :orientation :vertical :spacing 4 :halign :end
+                                     :css-classes '("duet-prompt"))))
+    (gtk:box-append box label)
+    (when (> (length text) *prompt-preview-length*)
+      (let ((preview (concatenate 'string (prompt-preview text) "…"))
+            (more (format nil "Show all (~:d characters)" (length text)))
+            (button (make-instance 'gtk:button :halign :start :css-classes '("flat")))
+            (all nil))
+        (flet ((show ()
+                 (gtk:label-set-text label (if all text preview))
+                 (gtk:button-set-label button (if all "Show less" more))))
+          (show)
+          (gobject:connect button :clicked
+                           (lambda (b) (declare (ignore b))
+                             (setf all (not all))
+                             (show))))
+        (gtk:box-append box button)))
+    (pane-append pane box)))
 
 (defun agent-pane-event (agent kind &key text title id error busy decision questions)
   (let ((pane (agent-pane-of agent)))
