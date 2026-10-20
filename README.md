@@ -245,6 +245,9 @@ graphical desktop session. No local Lisp installation is needed.
 To check an archive, run `shasum -a 256 -c <archive>.sha256` in the directory
 containing the archive and its checksum file.
 
+The **CI** workflow runs on branch pushes and pull requests; tag pushes
+do not rerun it.
+
 The **Builds** workflow tests and packages all three platforms on pushes
 to `main`, version tags, and manual runs; downloads are available in
 that workflow run's artifacts. After merging a release, create and push a
