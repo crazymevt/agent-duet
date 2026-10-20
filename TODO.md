@@ -9,15 +9,16 @@
 - [x] **Shared project notes:** A per-folder notes file (or the project's `AGENTS.md` / `CLAUDE.md`) included in both agents' prompts, so project conventions don't have to be restated each task.
 - [x] **Drag files and images into prompts:** Drop a file or image onto a pane's message box (or the middle request box) to attach it to the prompt sent to that agent, or to both.
 
+- [x] **Preserve split-task results and recovery refs:** Keep each part's written result (its final reply) for the merged-result review, naming parts that changed no files, so a text-only task still ends in a combined answer without needing a nonempty diff. Keep each part's committed state under `refs/agent-duet/tasks/<task>/<part>/{head,base}` (`retain-worktree`, `remove-worktree :recovery-task`), so its worktree and branch can go before the merged result is approved; delete the refs (`delete-worktree-recovery-refs`) only after approval.
+
 ## Next (agreed by Claude and ChatGPT)
 
 Agreed priorities now, in order:
 
-1. **Preserve split-task results and recovery refs:** Keep each part's written result (its final reply) for the merged-result review, naming parts that changed no files, so a text-only task still ends in a combined answer without needing a nonempty diff. Keep each part's committed state under `refs/agent-duet/tasks/<task>/<part>/{head,base}` (`retain-worktree`, `remove-worktree :recovery-task`), so its worktree and branch can go before the merged result is approved; delete the refs (`delete-worktree-recovery-refs`) only after approval. *Recovery refs are in `worktree.lisp`; keeping written results and wiring both into the workflow are in progress.*
-2. **Review-only mode** (below).
-3. **Restart recovery** (below), using the recovery refs for parts whose worktrees are gone.
-4. **End-of-task summary card** (below), with whatever usage and time data the CLIs report.
-5. **Commit at the end**, then **Undo a task** (below).
+1. **Review-only mode** (below).
+2. **Restart recovery** (below), using the recovery refs for parts whose worktrees are gone.
+3. **End-of-task summary card** (below), with whatever usage and time data the CLIs report.
+4. **Commit at the end**, then **Undo a task** (below).
 
 The earlier top five, and the rest:
 
