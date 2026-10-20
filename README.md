@@ -4,7 +4,7 @@ Claude and ChatGPT working on the same code, side by side, through their
 command-line tools: Claude Code (`claude -p`, stream-json) and Codex
 (`codex app-server`, the CLI bundled with the ChatGPT app or on PATH).
 
-![Agent Duet: Claude writes, ChatGPT reviews, with the review checklist on the right](docs/screenshot.png)
+![Agent Duet: Claude writes, ChatGPT reviews, with the checklist on the right](docs/screenshot.png)
 
 The window has three panes:
 
@@ -93,12 +93,18 @@ dismissed (the author's reasons convinced the reviewer) or still open, so an
 unresolved finding stays in view from one round to the next. A reviewer that
 approves with findings still open is asked once to settle them; if it
 leaves them open again, the part isn't approved, and **Continue** has the
-author pick them up. The checklist
-appears in a separate, resizable panel on the right, showing the latest checklist for each review loop. Use
-**Checklist** in the header to show or hide it; the app remembers your choice.
-Hidden updates leave a notice in the conversation. Saved conversations restore
-the latest checklist for each loop there too. When the task finishes,
-the conversation says how many findings are still open.
+author pick them up.
+
+The checklist is useful from the moment work is handed out: each task
+appears as soon as it's assigned, with the agent doing it and its progress
+through work and review, and the review findings join it as they come in.
+It's in a separate, resizable panel on the right, showing the latest
+checklist for each loop, updated in place. Use **Checklist** in the header
+to show or hide it; the app remembers your choice. Hidden updates leave a
+notice in the conversation. Saved conversations restore the latest
+checklist for each loop there too, including those saved before tasks were
+tracked. When the task finishes, the conversation says how many findings are
+still open.
 
 If the window isn't in front, a desktop notification tells you when both
 agents finish, when one is waiting for your approval or an answer, when one

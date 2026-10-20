@@ -13,8 +13,8 @@
 (defvar *codex* nil)
 (defvar *panes* '() "Agent id → AGENT-PANE.")
 (defvar *middle* nil "The conversation's PANE.")
-(defvar *checklist* nil "The review checklist panel's PANE.")
-(defvar *checklist-boxes* nil "Checklist heading → current Markdown box, one per review loop.")
+(defvar *checklist* nil "The task checklist panel's PANE.")
+(defvar *checklist-boxes* nil "Checklist heading → current Markdown box, one per loop.")
 (defvar *workflow* nil "The running or last workflow.")
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
@@ -855,7 +855,9 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                    (body (string-left-trim '(#\Newline) (subseq text end))))
               (cond
                 ((string= header "Check") (middle-check body))
-                ((string= header "Review checklist") (show-checklist body))
+                ;; Earlier conversations saved checklists as "Review checklist".
+                ((member header '("Task checklist" "Review checklist") :test #'string=)
+                 (show-checklist body))
                 (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
                                         ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
                                         (t :user))
@@ -959,16 +961,16 @@ comes without one (a turn stopped as the folder changes) isn't kept."
   (setf *checklist-boxes* nil)
   (when *checklist*
     (clear-box (pane-messages *checklist*))
-    (pane-note *checklist* "Review findings will appear here after a review." "dim-label")))
+    (pane-note *checklist* "Each task will appear here once it's assigned, with its progress and review findings." "dim-label")))
 
 (defun show-checklist (text)
-  "Update this loop's checklist in place, including when replaying history."
+  "Replace this loop's checklist snapshot in place, including when replaying history."
   (when *checklist*
-    ;; Only the bold heading identifies the loop. Counts after its closing
-    ;; ** change between reviews and must not become part of the key.
-    (let* ((heading-end (search "**" text :start2 2))
+    ;; Only the bold heading identifies the loop. Progress and counts after
+    ;; its closing ** change between snapshots and must not become part of the key.
+    (let* ((heading-end (and (uiop:string-prefix-p "**" text) (search "**" text :start2 2)))
            (heading (subseq text 0 (if heading-end (+ heading-end 2)
-                                      (position #\Newline text))))
+                                      (or (position #\Newline text) (length text)))))
            (box (cdr (assoc heading *checklist-boxes* :test #'string=))))
       (if box
           (progn (clear-box box) (render-markdown box text)
@@ -980,7 +982,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
             (push (cons heading box) *checklist-boxes*)
             (pane-append *checklist* box))))
     (unless (gtk:widget-get-visible (control :checklist-panel))
-      (pane-note *middle* "Review checklist updated. Open Checklist to see the findings."
+      (pane-note *middle* "Checklist updated. Open Checklist to see the tasks' progress and findings."
                  "dim-label" "duet-note"))))
 
 (defun set-checklist-visible (visible)
@@ -1036,7 +1038,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (clear-checklist)
     (let ((panel (gtk:build
                   (gtk:box :orientation :vertical :width-request 260
-                           (gtk:label :label "Review checklists" :xalign 0.0
+                           (gtk:label :label "Checklist" :xalign 0.0
                                       :margin-start 12 :margin-top 8 :margin-bottom 8
                                       :css-classes '("title-4"))
                            (gtk:separator)
@@ -1068,9 +1070,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun middle-message (from to text kind)
   (cond
     ((eq kind :findings)
-     ;; Keep the history format compatible with earlier conversations.
+     ;; A snapshot of the loop's tasks and findings; replay also accepts
+     ;; earlier conversations' "Review checklist".
      (show-checklist text)
-     (record :middle :text (format nil "Review checklist~%~%~a" text))
+     (record :middle :text (format nil "Task checklist~%~%~a" text))
      (save-current-history))
     ((eq kind :check)
      (middle-check text)
@@ -1769,7 +1772,7 @@ to now while it runs (or is still stopping)."
       (gtk:header-bar-pack-start header (make-history-button)))
     (let ((checklist (make-instance 'gtk:toggle-button :label "Checklist"
                                     :active (setting :checklist-visible t)
-                                    :tooltip-text "Show or hide review checklists on the right")))
+                                    :tooltip-text "Show or hide the checklist of tasks and review findings on the right")))
       (gobject:connect checklist :toggled
                        (lambda (b)
                          (let ((visible (gtk:toggle-button-get-active b)))
