@@ -101,7 +101,9 @@
 (define-test check-delivery-and-timeout :parent agent-duet
   (let ((ai::*check-timeout* 0.05) (deliveries nil) (result nil)
         (lock (sb-thread:make-mutex)))
-    (let ((handle (ai::run-check "echo before; sleep 30" (uiop:temporary-directory)
+    ;; A 50 ms timeout may expire before the shell starts on a busy runner.
+    ;; Output capture is covered by CHECK-PASSES; this checks timeout delivery.
+    (let ((handle (ai::run-check "sleep 30" (uiop:temporary-directory)
                                 (lambda (fn) (sb-thread:with-mutex (lock) (push fn deliveries)))
                                 (lambda (code output timeout) (setf result (list code output timeout))))))
       (unwind-protect
@@ -110,7 +112,7 @@
              (false result)
              (funcall (sb-thread:with-mutex (lock) (pop deliveries)))
              (true (third result))
-             (true (search "before" (second result))))
+             (is string= "" (second result)))
         (ai::kill-check handle)))))
 
 (define-test check-worktree-directories :parent agent-duet
