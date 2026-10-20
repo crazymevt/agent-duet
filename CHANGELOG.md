@@ -8,6 +8,7 @@
   their recovery locations.
 - The conversation-only view has each agent's model and thinking-level
   dropdowns under its status, kept in step with the ones in its pane.
+  During a task, each agent's status there shows its usage left again.
 
 ## 1.0.0 - 2026-10-20
 
