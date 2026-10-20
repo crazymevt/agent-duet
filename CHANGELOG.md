@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Split plans can be ordered: the lead says whether the parts go on at the
+  same time or one first (`ORDER:` in its plan), and the plan card has an
+  order menu. A dependent part waits, then starts with its prerequisite's
+  report and, in worktrees, its work merged in (a conflict pauses it for its
+  agent to resolve). A plan where each part waits for the other doesn't
+  start: the lead revises it once, then it's yours to fix on the card.
+- A prerequisite redone after its dependent started (a retry, a hand-off,
+  more rounds) has the dependent stop, told why, and revalidate its work
+  against the change, keeping what it had done; parts done against an
+  earlier version aren't merged. A prerequisite that fails or runs out of
+  usage only holds its dependents up. When no part can go on, the task
+  pauses with *Revise the order* (the lead re-plans from both parts'
+  progress) and *Run independently*.
+- Handing off a failed or stopped step tells the other agent how it stopped,
+  not only running out of usage.
+
 - Split parts with unresolved reviews or failing checks stay in their worktrees
   without merging. Continue offers more review rounds; failed or incomplete
   work cannot be forced into integration.

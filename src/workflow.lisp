@@ -19,6 +19,16 @@
 ;;;; may edit either part, before the work starts: ON-PLAN is told, and
 ;;;; APPROVE-PLAN starts it.
 ;;;;
+;;;; A split plan has an ORDER: :parallel, or :lead-first / :partner-first,
+;;;; when one part builds on the other. The dependent part waits (a STEP
+;;;; paused with reason :dependency) until its prerequisite is done, and then
+;;;; starts with the prerequisite's report and, in worktrees, its work merged
+;;;; in. Each part's work has a REVISION; a prerequisite reworked after its
+;;;; dependent started has the dependent revalidate (:prerequisite-changed).
+;;;; When no unfinished part can go on, the waiting step pauses with reason
+;;;; :deadlock, for the user to have the order revised or the parts run
+;;;; independently (RECOVER-WORKFLOW).
+;;;;
 ;;;; With WORKTREES, a plan split in two has each part done in its own git
 ;;;; worktree (worktree.lisp), each agent in a new conversation there, so
 ;;;; the parts can't get in each other's way. Once both are done, each is
@@ -88,7 +98,12 @@
             :documentation "Told (workflow lead-task partner-task) when a plan waits for approval")
    (approve-plan :initarg :approve-plan :initform nil :reader workflow-approve-plan-p)
    (pending-plan :initform nil :accessor workflow-pending-plan
-                 :documentation "The plan waiting for approval: (:lead task :partner task :takeover out-agent)")
+                 :documentation "The plan waiting for approval: (:lead task :partner task :order order
+:error why-it-can't-start :takeover out-agent)")
+   (plan-revisions :initform 0 :accessor workflow-plan-revisions
+                   :documentation "How often the lead was asked to revise a plan that couldn't start")
+   (prerequisite-merges :initform nil :accessor workflow-prerequisite-merges
+                        :documentation "(dependent-tree prerequisite-tree head)s: prerequisite work merged into worktrees")
    (proposals :initform '() :accessor workflow-proposals :documentation "(agent . text or nil), as they come in")
    (worktrees :initarg :worktrees :initform nil :reader workflow-worktrees-p)
    (home :initform nil :accessor workflow-home :documentation "The folder, while the agents are in worktrees")
@@ -134,8 +149,9 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   (check-report nil)                    ; most recent result for the reviewer
   (check-fixes 0)
   (check-failed nil)                    ; true while the check fails after the fix attempts
-  (dependencies nil)
-  (revision 0)
+  (dependencies nil)                    ; the loops it builds on, which must be done first
+  (revision 0)                          ; bumped each time its work (re)starts
+  (prerequisite-revisions nil)          ; (prerequisite . revision)s its work last started against
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
   (state :assigned))                    ; :assigned :working :checking :reviewing :paused :stopped or final outcome
@@ -146,7 +162,7 @@ again, or to the other agent, after the first ran out of usage."
   (id (make-uuid))
   (generation 0) (state :new) reason progress
   agent prompt original-prompt then target confirming (check-fixes 0) repositories repository-capture
-  role                                  ; :propose, :plan, :work, :review or :resolve
+  role                                  ; :propose, :plan, :replan, :work, :review, :resolve or :check
   loop)                                 ; the review loop it belongs to (not for :plan)
 
 (defun post (workflow from to text kind)
@@ -180,6 +196,8 @@ preserve the step for explicit recovery (PAUSE-STEP)."
       (pause-step workflow step)
       (return-from submit-step nil))
     (setf (step-state step) :running)
+    (when (and (step-loop step) (eq (step-role step) :work))
+      (work-started workflow (step-loop step)))
     (checkpoint-changed workflow)
     (unless (and (workflow-live-p workflow) (eq (step-state step) :running)
                  (= generation (step-generation step)))
@@ -197,9 +215,9 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                                   (step-progress step)
                                   (if (plusp (length (agent-partial-text (step-agent step))))
                                       (format nil "~a~%~%Partial reply:~%~a" text (agent-partial-text (step-agent step))) text))
-                            (pause-step workflow step)
-                            (when (and (eq error :disconnected) (step-loop step))
-                              (invalidate-dependent-loops workflow (step-loop step))))
+                            ;; Its dependents wait (PAUSE-STEP says so); they are
+                            ;; invalidated only once its work is redone (WORK-STARTED).
+                            (pause-step workflow step))
                           (progn
                             (setf (step-state step) :completed (step-progress step) text)
                             ;; Refresh restart state before the continuation can
@@ -268,6 +286,7 @@ unapproved has its author address the last review. True if it carried on."
       (:propose (format nil "~a's proposal" name))
       (:resolve (format nil "~a's resolving of the merge conflicts" name))
       (:plan (format nil "~a's plan for splitting the work" name))
+      (:replan (format nil "~a's revised plan" name))
       (:work (format nil "~a's work~@[ on ~a~]" name (and loop (loop-label loop))))
       (:review (format nil "~a's review of ~a" name
                        (or (and loop (loop-label loop))
@@ -348,20 +367,36 @@ from a checkpoint saved before its snapshot was ready."
   (refresh-recovery-baseline workflow (list step))
   (when (step-loop step)
     (update-loop-state workflow (step-loop step) :paused))
-  (note workflow "~a paused (~a). Available progress: ~a"
-        (step-description step) (step-reason step) (or (step-progress step) "No final reply yet."))
-  (let ((other (other-agent workflow (step-agent step)))
-        (message (format nil "~a paused (~a). Its incomplete result is unavailable; continue only independent work."
-                         (step-description step) (step-reason step))))
-    (post workflow :system other message :note))
-  (dolist (dependent (workflow-loops workflow))
-    (when (member (step-loop step) (loop-dependencies dependent))
-      (note workflow "~a is blocked until ~a is complete."
-            (or (loop-label dependent) "Dependent work") (or (loop-label (step-loop step)) "its prerequisite"))))
-  (note-retained-worktrees workflow)
-  (checkpoint-changed workflow)
-  (when (workflow-on-pause workflow)
-    (funcall (workflow-on-pause workflow) workflow step)))
+  ;; Waiting for a prerequisite is part of the plan: it starts again by
+  ;; itself (CHECK-FINISHED), so the user isn't asked, unless it deadlocks.
+  (let ((waiting (and (step-loop step) (waiting-step-p step))))
+    (if waiting
+        (note workflow "~a waits for ~{~a~^ and ~}." (step-description step)
+              (mapcar #'part-name (loop-dependencies (step-loop step))))
+        (progn
+          (note workflow "~a paused (~a). Available progress: ~a"
+                (step-description step) (step-reason step) (or (step-progress step) "No final reply yet."))
+          (let ((other (other-agent workflow (step-agent step)))
+                (message (format nil "~a paused (~a). Its incomplete result is unavailable; continue only independent work."
+                                 (step-description step) (step-reason step))))
+            (post workflow :system other message :note))
+          ;; Blocked, not invalidated: they go on once it's complete.
+          (dolist (dependent (workflow-loops workflow))
+            (when (and (step-loop step) (member (step-loop step) (loop-dependencies dependent)))
+              (note workflow "~a is blocked until ~a is complete."
+                    (string-capitalize (part-name dependent) :end 1) (part-name (step-loop step)))))))
+    (note-retained-worktrees workflow)
+    (checkpoint-changed workflow)
+    (when (and (workflow-on-pause workflow) (not waiting))
+      (funcall (workflow-on-pause workflow) workflow step))))
+
+(defun waiting-step-p (step)
+  "Whether STEP is paused only to wait for its loop's prerequisites."
+  (member (step-reason step) '(:dependency :prerequisite-changed)))
+
+(defun part-name (loop)
+  "LOOP for a note: \"Claude's part\", or \"Claude's work\"."
+  (or (loop-label loop) (format nil "~a's work" (agent-name (loop-author loop)))))
 
 (defun unpause (workflow step)
   "Take STEP off the paused list; true if it was on it (so each choice counts once)."
@@ -398,10 +433,11 @@ does then goes unreviewed, since the one that would review it is out."
       (ecase (step-role step)
         (:propose
          (proposal-in workflow out nil (format nil "~a is unavailable" (agent-name out))))
-        (:resolve
-         (note workflow "~a resolves the conflicts instead." (agent-name other))
+        ((:resolve :replan)
+         (note workflow "~a ~a instead." (agent-name other)
+               (if (eq (step-role step) :resolve) "resolves the conflicts" "revises the plan"))
          (submit-step workflow (make-step :agent other :prompt (step-prompt step) :then (step-then step)
-                                          :role :resolve :target (step-target step))))
+                                          :role (step-role step) :target (step-target step))))
         (:review
          (update-loop-state workflow loop :unreviewed)
          (note workflow "~@[~a ~]finished without a review: ~a is unavailable."
@@ -412,7 +448,7 @@ does then goes unreviewed, since the one that would review it is out."
                (agent-name other) (step-description step) (agent-name out))
          (setf (loop-author loop) other
                (loop-skip-review loop) t)
-         (loop-work workflow loop (takeover-prompt out (step-prompt step) (loop-tree loop))))
+         (loop-work workflow loop (takeover-prompt out (step-prompt step) (loop-tree loop) (step-reason step))))
         (:plan
          (note workflow "~a does the whole task. It won't be reviewed: ~a is unavailable."
                (agent-name other) (agent-name out))
@@ -491,12 +527,21 @@ Address the points you agree with, and say briefly why for any you don't. ~a"
 (defun plan-form (partner)
   "How the lead is to set out a plan split with PARTNER."
   (let ((p (agent-name partner)))
-    (format nil "Split the work into two parts that can be done in parallel without editing the same files: ~
+    (format nil "Split the work into two parts that don't edit the same files: ~
 one for you and one for ~a. Reply in exactly this form:~%~%~
 LEAD TASK:~%<your part>~%~%~
 PARTNER TASK:~%<~a's part, complete in itself: ~a won't see this conversation>~%~%~
+ORDER: PARALLEL~%~%~
+Split it so both parts can be done at the same time if you can. If one part can't start without the ~
+other's result, write ORDER: LEAD FIRST (yours is done first) or ORDER: PARTNER FIRST (~a's is) ~
+instead; neither part can wait for the other both ways. ~
 If the task is too small to split, write NONE under PARTNER TASK."
-            p p p)))
+            p p p p)))
+
+(defun revise-plan-prompt (partner problem)
+  "The lead's prompt to revise a plan that couldn't start, for PROBLEM."
+  (format nil "Your plan can't be started: ~a~%~%Revise it, without changing anything yet. ~a"
+          problem (plan-form partner)))
 
 (defun plan-prompt (partner request)
   (format nil "~a~%~%You are leading this task with ~a, another coding agent working in the same ~
@@ -543,13 +588,24 @@ its files alone:~%~%~a~%~%When you finish, ~a will review your part."
 When you finish, ~a will review your part."
             l request partner-task (and lead-task t) l lead-task l)))
 
-(defun takeover-prompt (out prompt &optional tree)
-  (format nil "~a ran out of usage partway through a task, so you're taking it over. Some of its work ~
+(defun stopped-text (reason)
+  "How an agent's turn ended, for REASON (STEP-REASON), as a verb phrase."
+  (case reason
+    (:out-of-usage "ran out of usage")
+    (:failed "failed")
+    (:disconnected "lost its connection")
+    (:interrupted "was stopped")
+    (:restart "was interrupted when the app closed")
+    (t "stopped")))
+
+(defun takeover-prompt (out prompt &optional tree (reason :out-of-usage))
+  (format nil "~a ~a partway through a task, so you're taking it over. Some of its work ~
 may already be in the files: look before you continue, and don't redo what's done.~@[ Its work is in ~
 its own git worktree, ~a: make your changes there, not in your own folder.~] Here is what ~a was ~
 asked (\"you\" there meant ~a):~%~%~a~%~%~
-No one will review your work this time, since ~a is out of usage. Finish with a summary of what you changed."
-          (agent-name out) (and tree (namestring tree)) (agent-name out) (agent-name out) prompt (agent-name out)))
+No one will review your work this time, since ~a is ~:[unavailable~;out of usage~]. Finish with a summary of what you changed."
+          (agent-name out) (stopped-text reason) (and tree (namestring tree)) (agent-name out) (agent-name out) prompt
+          (agent-name out) (eq reason :out-of-usage)))
 
 (defun proposal-takeover-prompt (out request)
   (format nil "~a ran out of usage before your proposals could be reconciled, so carry out yours yourself, ~
@@ -599,9 +655,46 @@ APPROVED (give or take Markdown emphasis and punctuation), otherwise
   (string-trim '(#\Space #\Tab #\Newline #\Return #\* #\# #\_)
                text))
 
+(defun plan-order (text)
+  "An ORDER line's TEXT as an order: :parallel (also for anything unknown),
+:lead-first, :partner-first, or :circular for each part first."
+  (let* ((words (substitute #\Space #\- (substitute #\Space #\_ (string-upcase text))))
+         (lead (search "LEAD" words))
+         (partner (search "PARTNER" words)))
+    (cond ((or (search "CIRCULAR" words) (search "MUTUAL" words) (search "EACH OTHER" words)
+               (and lead partner (search "FIRST" words) (not (search "PARALLEL" words))
+                    (search "FIRST" words :start2 (1+ (search "FIRST" words)))))
+           :circular)
+          ((search "PARALLEL" words) :parallel)
+          ((and lead (or (null partner) (< lead partner))) :lead-first)
+          (partner :partner-first)
+          (t :parallel))))
+
+(defun split-order-line (text)
+  "TEXT without its last ORDER: line, and that line's order (nil without one)."
+  (let ((found nil))
+    (loop with start = 0
+          for end = (or (position #\Newline text :start start) (length text))
+          for line = (string-left-trim '(#\Space #\Tab #\* #\_ #\#) (subseq text start end))
+          when (and (>= (length line) 6) (string-equal "ORDER:" line :end2 6))
+            do (setf found (list start end (subseq line 6)))
+          while (< end (length text))
+          do (setf start (1+ end)))
+    (if found
+        (destructuring-bind (start end value) found
+          (values (concatenate 'string (subseq text 0 start) (subseq text end))
+                  (plan-order (string-trim '(#\Space #\Tab #\Return #\* #\_ #\` #\.) value))))
+        (values text nil))))
+
 (defun parse-plan (text)
-  "The lead's and partner's tasks from a plan's TEXT, as two values. The
-partner's is nil when there is none (NONE, or no PARTNER TASK section)."
+  "The lead's and partner's tasks from a plan's TEXT, and its order, as three
+values. The partner's is nil when there is none (NONE, or no PARTNER TASK
+section). The order (PLAN-ORDER) is :parallel without an ORDER line."
+  (multiple-value-bind (text order) (split-order-line text)
+    (multiple-value-bind (lead partner) (parse-plan-parts text)
+      (values lead partner (or order :parallel)))))
+
+(defun parse-plan-parts (text)
   (let ((lead-at (search "LEAD TASK:" text :test #'char-equal))
         (partner-at (search "PARTNER TASK:" text :test #'char-equal)))
     (if (null partner-at)
@@ -825,16 +918,55 @@ the lead reconciles them into a plan."
 (defun plan-ready (workflow plan)
   "The lead's PLAN is in: wait for the user to approve it, if asked to, or start on it."
   (post workflow (workflow-lead workflow) (workflow-partner workflow) plan :plan)
-  (multiple-value-bind (lead-task partner-task) (parse-plan plan)
-    (if (workflow-approve-plan-p workflow)
-        (await-plan workflow lead-task partner-task)
-        (start-parts workflow lead-task partner-task))))
+  (multiple-value-bind (lead-task partner-task order) (parse-plan plan)
+    (let ((problem (and lead-task partner-task (plan-order-problem order))))
+      (cond ((workflow-approve-plan-p workflow)
+             (await-plan workflow lead-task partner-task :order order :error problem))
+            (problem (plan-not-started workflow lead-task partner-task order problem))
+            (t (let ((problem (start-parts workflow lead-task partner-task :order order)))
+                 (when problem (plan-not-started workflow lead-task partner-task order problem))))))))
 
-(defun await-plan (workflow lead-task partner-task &key takeover)
+(defparameter *circular-order-text*
+  "each part would wait for the other, so neither could start. Choose which part goes first, or have them done independently.")
+
+(defun plan-order-problem (order)
+  "Why a plan in ORDER can't start, or nil."
+  (case order
+    ((nil :parallel :lead-first :partner-first) nil)
+    (:circular *circular-order-text*)
+    (t (format nil "~a isn't an order." order))))
+
+(defun plan-not-started (workflow lead-task partner-task order problem)
+  "A plan, not to wait for approval, couldn't start for PROBLEM: the lead is
+asked once to revise it; after that, it waits for the user after all."
+  (cond ((< (workflow-plan-revisions workflow) 1)
+         (incf (workflow-plan-revisions workflow))
+         (note workflow "The plan can't start: ~a ~a revises it." problem (agent-name (workflow-lead workflow)))
+         (submit-plan workflow (revise-plan-prompt (workflow-partner workflow) problem)))
+        (t (note workflow "The revised plan can't start either: ~a" problem)
+           (await-plan workflow lead-task partner-task :order order :error problem))))
+
+(defun pending-plan-order (workflow)
+  "The order of WORKFLOW's pending plan: :parallel, :lead-first or :partner-first."
+  (let ((order (getf (workflow-pending-plan workflow) :order)))
+    (if (member order '(:lead-first :partner-first)) order :parallel)))
+
+(defun pending-plan-error (workflow)
+  "Why WORKFLOW's pending plan can't start as it is, or nil."
+  (getf (workflow-pending-plan workflow) :error))
+
+(export '(pending-plan-order pending-plan-error))
+
+(defun await-plan (workflow lead-task partner-task &key takeover order error)
   "Hold the plan for the user's approval (APPROVE-PLAN). TAKEOVER: the
-partner is to do it all, as that agent, the lead, is out of usage."
-  (setf (workflow-pending-plan workflow) (list :lead lead-task :partner partner-task :takeover takeover))
-  (note workflow "Waiting for you to approve the plan.")
+partner is to do it all, as that agent, the lead, is out of usage. ORDER:
+its order; ERROR, why it can't start as it is (a circular order shows as
+:parallel, with the ERROR)."
+  (setf (workflow-pending-plan workflow)
+        (list :lead lead-task :partner partner-task :takeover takeover
+              :order (if (member order '(:lead-first :partner-first)) order :parallel) :error error))
+  (checkpoint-changed workflow)
+  (note workflow "Waiting for you to approve the plan.~@[ It can't start as it is: ~a~]" error)
   (when (workflow-on-plan workflow)
     (funcall (workflow-on-plan workflow) workflow lead-task partner-task)))
 
@@ -847,35 +979,79 @@ partner is to do it all, as that agent, the lead, is out of usage."
   (let ((text (and text (string-trim '(#\Space #\Tab #\Newline #\Return) text))))
     (and text (plusp (length text)) text)))
 
-(defun approve-plan (workflow lead-task partner-task)
+(defun approve-plan (workflow lead-task partner-task &key order)
   "Start on WORKFLOW's pending plan with the tasks as the user left them; a
-blank one is no part for that agent. True if it started: false when nothing
-is pending, or both are blank."
+blank one is no part for that agent. ORDER: :parallel, :lead-first or
+:partner-first, by default the plan's. True if it started: false when nothing
+is pending, or both are blank, or it can't start in that order (then the
+plan stays pending, saying why: PENDING-PLAN-ERROR)."
   (let ((lead-task (blank-to-nil lead-task))
         (partner-task (blank-to-nil partner-task)))
     (when (and (workflow-live-p workflow) (workflow-pending-plan workflow) (or lead-task partner-task))
-      (destructuring-bind (&key lead partner takeover) (workflow-pending-plan workflow)
-        (let ((edited (not (and (equal lead-task lead) (equal partner-task partner)))))
-          (setf (workflow-pending-plan workflow) nil)
-          (note workflow (if edited "You edited the plan." "You approved the plan."))
-          ;; Given a part after all, the lead takes its chances with its usage.
-          (if (and takeover (null lead-task))
-              (start-takeover workflow takeover partner-task)
-              (start-parts workflow lead-task partner-task :edited edited))
-          t)))))
+      (let ((pending (workflow-pending-plan workflow)))
+        (destructuring-bind (&key lead partner takeover &allow-other-keys) pending
+          (let ((edited (not (and (equal lead-task lead) (equal partner-task partner))))
+                (order (or order (getf pending :order) :parallel)))
+            (flet ((refuse (problem)
+                     (setf (workflow-pending-plan workflow)
+                           (list* :error problem
+                                  :order (if (member order '(:lead-first :partner-first)) order :parallel)
+                                  (loop for (key value) on pending by #'cddr
+                                        unless (member key '(:error :order)) append (list key value))))
+                     (note workflow "The plan can't start: ~a" problem)
+                     (checkpoint-changed workflow)
+                     (return-from approve-plan nil)))
+              (let ((problem (and lead-task partner-task (plan-order-problem order))))
+                (when problem (refuse problem)))
+              (setf (workflow-pending-plan workflow) nil)
+              ;; Given a part after all, the lead takes its chances with its usage.
+              (if (and takeover (null lead-task))
+                  (progn (note workflow (if edited "You edited the plan." "You approved the plan."))
+                         (start-takeover workflow takeover partner-task))
+                  (let ((problem (start-parts workflow lead-task partner-task :edited edited :order order
+                                                                               :approved t)))
+                    (when problem (refuse problem))))
+              t)))))))
 
-(defun start-parts (workflow lead-task partner-task &key edited)
+(defun order-assignments (order mine theirs)
+  "The (loop . prerequisites) edges for ORDER between the lead's part MINE and the partner's THEIRS."
+  (ecase order
+    ((nil :parallel) (list (list mine) (list theirs)))
+    (:lead-first (list (list mine) (list theirs mine)))
+    (:partner-first (list (list mine theirs) (list theirs)))
+    (:circular (list (list mine theirs) (list theirs mine)))))
+
+(defun order-note (workflow loop)
+  "What LOOP's author is to know of the order: what it builds on, or what builds on it."
+  (let ((before (loop-dependencies loop))
+        (after (remove-if-not (lambda (l) (member loop (loop-dependencies l))) (workflow-loops workflow))))
+    (cond (before
+           (format nil "Your part builds on ~{~a~^ and ~}: it starts once that is done, and you're given its result~
+~:[~;, merged into your worktree~]."
+                   (mapcar #'part-name before) (loop-tree loop)))
+          (after
+           (format nil "~{~a~^ and ~} build~:[s~;~] on yours: ~:*~:[it starts~;they start~] once yours is done."
+                   (mapcar #'part-name after) (rest after))))))
+
+(defun with-order-note (workflow loop prompt)
+  (format nil "~a~@[~%~%~a~]" prompt (order-note workflow loop)))
+
+(defun start-parts (workflow lead-task partner-task &key edited order approved)
   "Start the work on a plan: a loop for each agent with a part (LEAD-TASK,
-PARTNER-TASK, nil for none). EDITED: the user changed the plan, so the
-lead, who made it, is told its part again."
+PARTNER-TASK, nil for none), in ORDER (:parallel, :lead-first or
+:partner-first). EDITED: the user changed the plan, so the lead, who made
+it, is told its part again. APPROVED: the user approved it. Returns nil, or
+why it couldn't start in that order: then nothing has started."
   (let ((lead (workflow-lead workflow))
         (partner (workflow-partner workflow))
         (request (workflow-request workflow)))
     (cond ((null partner-task)
+           (when approved (note workflow (if edited "You edited the plan." "You approved the plan.")))
            (note workflow "~a is doing it alone; ~a will review." (agent-name lead) (agent-name partner))
            (run-loop workflow (make-review-loop :author lead :reviewer partner :task (if edited lead-task request))
                      (lead-alone-prompt partner lead-task edited)))
           ((null lead-task)
+           (when approved (note workflow (if edited "You edited the plan." "You approved the plan.")))
            (note workflow "~a is doing it alone; ~a will review." (agent-name partner) (agent-name lead))
            (run-loop workflow (make-review-loop :author partner :reviewer lead :task partner-task)
                      (partner-task-prompt lead request nil partner-task)))
@@ -883,22 +1059,37 @@ lead, who made it, is told its part again."
            (let ((mine (make-review-loop :author lead :reviewer partner :task lead-task
                                          :label (format nil "~a's part" (agent-name lead))))
                  (theirs (make-review-loop :author partner :reviewer lead :task partner-task
-                                           :label (format nil "~a's part" (agent-name partner)))))
+                                           :label (format nil "~a's part" (agent-name partner))))
+                 (old (workflow-loops workflow)))
              ;; Both are registered before either starts, so the first to
-             ;; finish doesn't find every loop done.
+             ;; finish doesn't find every loop done; and their order is set
+             ;; before either starts, or nothing starts.
              (setf (workflow-loops workflow) (list mine theirs))
+             (handler-case (set-workflow-dependencies workflow (order-assignments order mine theirs))
+               (error (e)
+                 (setf (workflow-loops workflow) old)
+                 (return-from start-parts (princ-to-string e))))
+             (when approved (note workflow (if edited "You edited the plan." "You approved the plan.")))
+             (when (loop-dependencies theirs) (note workflow "~a's part goes first." (agent-name lead)))
+             (when (loop-dependencies mine) (note workflow "~a's part goes first." (agent-name partner)))
              (publish-checklist workflow mine)
              (publish-checklist workflow theirs)
-             (cond ((not (workflow-worktrees-p workflow))
-                    (loop-work workflow mine (lead-go-prompt partner lead-task partner-task edited))
-                    (loop-work workflow theirs (partner-task-prompt lead request lead-task partner-task)))
-                   ((open-worktrees workflow)
-                    (setf (loop-tree mine) (cdr (assoc lead (workflow-trees workflow)))
-                          (loop-tree theirs) (cdr (assoc partner (workflow-trees workflow))))
-                    (loop-work workflow mine (worktree-part-prompt partner request lead-task partner-task
-                                                                   (loop-tree mine)))
-                    (loop-work workflow theirs (worktree-part-prompt lead request partner-task lead-task
-                                                                     (loop-tree theirs))))))))))
+             (when (and (workflow-worktrees-p workflow) (not (open-worktrees workflow)))
+               (return-from start-parts nil))
+             (when (workflow-worktrees-p workflow)
+               (setf (loop-tree mine) (cdr (assoc lead (workflow-trees workflow)))
+                     (loop-tree theirs) (cdr (assoc partner (workflow-trees workflow)))))
+             (let ((starts
+                     (if (workflow-worktrees-p workflow)
+                         (list (cons mine (worktree-part-prompt partner request lead-task partner-task (loop-tree mine)))
+                               (cons theirs (worktree-part-prompt lead request partner-task lead-task (loop-tree theirs))))
+                         (list (cons mine (lead-go-prompt partner lead-task partner-task edited))
+                               (cons theirs (partner-task-prompt lead request lead-task partner-task))))))
+               ;; A dependent part first: it waits, while its prerequisite
+               ;; (which may finish at once) goes ahead.
+               (dolist (entry (stable-sort starts #'> :key (lambda (e) (length (loop-dependencies (car e))))))
+                 (loop-work workflow (car entry) (with-order-note workflow (car entry) (cdr entry))))))))
+    nil))
 
 (defun run-loop (workflow loop prompt)
   "Start LOOP: its author works on PROMPT, and then the reviewing begins."
@@ -906,21 +1097,27 @@ lead, who made it, is told its part again."
   (publish-checklist workflow loop)
   (loop-work workflow loop prompt))
 
-(defun loop-work (workflow loop prompt)
-  (when (plusp (loop-revision loop)) (invalidate-dependent-loops workflow loop))
+(defun loop-work (workflow loop prompt &key prepare)
+  "LOOP's author works on PROMPT. PREPARE: it starts as a dependent part
+does (START-DEPENDENT-STEP), given its ready prerequisites' work; one not
+ready waits for it in any case."
   (setf (loop-check-report loop) nil
         (loop-check-failed loop) nil)
   (update-loop-state workflow loop :working)
-  (submit workflow (loop-author loop) prompt
-          (lambda (text error)
-            (cond (error
-                   (loop-failed workflow loop (format nil "~a's turn failed: ~a" (agent-name (loop-author loop)) text)))
-                  (t
-                   (incf (loop-revision loop))
-                   (setf (loop-summary loop) text)
-                   (post workflow (loop-author loop) (loop-reviewer loop) text :work)
-                   (loop-check workflow loop))))
-          :role :work :loop loop))
+  (let ((step (make-step :agent (loop-author loop) :prompt prompt :role :work :loop loop
+                         :then (lambda (text error)
+                                 (cond (error
+                                        (loop-failed workflow loop (format nil "~a's turn failed: ~a"
+                                                                           (agent-name (loop-author loop)) text)))
+                                       (t
+                                        (setf (loop-summary loop) text)
+                                        (post workflow (loop-author loop) (loop-reviewer loop) text :work)
+                                        (loop-check workflow loop)))))))
+    (if (and prepare (loop-dependencies loop) (loop-prerequisites-ready-p loop))
+        (progn (setf (step-reason step) :dependency)
+               (push step (workflow-steps workflow))
+               (start-dependent-step workflow step))
+        (submit-step workflow step))))
 
 (defun loop-checked (workflow loop)
   "The checks are done with: review the work, or, taken over, finish it unreviewed."
@@ -1067,10 +1264,13 @@ still open, and is asked once to settle them (that's no new round)."
   (member (loop-state loop) '(:approved :unresolved :unreviewed :failed)))
 
 (defun check-finished (workflow)
+  ;; Steps waiting for prerequisites now done start by themselves.
   (dolist (step (copy-list (workflow-paused workflow)))
-    (when (and (eq (step-reason step) :dependency) (step-loop step)
+    (when (and (workflow-live-p workflow) (member step (workflow-paused workflow))
+               (waiting-step-p step) (step-loop step)
                (loop-prerequisites-ready-p (step-loop step)))
-      (%resume-step workflow step)))
+      (start-dependent-step workflow step)))
+  (detect-deadlock workflow)
   (when (and (workflow-live-p workflow) (null (workflow-paused workflow))
              (every #'loop-done-p (workflow-loops workflow)))
     (let ((failed (find :failed (workflow-loops workflow) :key #'loop-state)))
@@ -1329,6 +1529,17 @@ to the folder, and merge the branches into it."
                       (workflow-loops workflow))
                (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow))))
     (return-from integrate nil))
+  ;; A part done against an earlier version of its prerequisite is
+  ;; revalidated first, never merged as it is.
+  (let ((stale (remove-if-not #'loop-stale-p (workflow-loops workflow))))
+    (when stale
+      (dolist (l stale)
+        (note workflow "~a was done against an earlier version of what it builds on, so it isn't merged yet."
+              (string-capitalize (part-name l) :end 1))
+        (revalidate-loop workflow l (car (find-if (lambda (entry) (/= (cdr entry) (loop-revision (car entry))))
+                                                   (loop-prerequisite-revisions l)))))
+      (check-finished workflow)
+      (return-from integrate nil)))
   (setf (workflow-integrated workflow) t
         (workflow-integration-state workflow) :committing)
   (checkpoint-changed workflow)
@@ -1761,8 +1972,13 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           "approve-plan" (workflow-approve-plan-p workflow)
           "pending-plan" (let ((plan (workflow-pending-plan workflow)))
                            (when plan (jobj "lead" (getf plan :lead) "partner" (getf plan :partner)
+                                            "order" (pending-plan-order workflow) "error" (getf plan :error)
                                             "takeover" (and (getf plan :takeover)
                                                             (agent-id (getf plan :takeover))))))
+          "plan-revisions" (workflow-plan-revisions workflow)
+          "prerequisite-merges" (coerce (mapcar (lambda (entry) (jobj "path" (first entry) "from" (second entry)
+                                                                      "head" (third entry)))
+                                                (workflow-prerequisite-merges workflow)) 'vector)
           "proposals" (coerce (mapcar (lambda (entry) (jobj "agent" (agent-id (car entry)) "text" (cdr entry)))
                                        (workflow-proposals workflow)) 'vector)
           "agents" (vector (agent-data (workflow-lead workflow)) (agent-data (workflow-partner workflow)))
@@ -1792,6 +2008,10 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                    "dependencies" (coerce (mapcar (lambda (dep) (position dep (workflow-loops workflow)))
                                                                             (loop-dependencies l)) 'vector)
                                    "revision" (loop-revision l)
+                                   "prerequisite-revisions"
+                                   (coerce (mapcar (lambda (entry) (jobj "loop" (position (car entry) (workflow-loops workflow))
+                                                                         "revision" (cdr entry)))
+                                                   (loop-prerequisite-revisions l)) 'vector)
                                    "task" (loop-task l) "label" (loop-label l) "summary" (loop-summary l)
                                    "last-review" (loop-last-review l) "state" (loop-state l) "round" (loop-round l)
                                    "tree" (and (loop-tree l) (namestring (loop-tree l)))
@@ -1814,7 +2034,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
     (declare (ignore error))
     (let ((l (step-loop step)))
       (case (step-role step)
-        (:work (incf (loop-revision l)) (setf (loop-summary l) text)
+        (:work (setf (loop-summary l) text)
                (post workflow (step-agent step) (loop-reviewer l) text :work)
                (loop-check workflow l (step-check-fixes step)))
         (:review (if (eq (workflow-mode workflow) :review-only)
@@ -1828,6 +2048,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                             (check-finished workflow))
                      (review-in workflow l text (step-confirming step))))
         (:plan (plan-ready workflow text))
+        (:replan (order-revised workflow text))
         (:propose (proposal-in workflow (step-agent step) text))
         (:resolve
          ;; Recovery never repeats a merge from an arbitrary old prompt.
@@ -1891,7 +2112,13 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
         (when (jobject-p plan)
           (setf (workflow-pending-plan workflow)
                 (list :lead (recovery-null (jget plan "lead")) :partner (recovery-null (jget plan "partner"))
+                      :order (recovery-keyword (jget plan "order") :parallel)
+                      :error (recovery-null (jget plan "error"))
                       :takeover (and (recovery-null (jget plan "takeover")) (agent-for (jget plan "takeover")))))))
+      (setf (workflow-plan-revisions workflow) (or (jget checkpoint "plan-revisions") 0)
+            (workflow-prerequisite-merges workflow)
+            (mapcar (lambda (entry) (list (jget entry "path") (jget entry "from") (jget entry "head")))
+                    (jlist (jget checkpoint "prerequisite-merges"))))
       (setf (workflow-loops workflow)
             (mapcar (lambda (data)
                       (make-review-loop
@@ -1915,7 +2142,16 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
       (loop for l in (workflow-loops workflow)
             for data in (jlist (jget checkpoint "loops"))
             do (setf (loop-dependencies l) (mapcar #'loop-for (jlist (jget data "dependencies")))
-                     (loop-revision l) (or (jget data "revision") 0)))
+                     (loop-revision l) (or (jget data "revision") 0)
+                     (loop-prerequisite-revisions l)
+                     (mapcar (lambda (entry)
+                               (let ((dep (loop-for (jget entry "loop"))))
+                                 (unless (and dep (member dep (loop-dependencies l)) (integerp (jget entry "revision")))
+                                   (error "The checkpoint's prerequisite revisions don't match its dependencies."))
+                                 (cons dep (jget entry "revision"))))
+                             (jlist (jget data "prerequisite-revisions")))))
+      ;; Unknown or circular dependencies would leave parts waiting for ever.
+      (check-dependency-graph (workflow-loops workflow))
       (setf (workflow-merged-loop workflow) (loop-for (jget checkpoint "merged-loop")))
       (dolist (data (jlist (jget checkpoint "steps")))
         (let* ((state (recovery-keyword (jget data "state")))
@@ -1977,7 +2213,9 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                                    (workflow-recovery-baseline workflow))))
     (jobj "pending-plan" (and (workflow-pending-plan workflow)
                                    (jobj "lead" (getf (workflow-pending-plan workflow) :lead)
-                                         "partner" (getf (workflow-pending-plan workflow) :partner)))
+                                         "partner" (getf (workflow-pending-plan workflow) :partner)
+                                         "order" (pending-plan-order workflow)
+                                         "error" (pending-plan-error workflow)))
           "state" (workflow-state workflow) "integration" (workflow-integration-state workflow)
           "merged-refs" (coerce (workflow-merged-refs workflow) 'vector)
           "repositories" now
@@ -2009,6 +2247,9 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                         (not (loop-check-failed l)))))
                    (workflow-loops workflow))
       (return-from recover-integration :blocked))
+    ;; A part done against an earlier version of its prerequisite isn't merged.
+    (when (some #'loop-stale-p (workflow-loops workflow))
+      (return-from recover-integration :blocked))
     (setf (workflow-state workflow) :running)
     (if (eq (workflow-integration-state workflow) :committing)
         (integrate workflow)
@@ -2038,9 +2279,13 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
   (when (eq (workflow-state workflow) :abandoned) (return-from recover-workflow :blocked))
   (when (and (stringp step) (not (find step (workflow-paused workflow) :key #'step-id :test #'equal)))
     (return-from recover-workflow :blocked))
-  (unless (member action '(:resume :retry :hand-off)) (error "Unknown recovery action ~a" action))
-  (let* ((step (if (stringp step) (find step (workflow-paused workflow) :key #'step-id :test #'equal)
-                   (or step (first (workflow-paused workflow)))))
+  (unless (member action '(:resume :retry :hand-off :revise-order :run-independently))
+    (error "Unknown recovery action ~a" action))
+  (let* ((order (member action '(:revise-order :run-independently)))
+         ;; The order actions act on every waiting step, not one.
+         (step (cond (order nil)
+                     ((stringp step) (find step (workflow-paused workflow) :key #'step-id :test #'equal))
+                     (t (or step (first (workflow-paused workflow))))))
          (inspection (or inspection (inspect-workflow-recovery workflow))))
     ;; A supplied inspection must have waited for the pause snapshot. Never
     ;; block GTK here, or treat an unfinished snapshot as permission to resume.
@@ -2058,12 +2303,17 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                       (and (jtrue-p (jget r "operation"))
                                            (not (and step (eq (step-role step) :resolve)
                                                      (workflow-home workflow)
-                                                     (equal (jget r "path") (namestring (workflow-home workflow))))))))
+                                                     (equal (jget r "path") (namestring (workflow-home workflow)))))
+                                           ;; A prerequisite's merge left for the dependent's agent to resolve.
+                                           (not (and step (eq (step-reason step) :integration-unresolved)
+                                                     (step-loop step) (loop-tree (step-loop step))
+                                                     (equal (jget r "path") (namestring (loop-tree (step-loop step)))))))))
                 (jlist (jget inspection "repositories")))
       (return-from recover-workflow :blocked))
     (when (not (workflow-old-processes-stopped-p workflow))
       (return-from recover-workflow :pending-shutdown))
     (unless (workflow-checks-quiescent-p workflow) (return-from recover-workflow :pending-shutdown))
+    (when order (return-from recover-workflow (recover-order workflow action inspection)))
     (unless step
       (unless (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow)))
         (return-from recover-workflow :pending-shutdown))
@@ -2086,15 +2336,10 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
     (let ((agent (if (eq action :hand-off) (other-agent workflow (step-agent step)) (step-agent step))))
       (when (agent-out-of-usage-p agent) (return-from recover-workflow :unavailable))
       (unless (agent-quiescent-p agent) (return-from recover-workflow :pending-shutdown))
-      (let ((directory (or (and (step-loop step) (loop-tree (step-loop step))) (workflow-home workflow)
-                           (agent-directory agent))))
-        (when (and directory (not (equal directory (agent-directory agent)))) (move-agent agent directory)))
-      (let ((saved (find (agent-id agent) (workflow-saved-agent-context workflow)
-                         :key (lambda (entry) (recovery-keyword (jget entry "id"))))))
-        (when (and saved (not (eq action :hand-off)))
-          (agent-resume-conversation agent (recovery-null (jget saved "conversation")))
-          (setf (workflow-saved-agent-context workflow)
-                (remove saved (workflow-saved-agent-context workflow)))))
+      (recovery-acquire-agent workflow agent
+                              (or (and (step-loop step) (loop-tree (step-loop step))) (workflow-home workflow)
+                                  (agent-directory agent))
+                              :fresh (eq action :hand-off))
       (when (eq (workflow-mode workflow) :review-only)
         (unless (assoc agent (workflow-review-access workflow))
           (push (cons agent (agent-read-only-p agent)) (workflow-review-access workflow)))
@@ -2109,6 +2354,9 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
             ((eq action :hand-off)
              (setf (step-prompt step) (recovery-progress-prompt workflow step inspection))
              (%hand-off-step workflow step))
+            ;; Its prerequisites are ready now: it starts as it would have by itself.
+            ((and (waiting-step-p step) (step-loop step))
+             (start-dependent-step workflow step))
             (t
              (setf (step-prompt step)
                    (if (eq action :retry) (or (step-original-prompt step) (step-prompt step))
@@ -2122,9 +2370,24 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
 (defun hand-off-step (workflow step)
   (recover-workflow workflow :hand-off :step step))
 
+(defun loop-ready-p (l)
+  "Whether L is done well enough for what builds on it: approved, or done
+unreviewed, with its check passing."
+  (and (member (loop-state l) '(:approved :unreviewed)) (not (loop-check-failed l))))
+
 (defun loop-prerequisites-ready-p (l)
-  (every (lambda (dep) (and (member (loop-state dep) '(:approved :unreviewed))
-                             (not (loop-check-failed dep)))) (loop-dependencies l)))
+  (every #'loop-ready-p (loop-dependencies l)))
+
+(defun check-dependency-graph (loops)
+  "Signal an error unless each of LOOPS depends only on others of LOOPS, and
+none waits for itself, directly or through others."
+  (dolist (l loops)
+    (unless (every (lambda (dep) (member dep loops)) (loop-dependencies l))
+      (error "Dependencies must name loops in this workflow.")))
+  (labels ((visit (l path)
+             (when (member l path) (error "Circular dependencies: revise the plan or dependency order."))
+             (dolist (dep (loop-dependencies l)) (visit dep (cons l path)))))
+    (dolist (l loops) (visit l nil))))
 
 (defun set-workflow-dependencies (workflow assignments)
   "Set (LOOP . PREREQUISITES) edges atomically, rejecting mutual waiting/cycles."
@@ -2132,47 +2395,366 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
     (handler-case
         (progn
           (dolist (entry assignments)
-            (unless (and (member (car entry) (workflow-loops workflow))
-                         (every (lambda (l) (member l (workflow-loops workflow))) (cdr entry)))
+            (unless (member (car entry) (workflow-loops workflow))
               (error "Dependencies must name loops in this workflow."))
             (setf (loop-dependencies (car entry)) (cdr entry)))
-          (labels ((visit (l path)
-                     (when (member l path) (error "Circular dependencies: revise the plan or dependency order."))
-                     (dolist (dep (loop-dependencies l)) (visit dep (cons l path)))))
-            (dolist (l (workflow-loops workflow)) (visit l nil)))
+          (check-dependency-graph (workflow-loops workflow))
           (checkpoint-changed workflow) t)
       (error (e)
         (dolist (entry old) (setf (loop-dependencies (car entry)) (cdr entry)))
         (error e)))))
 (export '(set-workflow-dependencies loop-dependencies))
 
-(defun invalidate-dependent-loops (workflow prerequisite &optional (seen (make-hash-table :test #'eq)))
-  "A changed prerequisite invalidates dependent checks, reviews and completion."
-  (when (gethash prerequisite seen) (return-from invalidate-dependent-loops nil))
-  (setf (gethash prerequisite seen) t)
-  (dolist (dependent (workflow-loops workflow))
-    (when (and (member prerequisite (loop-dependencies dependent)) (not (gethash dependent seen)))
-      (note workflow "~a changed; ~a must be revalidated before completion."
-            (or (loop-label prerequisite) "Prerequisite") (or (loop-label dependent) "dependent work"))
-      (let ((token (loop-check-handle dependent)))
-        (setf (loop-check-handle dependent) nil)
-        (when token (kill-check (car token))))
-      (let ((steps (remove-if-not (lambda (s) (and (eq dependent (step-loop s))
-                                                  (member (step-state s) '(:running :paused)))) (workflow-steps workflow))))
-        (if steps
-            (dolist (step steps)
-              (let ((running (eq (step-state step) :running)))
-                (incf (step-generation step))
-                (setf (step-reason step) :prerequisite-changed)
-                (pause-step workflow step)
-                (when running (agent-cancel (step-agent step)))))
-            (let ((step (make-step :agent (loop-author dependent) :role :work :loop dependent
-                                   :prompt (format nil "Revalidate your work against the changed prerequisite.~%~a" (loop-task dependent))
-                                   :reason :prerequisite-changed)))
-              (setf (step-then step) (restored-step-continuation workflow step))
-              (push step (workflow-steps workflow))
-              (pause-step workflow step))))
-      (invalidate-dependent-loops workflow dependent seen))))
+;;; Prerequisites that change
+
+(defun loop-stale-p (l)
+  "Whether L's work last started against a revision of a prerequisite that
+has been redone since."
+  (some (lambda (entry) (/= (cdr entry) (loop-revision (car entry)))) (loop-prerequisite-revisions l)))
+
+(defun work-started (workflow loop)
+  "LOOP's work (re)starts: a retry, a hand-off, a fix or another round. It's a
+new revision, so parts that started against an earlier one revalidate; and
+LOOP now works against its own prerequisites as they are."
+  (incf (loop-revision loop))
+  (setf (loop-prerequisite-revisions loop)
+        (mapcar (lambda (dep) (cons dep (loop-revision dep))) (loop-dependencies loop)))
+  (invalidate-dependent-loops workflow loop :started-only t))
+
+(defun invalidate-dependent-loops (workflow prerequisite &key started-only (seen (make-hash-table :test #'eq)))
+  "PREREQUISITE changed: the loops that build on it, and those that build on
+them, revalidate (REVALIDATE-LOOP). STARTED-ONLY: only those whose work has
+started; the others will start against it as it is then."
+  (unless (gethash prerequisite seen)
+    (setf (gethash prerequisite seen) t)
+    (dolist (dependent (workflow-loops workflow))
+      (when (and (member prerequisite (loop-dependencies dependent)) (not (gethash dependent seen))
+                 (or (not started-only) (loop-prerequisite-revisions dependent)))
+        (revalidate-loop workflow dependent prerequisite)
+        (invalidate-dependent-loops workflow dependent :started-only started-only :seen seen)))))
+
+(defun revalidation-prompt (dependent prerequisite progress)
+  (format nil "~a, which your part builds on, changed after you started, so your part must be revalidated ~
+against it. Your part:~%~%~a~%~%What you had reported so far:~%~%~a~%~%~
+~@[What you had written when you were stopped:~%~%~a~%~%~]~
+Look at your work as it is now: keep what still holds against the changed ~a, and change what doesn't. ~a"
+          (string-capitalize (part-name prerequisite) :end 1) (loop-task dependent)
+          (if (plusp (length (loop-summary dependent))) (loop-summary dependent) "Nothing yet.")
+          progress (part-name prerequisite) (work-reply-instruction dependent)))
+
+(defun revalidate-loop (workflow dependent prerequisite)
+  "PREREQUISITE changed after DEPENDENT's work started: stop that work and
+its checks, tell its author, and give the author a revalidation step, which
+starts once DEPENDENT's prerequisites are ready again (CHECK-FINISHED).
+DEPENDENT's written result and findings are kept."
+  (when (find-if (lambda (s) (and (eq dependent (step-loop s)) (eq (step-reason s) :prerequisite-changed)))
+                 (workflow-paused workflow))
+    ;; Already waiting to revalidate: it will see the latest change.
+    (return-from revalidate-loop nil))
+  (let* ((author (loop-author dependent))
+         (old (remove-if-not (lambda (s) (and (eq dependent (step-loop s))
+                                              (member (step-state s) '(:new :running :paused))))
+                             (workflow-steps workflow)))
+         (running (remove-duplicates (loop for s in old when (eq (step-state s) :running) collect (step-agent s))))
+         ;; A running turn's reply so far, taken before it's cancelled.
+         (progress (format nil "~{~a~^~%~%~}"
+                           (remove-if (lambda (text) (zerop (length text)))
+                                      (mapcar (lambda (s)
+                                                (or (step-progress s)
+                                                    (and (eq (step-state s) :running)
+                                                         (agent-partial-text (step-agent s)))))
+                                              old)))))
+    (note workflow "~a changed after ~a started on it: ~a revalidates it once ~a is ready again."
+          (string-capitalize (part-name prerequisite) :end 1) (part-name dependent) (agent-name author)
+          (part-name prerequisite))
+    (post workflow :system author
+          (format nil "~a, which your part builds on, has changed. Stop working on your part: once ~
+it's ready again, you'll be asked to revalidate your part against it."
+                  (string-capitalize (part-name prerequisite) :end 1))
+          :note)
+    (let ((token (loop-check-handle dependent)))
+      (setf (loop-check-handle dependent) nil)
+      (when token
+        (when (car token) (pushnew (car token) (workflow-stopping-checks workflow)))
+        (kill-check (car token))))
+    ;; Its steps are replaced: their late results can't carry it on.
+    (dolist (s old)
+      (incf (step-generation s))
+      (setf (step-state s) :superseded)
+      (unpause workflow s))
+    (dolist (agent running) (agent-cancel agent))
+    (let ((step (make-step :agent author :role :work :loop dependent :reason :prerequisite-changed
+                           :prompt (revalidation-prompt dependent prerequisite (blank-to-nil progress)))))
+      ;; Its progress is what's in its prompt, not what the cancelled turn adds later.
+      (setf (step-progress step) (blank-to-nil progress)
+            (step-original-prompt step) (step-prompt step)
+            (step-then step) (restored-step-continuation workflow step))
+      (push step (workflow-steps workflow))
+      (pause-step workflow step))))
+
+;;; Starting a dependent part
+
+(defun commit-prerequisite (workflow dep)
+  "Commit DEP's work in its worktree; its head, and the files it changed."
+  (let ((tree (loop-tree dep)))
+    (commit-worktree tree (format nil "~a~%~%~a" (string-capitalize (part-name dep) :end 1) (loop-task dep)))
+    (let ((head (worktree-git-line tree "rev-parse" "HEAD")))
+      (values head
+              (ignore-errors
+                (remove "" (uiop:split-string
+                            (worktree-git tree "diff" "--name-only"
+                                          (or (workflow-base workflow)
+                                              (worktree-git-line tree "config" (worktree-base-key (worktree-branch tree))))
+                                          head)
+                            :separator '(#\Newline))
+                        :test #'equal))))))
+
+(defun merge-prerequisite (workflow l dep head)
+  "Merge HEAD, DEP's committed work, into L's worktree, once: recorded in
+WORKFLOW-PREREQUISITE-MERGES. L's own work so far is committed first, so
+the merge can't touch it. MERGE-PREREQUISITE-INTO-WORKTREE's status and files."
+  (let* ((key (list (namestring (loop-tree l)) (namestring (loop-tree dep))))
+         (done (find key (workflow-prerequisite-merges workflow) :key (lambda (e) (subseq e 0 2)) :test #'equal)))
+    (if (equal head (third done))
+        :already
+        (progn
+          (commit-worktree (loop-tree l) (format nil "~a, in progress" (string-capitalize (part-name l) :end 1)))
+          (multiple-value-bind (status files)
+              (merge-prerequisite-into-worktree (loop-tree l) head
+                                                :message (format nil "Merge ~a into ~a" (part-name dep) (part-name l)))
+            (when (member status '(:merged :already))
+              (setf (workflow-prerequisite-merges workflow)
+                    (cons (append key (list head)) (remove done (workflow-prerequisite-merges workflow))))
+              (checkpoint-changed workflow))
+            (values status files))))))
+
+(defun prerequisite-context (workflow l)
+  "What L's prerequisites did, for its author. In worktrees, each one's work
+is first committed and merged into L's. Returns the text; or nil and, when a
+merge conflicted or failed, what L's author is to do about it first."
+  (let ((parts '()))
+    (dolist (dep (loop-dependencies l))
+      (let ((files nil))
+        (when (and (loop-tree dep) (loop-tree l))
+          (handler-case
+              (multiple-value-bind (head changed) (commit-prerequisite workflow dep)
+                (setf files changed)
+                (multiple-value-bind (status conflicted) (merge-prerequisite workflow l dep head)
+                  (case status
+                    ((:merged :already) nil)
+                    (:conflict
+                     (return-from prerequisite-context
+                       (values nil (format nil "Merging ~a (commit ~a), which your part builds on, into your ~
+worktree conflicted in:~%~%~{- ~a~%~}~%Resolve the conflicts first, keeping what both parts meant to do; ~
+then stage the files and conclude the merge with `git commit --no-edit`."
+                                           (part-name dep) head conflicted))))
+                    (t
+                     (return-from prerequisite-context
+                       (values nil (format nil "~a (commit ~a), which your part builds on, couldn't be merged ~
+into your worktree (~(~a~)). Merge it (`git merge ~a`) before you go on."
+                                           (string-capitalize (part-name dep) :end 1) head status head)))))))
+            (error (e)
+              (return-from prerequisite-context
+                (values nil (format nil "~a, which your part builds on, couldn't be brought into your worktree: ~a"
+                                    (string-capitalize (part-name dep) :end 1) e))))))
+        (push (format nil "~a is done (~a). ~a reported:~%~%~a~%~%~:[It's in the folder you share.~;~
+It's merged into your worktree. Files it changed: ~:*~{~a~^, ~}.~]"
+                      (string-capitalize (part-name dep) :end 1) (loop-outcome dep) (agent-name (loop-author dep))
+                      (if (plusp (length (loop-summary dep))) (loop-summary dep) "Nothing.")
+                      (and (loop-tree dep) (loop-tree l) (or files '("none"))))
+              parts)))
+    (values (format nil "Your part builds on work that is now done.~%~%~{~a~^~%~%~}" (nreverse parts)) nil)))
+
+(defun start-dependent-step (workflow step)
+  "STEP's prerequisites are ready: bring their work into its worktree, tell
+its agent what they did, and start it. A merge that conflicts pauses it
+instead (:integration-unresolved), for its agent to resolve once resumed."
+  (let ((l (step-loop step)))
+    (when (eq (step-role step) :work)
+      (multiple-value-bind (context problem) (prerequisite-context workflow l)
+        (let ((prompt (format nil "~a~%~%~a" (or (step-original-prompt step) (step-prompt step))
+                              (or context ""))))
+          (when problem
+            (setf (step-reason step) :integration-unresolved
+                  (step-prompt step) (format nil "~a~%~%~a" problem prompt)
+                  (step-original-prompt step) (step-prompt step))
+            (pause-step workflow step)
+            (return-from start-dependent-step nil))
+          ;; Its assignment now includes their result, also for a retry.
+          (setf (step-prompt step) prompt
+                (step-original-prompt step) prompt))))
+    (unpause workflow step)
+    (note workflow "~{~a~^ and ~} ~:[is~;are~] done: ~a starts."
+          (mapcar #'part-name (loop-dependencies l)) (rest (loop-dependencies l)) (step-description step))
+    (update-loop-state workflow l (if (eq (step-role step) :review) :reviewing :working))
+    (submit-step workflow step)))
+
+;;; Mutual waiting
+
+(defun detect-deadlock (workflow)
+  "When no unfinished part can go on, each waiting for a prerequisite that
+can't become ready by itself (not approved, failed, or waiting in turn),
+the waiting steps pause with reason :deadlock, for the user to choose."
+  (let ((waiting (remove-if-not (lambda (s) (and (waiting-step-p s) (step-loop s))) (workflow-paused workflow))))
+    (when (and (workflow-live-p workflow) waiting
+               (every (lambda (s) (member (step-reason s) '(:dependency :prerequisite-changed :deadlock)))
+                      (workflow-paused workflow))
+               (notany (lambda (s) (eq (step-state s) :running)) (workflow-steps workflow))
+               (notany #'loop-check-handle (workflow-loops workflow))
+               (every (lambda (l) (or (loop-done-p l) (find l waiting :key #'step-loop))) (workflow-loops workflow))
+               (notany (lambda (s) (loop-prerequisites-ready-p (step-loop s))) waiting))
+      (note workflow "No part can go on: ~{~a~^; ~}. Revise the order, or have the parts go on independently."
+            (loop for s in waiting
+                  collect (format nil "~a waits for ~{~a (~a)~^ and ~}" (part-name (step-loop s))
+                                  (loop for dep in (loop-dependencies (step-loop s))
+                                        unless (loop-ready-p dep)
+                                          append (list (part-name dep)
+                                                       (if (find dep waiting :key #'step-loop) "waiting"
+                                                           (loop-outcome dep)))))))
+      (dolist (s waiting)
+        (setf (step-reason s) :deadlock))
+      (checkpoint-changed workflow)
+      (when (workflow-on-pause workflow)
+        (dolist (s waiting) (funcall (workflow-on-pause workflow) workflow s))))))
+
+(defun recovery-acquire-agent (workflow agent directory &key fresh)
+  "Put AGENT where recovered work goes on: in DIRECTORY, and, unless FRESH,
+in the conversation it was in when the task was saved."
+  (when (and directory (not (equal directory (agent-directory agent)))) (move-agent agent directory))
+  (let ((saved (find (agent-id agent) (workflow-saved-agent-context workflow)
+                     :key (lambda (entry) (recovery-keyword (jget entry "id"))))))
+    (when (and saved (not fresh))
+      (agent-resume-conversation agent (recovery-null (jget saved "conversation")))
+      (setf (workflow-saved-agent-context workflow)
+            (remove saved (workflow-saved-agent-context workflow))))))
+
+(defun part-loops (workflow)
+  "The parts of a split plan, the lead's first: not the merged result."
+  (remove (workflow-merged-loop workflow) (workflow-loops workflow)))
+
+(defun recover-order (workflow action inspection)
+  ":revise-order or :run-independently, for parts waiting on each other.
+RECOVER-WORKFLOW has checked the repositories, INSPECTION."
+  (let ((waiting (remove-if-not (lambda (s) (and (step-loop s)
+                                                 (member (step-reason s) '(:deadlock :dependency :prerequisite-changed))))
+                                (workflow-paused workflow)))
+        (agents (list (workflow-lead workflow) (workflow-partner workflow))))
+    (cond ((or (null waiting) (eq (workflow-mode workflow) :review-only)) :blocked)
+          ((not (and (workflow-old-processes-stopped-p workflow) (workflow-checks-quiescent-p workflow)
+                     (every #'agent-quiescent-p agents)))
+           :pending-shutdown)
+          ((and (eq action :revise-order) (agent-out-of-usage-p (workflow-lead workflow))) :unavailable)
+          (t
+           (setf (workflow-state workflow) :running
+                 (workflow-recovery-baseline workflow) (jget inspection "repositories")
+                 (workflow-recovery-capture workflow) nil
+                 (workflow-recovery-stale workflow) (remove :baseline (workflow-recovery-stale workflow)))
+           (if (eq action :run-independently)
+               (run-independently workflow waiting)
+               (revise-order workflow waiting))
+           (checkpoint-changed workflow)
+           :started))))
+
+(defun run-independently (workflow waiting)
+  "Drop every part's prerequisites and start the WAITING steps."
+  (set-workflow-dependencies workflow (mapcar #'list (workflow-loops workflow)))
+  (dolist (l (workflow-loops workflow)) (setf (loop-prerequisite-revisions l) nil))
+  (note workflow "The parts now go on independently: none waits for another.")
+  (dolist (step waiting)
+    (when (member step (workflow-paused workflow))
+      (recovery-acquire-agent workflow (step-agent step) (or (loop-tree (step-loop step)) (workflow-home workflow)))
+      (unpause workflow step)
+      (setf (step-prompt step)
+            (format nil "~a~%~%The parts now go on independently: don't wait for the other part, or count on its result."
+                    (or (step-original-prompt step) (step-prompt step))))
+      (update-loop-state workflow (step-loop step) (if (eq (step-role step) :review) :reviewing :working))
+      (submit-step workflow step))))
+
+(defun revise-order-prompt (workflow)
+  (format nil "The overall request:~%~%~a~%~%You split it into parts, but no part can go on: each is waiting ~
+for another, or for one that can't finish as it is. Each part as it stands:~%~%~{~a~^~%~%~}~%~%~
+Revise the plan so the parts can go on, using what's already done: change the order, or the tasks. ~
+Don't change anything yet. ~a"
+          (workflow-request workflow)
+          (loop for l in (part-loops workflow)
+                collect (format nil "~a, by ~a: ~a~@[, builds on ~{~a~^ and ~}~].~%Task:~%~a~%Done so far:~%~a~@[~%Last review:~%~a~]"
+                                (string-capitalize (part-name l) :end 1) (agent-name (loop-author l))
+                                (if (loop-done-p l) (loop-outcome l) "waiting")
+                                (mapcar #'part-name (loop-dependencies l)) (loop-task l)
+                                (if (plusp (length (loop-summary l))) (loop-summary l) "Nothing yet.")
+                                (loop-last-review l)))
+          (plan-form (workflow-partner workflow))))
+
+(defun revise-order (workflow waiting)
+  "Have the lead revise the plan from both parts' progress; the WAITING steps
+are replaced by what the revised plan has the parts do (ORDER-REVISED)."
+  (let* ((lead (workflow-lead workflow))
+         (prompts (mapcar (lambda (s) (cons (step-loop s) (or (step-original-prompt s) (step-prompt s)))) waiting))
+         (own (find lead (part-loops workflow) :key #'loop-author)))
+    (dolist (s waiting)
+      (incf (step-generation s))
+      (setf (step-state s) :superseded)
+      (unpause workflow s))
+    (recovery-acquire-agent workflow lead (or (and own (loop-tree own)) (workflow-home workflow)))
+    (note workflow "~a revises the plan, with both parts' progress." (agent-name lead))
+    (submit-step workflow (make-step :agent lead :role :replan :prompt (revise-order-prompt workflow)
+                                     :then (lambda (text error)
+                                             (declare (ignore error))
+                                             (order-revised workflow text prompts))))))
+
+(defun revised-part-prompt (workflow l changed)
+  (format nil "The plan was revised~:[~;, and your part changed~]. Your part is now:~%~%~a~%~%~
+What you've done on it so far:~%~%~a~%~%~@[The last review of it:~%~%~a~%~%~]~
+Carry on from there: look at the files as they are, keep what still holds, and don't redo what's done. ~a~@[~%~%~a~]"
+          changed (loop-task l) (if (plusp (length (loop-summary l))) (loop-summary l) "Nothing yet.")
+          (loop-last-review l) (work-reply-instruction l) (order-note workflow l)))
+
+(defun deadlock-parts (workflow prompts)
+  "The parts still can't go on: each unfinished one pauses again, :deadlock,
+with its assignment from PROMPTS ((loop . prompt)s), for the user to choose."
+  (dolist (l (or (remove-if #'loop-done-p (part-loops workflow)) (part-loops workflow)))
+    (let ((step (make-step :agent (loop-author l) :role :work :loop l :reason :deadlock
+                           :prompt (or (cdr (assoc l prompts)) (revised-part-prompt workflow l nil)))))
+      (setf (step-original-prompt step) (step-prompt step)
+            (step-then step) (restored-step-continuation workflow step))
+      (push step (workflow-steps workflow))
+      (pause-step workflow step))))
+
+(defun order-revised (workflow text &optional prompts)
+  "The lead's revised plan, TEXT, is in: its tasks and order go to the parts,
+and the parts it changes, or that aren't done, carry on from their progress."
+  (post workflow (workflow-lead workflow) :user text :plan)
+  (multiple-value-bind (lead-task partner-task order) (parse-plan text)
+    (destructuring-bind (&optional mine theirs &rest others) (part-loops workflow)
+      (declare (ignore others))
+      (let* ((before (mapcar (lambda (l) (cons l (copy-list (loop-dependencies l)))) (workflow-loops workflow)))
+             (problem (cond ((null theirs) "there aren't two parts to order")
+                            ((plan-order-problem order))
+                            (t (handler-case
+                                   (progn (set-workflow-dependencies workflow (order-assignments order mine theirs))
+                                          nil)
+                                 (error (e) (princ-to-string e)))))))
+        (when problem
+          (note workflow "The revised plan can't go on: ~a" problem)
+          (deadlock-parts workflow prompts)
+          (return-from order-revised nil))
+        (note workflow "The revised plan: ~(~a~)." (substitute #\Space #\- (string order)))
+        (let ((restart '()))
+          (loop for l in (list mine theirs)
+                for task in (list lead-task partner-task)
+                do (let* ((task (blank-to-nil task))
+                          (changed (and task (not (equal task (loop-task l))))))
+                     (when changed (setf (loop-task l) task))
+                     (unless (and (not changed) (loop-ready-p l) (loop-done-p l)
+                                  (equal (loop-dependencies l) (cdr (assoc l before))))
+                       (push (cons l changed) restart))))
+          ;; A dependent part first: it waits while its prerequisite goes ahead.
+          (dolist (entry (stable-sort (nreverse restart) #'> :key (lambda (e) (length (loop-dependencies (car e))))))
+            (let ((l (car entry)))
+              (setf (workflow-max-rounds workflow) (max (workflow-max-rounds workflow) (1+ (loop-round l))))
+              (recovery-acquire-agent workflow (loop-author l) (or (loop-tree l) (workflow-home workflow)))
+              (loop-work workflow l (revised-part-prompt workflow l (cdr entry)) :prepare t)))
+          (unless restart (check-finished workflow)))))))
 
 (defun restore-workflow-worktrees (workflow)
   "An explicit action recovers missing worktrees from committed recovery refs."

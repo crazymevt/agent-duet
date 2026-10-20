@@ -273,6 +273,34 @@
     (false partner))
   (false (nth-value 1 (ai:parse-plan "Just do it."))))
 
+(define-test plan-orders
+    :parent agent-duet
+  ;; No ORDER line: the parts go on in parallel.
+  (is eq :parallel (nth-value 2 (ai:parse-plan (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B"))))
+  (multiple-value-bind (lead partner order)
+      (ai:parse-plan (format nil "LEAD TASK:~%The parser~%~%PARTNER TASK:~%The tests~%~%ORDER: LEAD FIRST"))
+    (is string= "The parser" lead)
+    ;; The ORDER line isn't part of the partner's task.
+    (is string= "The tests" partner)
+    (is eq :lead-first order))
+  (multiple-value-bind (lead partner order)
+      (ai:parse-plan (format nil "**LEAD TASK:**~%A~%~%**ORDER:** partner-first.~%~%**PARTNER TASK:**~%B"))
+    (is string= "A" lead)
+    (is string= "B" partner)
+    (is eq :partner-first order))
+  (is eq :parallel (nth-value 2 (ai:parse-plan (format nil "LEAD TASK:~%A~%PARTNER TASK:~%B~%ORDER: PARALLEL"))))
+  (is eq :circular (nth-value 2 (ai:parse-plan (format nil "LEAD TASK:~%A~%PARTNER TASK:~%B~%ORDER: LEAD FIRST, PARTNER FIRST"))))
+  (is eq :circular (nth-value 2 (ai:parse-plan (format nil "LEAD TASK:~%A~%PARTNER TASK:~%B~%ORDER: circular"))))
+  (is eq :parallel (nth-value 2 (ai:parse-plan (format nil "LEAD TASK:~%A~%PARTNER TASK:~%B~%ORDER: whenever"))))
+  ;; A plan that can't be split still parses, its order unused.
+  (multiple-value-bind (lead partner order)
+      (ai:parse-plan (format nil "LEAD TASK:~%All of it.~%~%PARTNER TASK:~%NONE~%ORDER: PARALLEL"))
+    (is string= "All of it." lead)
+    (false partner)
+    (is eq :parallel order))
+  ;; The lead is asked for an order.
+  (true (search "ORDER: LEAD FIRST" (ai::plan-form (make-instance 'fake-agent :id :codex :name "ChatGPT")))))
+
 (define-test findings
     :parent agent-duet
   (let ((f (ai::parse-finding-line "- F2 [fixed] `src/a.lisp:42` — Off by one")))
@@ -331,8 +359,10 @@
                     (pop (fake-replies agent))))
          (text (if reply (funcall reply prompt) "out of replies")))
     ;; A reply of :out-of-usage plays the account running out; (:error
-    ;; text), a turn that fails.
-    (cond ((eq text :out-of-usage) (ai:agent-turn-finished agent "You've hit your limit" :out-of-usage))
+    ;; text), a turn that fails; :hang, one that goes on until finished
+    ;; by hand (AGENT-TURN-FINISHED).
+    (cond ((eq text :hang) nil)
+          ((eq text :out-of-usage) (ai:agent-turn-finished agent "You've hit your limit" :out-of-usage))
           ((consp text) (ai:agent-turn-finished agent (second text) t))
           (t (ai:agent-turn-finished agent text (null reply))))))
 
@@ -2478,20 +2508,33 @@ VERDICT: APPROVED" nil)
       (is eq :disconnected (second (first results)))
       (true (wait-until (lambda () (ai::agent-quiescent-p agent)) 2)))))
 
-(define-test recovery-disconnect-invalidates-dependent-work :parent agent-duet
+(define-test recovery-disconnect-blocks-dependent-work :parent agent-duet
   (multiple-value-bind (workflow lead partner) (recovery-fixture)
     (let* ((prerequisite (first (ai:workflow-loops workflow)))
            (dependent (ai::make-review-loop :author partner :reviewer lead :task "Dependent"
                                             :state :approved :summary "Keep result"
-                                            :dependencies (list prerequisite))))
+                                            :dependencies (list prerequisite)))
+           (notes '()))
       (push dependent (ai:workflow-loops workflow))
+      ;; It had started against the prerequisite's first revision.
+      (setf (ai::loop-prerequisite-revisions dependent) (list (cons prerequisite (ai::loop-revision prerequisite)))
+            (ai::workflow-on-message workflow) (lambda (from to text kind)
+                                                (declare (ignore from to kind)) (push text notes)))
       (ai::agent-emit lead :delta :text "Partial reply")
       (ai:agent-turn-finished lead "Connection closed" :disconnected)
       (is eq :paused (ai::loop-state prerequisite))
-      (is eq :paused (ai::loop-state dependent))
       (true (find "Partial reply" (ai::workflow-paused workflow)
                   :key #'ai::step-progress :test (lambda (a b) (and b (search a b)))))
+      ;; Blocked, not invalidated: its result and state are as they were.
+      (is eq :approved (ai::loop-state dependent))
+      (false (find dependent (ai::workflow-paused workflow) :key #'ai::step-loop))
+      (true (find "is blocked until" notes :test #'search))
+      (is string= "Keep result" (ai::loop-summary dependent))
+      ;; Its prerequisite's work is redone: then it revalidates.
+      (is eq :started (ai:recover-workflow workflow :resume))
+      (is eq :paused (ai::loop-state dependent))
       (let ((step (find dependent (ai::workflow-paused workflow) :key #'ai::step-loop)))
+        (is eq :prerequisite-changed (ai::step-reason step))
         (is eq :blocked (ai:recover-workflow workflow :resume :step step)))
       (is string= "Keep result" (ai::loop-summary dependent))
       (ai:stop-workflow workflow))))
@@ -2574,3 +2617,455 @@ VERDICT: APPROVED" nil)
         (sb-ext:process-kill (ai::cp-process cp) 15)
         (true (wait-until (lambda () (null (ai::claude-agent-process agent)))))
         (false notes)))))
+
+;;; Ordered split plans, changed prerequisites and mutual waiting
+
+(defun run-ordered (claude-replies codex-replies &key (rounds 3) approve-plan)
+  "A :divide workflow like RUN-FAKE, also collecting notes, pauses and plans offered."
+  (let* ((claude (make-instance 'fake-agent :id :claude :name "Claude" :replies claude-replies))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies codex-replies))
+         (log (list :notes '() :paused '() :plans '()))
+         (workflow (make-instance 'ai:workflow :mode :divide :lead claude :partner codex
+                                  :request "Add a frobnicate function" :max-rounds rounds
+                                  :approve-plan approve-plan
+                                  :on-plan (lambda (w lead partner) (declare (ignore w))
+                                             (push (list lead partner) (getf log :plans)))
+                                  :on-pause (lambda (w step) (declare (ignore w)) (push step (getf log :paused)))
+                                  :on-message (lambda (from to text kind)
+                                                (declare (ignore from))
+                                                (when (eq kind :note) (push (list to text) (getf log :notes)))))))
+    (ai:start-workflow workflow)
+    (values workflow claude codex log)))
+
+(defun noted (log text &optional to)
+  "Whether a note containing TEXT was posted (to TO, if given: an agent, or nil for the user)."
+  (find-if (lambda (n) (and (search text (second n)) (or (null to) (eq to (first n)))))
+           (getf log :notes)))
+
+(defun reviews (&rest verdicts)
+  "A reply function for reviews: VERDICTS in turn (:approve or :changes), then approvals."
+  (lambda (prompt)
+    (declare (ignore prompt))
+    (if (eq (pop verdicts) :changes)
+        (format nil "Still wrong.~%VERDICT: CHANGES REQUESTED")
+        *approve*)))
+
+(defparameter *lead-first-plan* (format nil "LEAD TASK:~%The function~%~%PARTNER TASK:~%The tests~%~%ORDER: LEAD FIRST"))
+
+(define-test ordered-plan-lead-first
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex log)
+      (run-ordered (responder "Split the work" *lead-first-plan* "Review the work" *approve* "Wrote the function")
+                   (responder "Review the work" *approve* "Wrote the tests"))
+    (is eq :finished (ai:workflow-state workflow))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is equal (list mine) (ai::loop-dependencies theirs))
+      (false (ai::loop-dependencies mine))
+      (true (every (lambda (l) (eq :approved (ai::loop-state l))) (list mine theirs)))
+      ;; ChatGPT's part started against the first revision of Claude's.
+      (is equal (list (cons mine 1)) (ai::loop-prerequisite-revisions theirs)))
+    ;; ChatGPT reviewed Claude's part before doing its own, and was given its report.
+    (let ((prompts (reverse (fake-prompts codex))))
+      (true (search "Review the work" (first prompts)))
+      (true (search "Your part builds on work that is now done" (second prompts)))
+      (true (search "Wrote the function" (second prompts)))
+      (true (search "Your part builds on Claude's part" (second prompts))))
+    (true (find "ChatGPT's part builds on yours" (fake-prompts claude) :test #'search))
+    (true (noted log "ChatGPT's work on ChatGPT's part waits for Claude's part"))
+    ;; A planned wait isn't a pause for the user.
+    (false (getf log :paused))))
+
+(define-test ordered-plan-approval
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex log)
+      (run-ordered (responder "Split the work" (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B~%~%ORDER: PARTNER FIRST")
+                              "Review the work" *approve* "Did A")
+                   (responder "Review the work" *approve* "Did B")
+                   :approve-plan t)
+    (declare (ignore claude))
+    (is = 1 (length (getf log :plans)))
+    (is eq :partner-first (ai:pending-plan-order workflow))
+    (false (ai:pending-plan-error workflow))
+    (let ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))))
+      (is string= "partner-first" (ai:jget checkpoint "pending-plan" "order"))
+      (false (ai::jtrue-p (ai:jget checkpoint "pending-plan" "error"))))
+    ;; Each first, both ways: nothing starts, and the plan says why.
+    (false (ai:approve-plan workflow "A" "B" :order :circular))
+    (true (ai:pending-plan-error workflow))
+    (false (fake-prompts codex))
+    (is eq :parallel (ai:pending-plan-order workflow))
+    (is string= (ai:pending-plan-error workflow)
+        (ai:jget (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))) "pending-plan" "error"))
+    ;; The order chosen on the card wins over the lead's.
+    (true (ai:approve-plan workflow "A" "B" :order :lead-first))
+    (false (ai:workflow-pending-plan workflow))
+    (is eq :finished (ai:workflow-state workflow))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is equal (list mine) (ai::loop-dependencies theirs))
+      (false (ai::loop-dependencies mine))))
+  ;; Approved as proposed, the plan's order holds.
+  (multiple-value-bind (workflow claude codex)
+      (run-ordered (responder "Split the work" (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B~%~%ORDER: PARTNER FIRST")
+                              "Review the work" *approve* "Did A")
+                   (responder "Review the work" *approve* "Did B")
+                   :approve-plan t)
+    (declare (ignore codex))
+    (true (ai:approve-plan workflow "A" "B"))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is equal (list theirs) (ai::loop-dependencies mine)))
+    (true (find "Did B" (fake-prompts claude) :test #'search))
+    (is eq :finished (ai:workflow-state workflow))))
+
+(define-test ordered-plan-circular
+    :parent agent-duet
+  (let ((circular (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B~%~%ORDER: LEAD FIRST AND PARTNER FIRST")))
+    ;; Without approval, the lead revises it once.
+    (multiple-value-bind (workflow claude codex log)
+        (run-ordered (responder "can't be started" *lead-first-plan* "Split the work" circular
+                                "Review the work" *approve* "Wrote the function")
+                     (responder "Review the work" *approve* "Wrote the tests"))
+      (declare (ignore log))
+      (true (find "each part would wait for the other" (fake-prompts claude) :test #'search))
+      (is eq :finished (ai:workflow-state workflow))
+      (is = 2 (length (ai:workflow-loops workflow)))
+      (true (fake-prompts codex)))
+    ;; Circular again: it waits for the user, saying why, with nothing started.
+    (multiple-value-bind (workflow claude codex log)
+        (run-ordered (responder "Split the work" circular) nil)
+      (is = 2 (length (fake-prompts claude)))
+      (false (fake-prompts codex))
+      (false (ai:workflow-loops workflow))
+      (is = 1 (length (getf log :plans)))
+      (true (search "each part would wait" (ai:pending-plan-error workflow)))
+      (is eq :parallel (ai:pending-plan-order workflow))
+      ;; A restart keeps the order and the reason.
+      (let ((restored (ai:restore-workflow (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))
+                                           :lead claude :partner codex)))
+        (true (search "each part would wait" (ai:pending-plan-error restored)))
+        (is eq :parallel (ai:pending-plan-order restored))))))
+
+(define-test prerequisite-change-revalidates-dependent
+    :parent agent-duet
+  (progn
+    (multiple-value-bind (workflow claude codex log)
+        (run-ordered (responder "Split the work" *lead-first-plan* "Review the work" *approve* "Wrote the function")
+                     (responder "Review the work" *approve* "changed after you started" "Revalidated the tests"
+                                "Wrote the tests"))
+      (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+        (is eq :finished (ai:workflow-state workflow))
+        ;; Claude's part is reworked after ChatGPT's was done against it.
+        (setf (ai:workflow-state workflow) :running
+              (ai::loop-check-handle theirs) (list nil))
+        (setf (fake-replies claude)
+              (let ((old (fake-replies claude)))
+                (lambda (prompt) (if (search "Rework" prompt) :hang (funcall old prompt)))))
+        (ai::loop-work workflow mine "Rework the function")
+        (is = 2 (ai::loop-revision mine))
+        (true (ai::loop-stale-p theirs))
+        ;; ChatGPT is told; its check is cancelled; its part waits to revalidate.
+        (true (noted log "has changed" codex))
+        (false (ai::loop-check-handle theirs))
+        (is eq :paused (ai::loop-state theirs))
+        (let ((step (find theirs (ai::workflow-paused workflow) :key #'ai::step-loop)))
+          (is eq :prerequisite-changed (ai::step-reason step))
+          (true (search "Wrote the tests" (ai::step-prompt step)))
+          (is eq :blocked (ai:recover-workflow workflow :resume :step step)))
+        (is string= "Wrote the tests" (ai::loop-summary theirs))
+        ;; Claude's rework is done and approved: ChatGPT revalidates, given the change.
+        (ai:agent-turn-finished claude "Reworked the function" nil)
+        (let ((prompt (find "changed after you started" (fake-prompts codex) :test #'search)))
+          (true (search "Reworked the function" prompt))
+          (true (search "changed after you started" prompt)))
+        (is string= "Revalidated the tests" (ai::loop-summary theirs))
+        (false (ai::loop-stale-p theirs))
+        (is eq :approved (ai::loop-state theirs))
+        (is eq :finished (ai:workflow-state workflow))))))
+
+(define-test failed-prerequisite-hand-off-prompt
+    :parent agent-duet
+  (multiple-value-bind (workflow paused claude codex)
+      (run-pausing :review (list (says '(:error "Lost the network"))) (list (says "Took it over")))
+    (declare (ignore claude))
+    (is eq :failed (ai::step-reason (first paused)))
+    (is eq :started (ai:recover-workflow workflow :hand-off))
+    (let ((prompt (first (fake-prompts codex))))
+      (true (search "Claude failed partway through a task" prompt))
+      (true (search "Original assignment" prompt))
+      (true (search "Add frobnicate" prompt))
+      (true (search "Reason: FAILED" prompt :test #'char-equal))
+      (true (search "Lost the network" prompt))
+      (true (search "Current repository inspection" prompt))
+      (true (search "since Claude is unavailable" prompt)))
+    (is eq :unreviewed (ai::loop-state (first (ai:workflow-loops workflow))))))
+
+(defun deadlocked-workflow (claude-replies)
+  "Claude's part goes first but isn't approved in its one round, so ChatGPT's waits for ever."
+  (run-ordered claude-replies
+               (let ((review (reviews :changes)))
+                 (lambda (prompt)
+                   (cond ((search "Review the work" prompt) (funcall review prompt))
+                         (t "Wrote the tests"))))
+               :rounds 1))
+
+(define-test deadlock-run-independently
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex log)
+      (deadlocked-workflow (responder "Split the work" *lead-first-plan* "Review the work" *approve* "Wrote the function"))
+    (declare (ignore claude))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is eq :running (ai:workflow-state workflow))
+      (is eq :unresolved (ai::loop-state mine))
+      (let ((step (first (ai::workflow-paused workflow))))
+        (is eq :deadlock (ai::step-reason step))
+        (is eq theirs (ai::step-loop step))
+        ;; The user is asked, once.
+        (is equal (list step) (getf log :paused))
+        (is eq :blocked (ai:recover-workflow workflow :resume)))
+      (true (noted log "No part can go on"))
+      (is string= "deadlock" (ai:jget (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))
+                                      "steps" 0 "reason"))
+      (is eq :started (ai:recover-workflow workflow :run-independently))
+      (false (ai::loop-dependencies theirs))
+      (true (search "go on independently" (first (fake-prompts codex))))
+      (is eq :approved (ai::loop-state theirs))
+      (is eq :finished (ai:workflow-state workflow))
+      (is eq :blocked (ai:recover-workflow workflow :run-independently)))))
+
+(define-test deadlock-revise-order
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex log)
+      (deadlocked-workflow (responder "no part can go on" (format nil "LEAD TASK:~%The function, fixed~%~%PARTNER TASK:~%The tests~%~%ORDER: PARTNER FIRST")
+                                      "Split the work" *lead-first-plan* "Review the work" *approve*
+                                      "Wrote the function"))
+    (declare (ignore log))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is eq :deadlock (ai::step-reason (first (ai::workflow-paused workflow))))
+      (is eq :started (ai:recover-workflow workflow :revise-order))
+      ;; The lead was given both parts' progress.
+      (let ((prompt (find "no part can go on" (fake-prompts claude) :test #'search)))
+        (true (search "Wrote the function" prompt))
+        (true (search "Still wrong" prompt))
+        (true (search "The tests" prompt)))
+      (is equal (list theirs) (ai::loop-dependencies mine))
+      (false (ai::loop-dependencies theirs))
+      (is string= "The function, fixed" (ai::loop-task mine))
+      ;; ChatGPT's went first; then Claude's carried on, given its result.
+      (true (find "Wrote the tests" (fake-prompts claude) :test #'search))
+      (true (search "your part changed" (first (fake-prompts claude))))
+      (true (every (lambda (l) (eq :approved (ai::loop-state l))) (list mine theirs)))
+      (is eq :finished (ai:workflow-state workflow))
+      (true codex))))
+
+(define-test deadlock-revised-order-still-circular
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex log)
+      (deadlocked-workflow (responder "no part can go on" (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B~%~%ORDER: CIRCULAR")
+                                      "Split the work" *lead-first-plan* "Review the work" *approve*
+                                      "Wrote the function"))
+    (declare (ignore claude codex))
+    (is eq :started (ai:recover-workflow workflow :revise-order))
+    (true (noted log "The revised plan can't go on"))
+    (let ((step (first (ai::workflow-paused workflow))))
+      (is eq :deadlock (ai::step-reason step))
+      (true (member step (getf log :paused))))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is equal (list mine) (ai::loop-dependencies theirs)))))
+
+(define-test order-recovery-checks-repositories
+    :parent agent-duet
+  (dolist (repository (list (ai:jobj "path" "/nowhere" "available" :false)
+                            (ai:jobj "path" "/merging" "available" t "operation" t)))
+    (multiple-value-bind (workflow claude codex)
+        (deadlocked-workflow (responder "Split the work" *lead-first-plan* "Review the work" *approve* "Wrote the function"))
+      ;; The pause snapshot is done, so only the repository can block it.
+      (ai::await-recovery-captures workflow)
+      (let ((prompts (length (fake-prompts codex)))
+            (inspection (ai:jobj "repositories" (vector repository) "repository-changed" :false)))
+        (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+          (dolist (action '(:run-independently :revise-order))
+            (is eq :blocked (ai:recover-workflow workflow action :inspection inspection)))
+          ;; Nothing changed or started.
+          (is equal (list mine) (ai::loop-dependencies theirs))
+          (is = prompts (length (fake-prompts codex)))
+          (false (find "no part can go on" (fake-prompts claude) :test #'search))
+          (is eq :deadlock (ai::step-reason (first (ai::workflow-paused workflow)))))))))
+
+(define-test revised-order-prepares-ready-dependent
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex)
+      (run-ordered (responder "Split the work" *lead-first-plan* "Review the work" *approve* "Wrote the function")
+                   (responder "Review the work" *approve* "Wrote the tests"))
+    (declare (ignore claude))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is eq :finished (ai:workflow-state workflow))
+      (setf (ai:workflow-state workflow) :running)
+      (let ((before (length (fake-prompts codex))))
+        ;; Claude's part is unchanged and done; ChatGPT's changes and starts at once.
+        (ai::order-revised workflow (format nil "LEAD TASK:~%The function~%~%PARTNER TASK:~%The tests, more of them~%~%ORDER: LEAD FIRST"))
+        (let ((prompt (nth (- (length (fake-prompts codex)) before 1) (fake-prompts codex))))
+          (true (search "your part changed" prompt))
+          (true (search "Your part builds on work that is now done" prompt))
+          (true (search "Wrote the function" prompt))))
+      (is equal (list (cons mine (ai::loop-revision mine))) (ai::loop-prerequisite-revisions theirs)))))
+
+(define-test revalidation-keeps-partial-reply
+    :parent agent-duet
+  (multiple-value-bind (workflow claude codex)
+      (run-ordered (responder "Split the work" *lead-first-plan* "Review the work" *approve* "Wrote the function")
+                   (lambda (prompt)
+                     (cond ((search "Review the work" prompt) *approve*)
+                           ((search "changed after you started" prompt) "Revalidated the tests")
+                           (t :hang))))
+    (destructuring-bind (mine theirs) (ai:workflow-loops workflow)
+      (is eq :approved (ai::loop-state mine))
+      (is eq :working (ai::loop-state theirs))
+      (setf (ai::agent-partial-text codex) "UNFINISHED DESIGN DETAILS")
+      (setf (fake-replies claude)
+            (let ((old (fake-replies claude)))
+              (lambda (prompt) (if (search "Rework" prompt) :hang (funcall old prompt)))))
+      (ai::loop-work workflow mine "Rework the function")
+      ;; ChatGPT's cancelled turn ends, as a real one does once interrupted.
+      (ai:agent-turn-finished codex "" :interrupted)
+      (let ((step (find theirs (ai::workflow-paused workflow) :key #'ai::step-loop)))
+        (is eq :prerequisite-changed (ai::step-reason step))
+        (true (search "UNFINISHED DESIGN DETAILS" (ai::step-prompt step)))
+        (is string= "UNFINISHED DESIGN DETAILS" (ai::step-progress step)))
+      ;; Started again once the rework is in, it's given what it had written.
+      (ai:agent-turn-finished claude "Reworked the function" nil)
+      (let ((prompt (find "changed after you started" (fake-prompts codex) :test #'search)))
+        (true (search "UNFINISHED DESIGN DETAILS" prompt))
+        (true (search "Reworked the function" prompt))))))
+
+(defun jset (object key value)
+  (setf (cdr (assoc key (cdr object) :test #'string=)) value))
+
+(define-test restore-validates-dependencies
+    :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((prerequisite (first (ai:workflow-loops workflow)))
+           (dependent (ai::make-review-loop :author partner :reviewer lead :task "Dependent" :state :approved)))
+      (setf (ai:workflow-loops workflow) (list prerequisite dependent))
+      (ai:set-workflow-dependencies workflow (list (list dependent prerequisite)))
+      (setf (ai::loop-prerequisite-revisions dependent) (list (cons prerequisite 1)))
+      (flet ((checkpoint () (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+             (restore (checkpoint) (ai:restore-workflow checkpoint :lead lead :partner partner)))
+        (let ((restored (restore (checkpoint))))
+          (destructuring-bind (a b) (ai:workflow-loops restored)
+            (is equal (list a) (ai::loop-dependencies b))
+            (is equal (list (cons a 1)) (ai::loop-prerequisite-revisions b))
+            (is = (ai::loop-revision prerequisite) (ai::loop-revision a))))
+        ;; Waiting for itself, for each other, or for a part that isn't there.
+        (dolist (edges (list (list #(0) #()) (list #(1) #(0)) (list #() #(5))))
+          (let ((checkpoint (checkpoint)))
+            (jset (ai:jget checkpoint "loops" 0) "dependencies" (first edges))
+            (jset (ai:jget checkpoint "loops" 1) "dependencies" (second edges))
+            (fail (restore checkpoint) error)))
+        ;; A revision recorded for a loop it doesn't depend on.
+        (let ((checkpoint (checkpoint)))
+          (jset (ai:jget checkpoint "loops" 1) "dependencies" #())
+          (fail (restore checkpoint) error))
+        ;; An older checkpoint, without revisions, reads as before.
+        (let ((checkpoint (checkpoint)))
+          (dolist (l (ai::jlist (ai:jget checkpoint "loops")))
+            (setf (cdr l) (remove-if (lambda (entry) (member (car entry) '("revision" "prerequisite-revisions")
+                                                                :test #'string=))
+                                     (cdr l))))
+          (setf (cdr checkpoint) (remove-if (lambda (entry) (member (car entry) '("plan-revisions" "prerequisite-merges")
+                                                                    :test #'string=))
+                                            (cdr checkpoint)))
+          (let ((restored (restore checkpoint)))
+            (is = 0 (ai::loop-revision (first (ai:workflow-loops restored))))
+            (false (ai::loop-prerequisite-revisions (second (ai:workflow-loops restored))))))))))
+
+(define-test stale-dependent-not-integrated
+    :parent agent-duet
+  (with-git-folder (repo)
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((prerequisite (first (ai:workflow-loops workflow)))
+           (dependent (ai::make-review-loop :author partner :reviewer lead :task "Dependent" :state :approved)))
+      (ai:stop-workflow workflow)
+      (ai:agent-turn-finished lead "Stopped" :interrupted)
+      (setf (ai:workflow-loops workflow) (list prerequisite dependent)
+            (ai::workflow-paused workflow) nil
+            (ai::loop-state prerequisite) :approved
+            (ai::workflow-integration-state workflow) :committing
+            (ai::workflow-home workflow) repo)
+      (ai:set-workflow-dependencies workflow (list (list dependent prerequisite)))
+      (setf (ai::loop-prerequisite-revisions dependent) (list (cons prerequisite 0)))
+      (true (ai::loop-stale-p dependent))
+      (is eq :blocked (ai::recover-integration workflow))
+      (setf (ai::loop-prerequisite-revisions dependent) (list (cons prerequisite (ai::loop-revision prerequisite))))
+      (false (ai::loop-stale-p dependent))))))
+
+;;; Ordered parts in their own worktrees
+
+(define-test worktree-dependent-gets-prerequisite
+    :parent agent-duet
+  (if (not (fboundp 'ai::merge-prerequisite-into-worktree))
+      (skip "merge-prerequisite-into-worktree isn't here yet" (true nil))
+      (with-git-folder (repo)
+        (multiple-value-bind (claude codex)
+            (worktree-agents repo
+                             (lambda (agent prompt)
+                               (cond ((search "Split the work" prompt) *lead-first-plan*)
+                                     ((search "Produce one combined answer" prompt) "Combined answer")
+                                     ((search "Review the work" prompt) *approve*)
+                                     (t (write-file-text (ai:agent-directory agent) "a.txt" "from Claude") "Wrote a.txt")))
+                             (lambda (agent prompt)
+                               (cond ((search "Review the work" prompt) *approve*)
+                                     (t (write-file-text (ai:agent-directory agent) "b.txt"
+                                                         (format nil "saw ~a" (ignore-errors (read-file-text (ai:agent-directory agent) "a.txt"))))
+                                        "Wrote b.txt"))))
+          (multiple-value-bind (workflow messages) (run-worktrees claude codex)
+            (declare (ignore messages))
+            (is eq :finished (ai:workflow-state workflow))
+            (let ((part (find "Your part builds on work that is now done" (fake-prompts codex) :test #'search)))
+              (true (search "merged into your worktree" part))
+              (true (search "a.txt" part)))
+            ;; ChatGPT's part was done with Claude's merged in, recorded once.
+            (is string= "saw from Claude" (read-file-text repo "b.txt"))
+            (is string= "from Claude" (read-file-text repo "a.txt"))
+            (is = 1 (length (ai::workflow-prerequisite-merges workflow)))
+            (true (every (lambda (l) (eq :approved (ai::loop-state l))) (ai:workflow-loops workflow))))))))
+
+(define-test worktree-prerequisite-merge-conflict
+    :parent agent-duet
+  (if (not (fboundp 'ai::merge-prerequisite-into-worktree))
+      (skip "merge-prerequisite-into-worktree isn't here yet" (true nil))
+      (with-git-folder (repo)
+        (let ((paused '()))
+          (multiple-value-bind (claude codex)
+              (worktree-agents repo
+                               (lambda (agent prompt)
+                                 (cond ((search "Split the work" prompt) *lead-first-plan*)
+                                       ((search "Review the work" prompt) *approve*)
+                                       (t (write-file-text (ai:agent-directory agent) "shared.txt" "from Claude")
+                                          "Changed shared.txt")))
+                               (lambda (agent prompt)
+                                 (declare (ignore agent))
+                                 (cond ((search "Review the work" prompt) *approve*)
+                                       ((search "Explicit recovery" prompt) :hang)
+                                       (t "Wrote the tests"))))
+            (let ((workflow (make-instance 'ai:workflow :mode :divide :lead claude :partner codex :worktrees t
+                                           :request "Add frobnicate"
+                                           :on-pause (lambda (w step) (declare (ignore w)) (push step paused)))))
+              ;; ChatGPT's worktree already has its own, conflicting, edit when Claude's part is done.
+              (setf (fake-replies claude)
+                    (let ((old (fake-replies claude)))
+                      (lambda (prompt)
+                        (unless (search "Split the work" prompt)
+                          (write-file-text (ai:agent-directory codex) "shared.txt" "from ChatGPT"))
+                        (funcall old prompt))))
+              (ai:start-workflow workflow)
+              (let* ((theirs (second (ai:workflow-loops workflow)))
+                     (step (find theirs (ai::workflow-paused workflow) :key #'ai::step-loop)))
+                (is eq :integration-unresolved (ai::step-reason step))
+                (true (member step paused))
+                (true (search "conflicted in" (ai::step-prompt step)))
+                (true (search "shared.txt" (ai::step-prompt step)))
+                (true (ai::merge-in-progress-p (ai::loop-tree theirs)))
+                (false (ai::workflow-prerequisite-merges workflow))
+                ;; Resuming lets its agent resolve it in its worktree.
+                (is eq :started (ai:recover-workflow workflow :resume :step step :acknowledge-changes t))
+                (true (search "conflicted in" (first (fake-prompts codex)))))
+              (ai:stop-workflow workflow)))))))
