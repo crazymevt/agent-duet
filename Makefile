@@ -26,6 +26,7 @@ dev:
 
 # Build the program: bin/agent-duet (it needs GTK installed where it runs)
 build:
+	mkdir -p bin
 	$(RUN) --eval '(ql:quickload :agent-duet)' --eval '(gtk4:save-executable "bin/agent-duet" (function agent-duet:main))'
 
 # The macOS app: build/Agent Duet.app (GTK, libadwaita and VTE come from Homebrew)

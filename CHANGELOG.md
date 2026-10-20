@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 - 2026-10-20
 
+- Automated builds for macOS (Apple Silicon and Intel) and Linux x86_64;
+  version tags publish archives and SHA-256 checksums on GitHub Releases.
 - Long prompts in the agent panes (reviews quote whole diffs) show their
   first 2,000 characters, with *Show all*. Resizing the window rewrapped
   them in full every frame, which made it lag.
@@ -29,7 +31,6 @@
 - Drop files or images on an agent's message box to attach them to the next
   message: their paths are listed, and images are shown to the agent. On the
   middle request box, dropped files' paths are typed in.
-
 - The panes no longer leave a new message, card or question just below the
   visible area until you scroll: following the end now waits until the
   content has been laid out.

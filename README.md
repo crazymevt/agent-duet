@@ -219,6 +219,46 @@ The menu at the top right:
 
 Both must be signed in first: `claude auth login` and `codex login`.
 
+## Downloads and releases
+
+[GitHub Releases](https://github.com/crazymevt/agent-duet/releases) provides
+versioned macOS ZIPs (arm64 for Apple Silicon, x86_64 for Intel) and a Linux
+x86_64 tarball, with SHA-256 checksum files. SBCL and the Lisp dependencies
+are included; install the native libraries and the Claude and Codex CLIs
+separately, and sign in to both CLIs.
+
+The Apple Silicon download requires macOS 14 or later; the Intel download
+requires macOS 15 or later. Install `brew install gtk4 libadwaita vte3`,
+extract the ZIP and move **Agent Duet.app** to Applications. These builds are signed ad hoc and
+are not notarized; macOS may require allowing the app in **System Settings
+→ Privacy & Security** after the first attempt to open it.
+
+The Linux build targets Ubuntu 24.04 x86_64 (or a compatible system with
+glibc 2.39+, GTK 4.14+ and libadwaita 1.5+). Install its runtime libraries:
+
+```sh
+sudo apt-get install libgtk-4-1 libadwaita-1-0 libvte-2.91-gtk4-0
+```
+
+Extract the tarball and run `./agent-duet` from the extracted folder in a
+graphical desktop session. No local Lisp installation is needed.
+To check an archive, run `shasum -a 256 -c <archive>.sha256` in the directory
+containing the archive and its checksum file.
+
+The **Builds** workflow tests and packages all three platforms on pushes
+to `main`, version tags, and manual runs; downloads are available in
+that workflow run's artifacts. After merging a release, create and push a
+tag matching the version in `agent-duet.asd` to publish a GitHub Release:
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+A mismatched tag fails the build, and publication waits for all three
+platforms to pass. For the next release, update both system versions in
+`agent-duet.asd` and the changelog before tagging.
+
 ## Running
 
 On macOS, GTK must run on the process's first thread. In Cadre, **Run GTK App**
@@ -245,7 +285,9 @@ Finder or the Dock, it takes `PATH` from your login shell, so `claude`, `codex`
 and your tools are found as in a terminal, and it starts in the last folder you
 used (your home folder the first time). Its output goes to
 `~/.local/state/agent-duet/agent-duet.log`. It's signed ad hoc, or with
-`CODESIGN_IDENTITY` if that's set.
+`CODESIGN_IDENTITY` if that's set. Locally built apps declare the build
+host's macOS version as their minimum, matching the Homebrew runtime and
+libraries used to build them.
 
 ## Layout of the code
 

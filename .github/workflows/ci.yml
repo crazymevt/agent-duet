@@ -54,5 +54,6 @@ jobs:
           if [ ! -d "$HOME/quicklisp/local-projects/gtk4/.git" ]; then
             git clone https://github.com/crazymevt/gtk4.git "$HOME/quicklisp/local-projects/gtk4"
           fi
-          git -C "$HOME/quicklisp/local-projects/gtk4" checkout 4f7ac6daf9de3f4fce1ca75b0f5dbf56681fac70
+          git -C "$HOME/quicklisp/local-projects/gtk4" fetch origin 4f7ac6daf9de3f4fce1ca75b0f5dbf56681fac70
+          git -C "$HOME/quicklisp/local-projects/gtk4" checkout --detach FETCH_HEAD
       - run: make ${{ matrix.target }}

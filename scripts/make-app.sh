@@ -15,6 +15,9 @@ cd "$(dirname "$0")/.."
 
 sbcl=${SBCL:-sbcl}
 identity=${CODESIGN_IDENTITY:--}
+# Homebrew's runtime and libraries target the build host's macOS release.
+# Use that conservative minimum for both the launcher and bundle metadata.
+minimum_macos=$(sw_vers -productVersion | cut -d. -f1,2)
 core=build/app/agent-duet.core
 app="build/Agent Duet.app"
 version=$(sed -n 's/.*:version "\([^"]*\)".*/\1/p' agent-duet.asd | head -1)
@@ -27,7 +30,7 @@ cp "$core" "$contents/Resources/agent-duet.core"
 cp LICENSE "$contents/Resources/LICENSE"
 
 # The launcher, and the runtime that saved the core (they must match).
-cc -O2 -Wall -mmacosx-version-min=12.0 -o "$contents/MacOS/Agent Duet" packaging/macos/launcher.c
+cc -O2 -Wall -mmacosx-version-min="$minimum_macos" -o "$contents/MacOS/Agent Duet" packaging/macos/launcher.c
 runtime=$("$sbcl" --noinform --non-interactive --no-userinit --no-sysinit --eval '(princ sb-ext:*runtime-pathname*)')
 cp "$runtime" "$contents/MacOS/sbcl"
 chmod u+w "$contents/MacOS/sbcl"
@@ -55,7 +58,7 @@ cat > "$contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
-  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSMinimumSystemVersion</key><string>$minimum_macos</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Jessie Hughart. MIT License.</string>
 </dict>
