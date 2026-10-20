@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Recovering a task: its state is saved with the conversation as it goes.
+  Reopening one that was interrupted (the app quit mid-task) or stopped
+  shows where it stopped, what was done and written, each agent's
+  availability, unreviewed work, and what the folder and worktrees look like
+  now; nothing runs until *Review what's there*, *Resume*, *Redo the step*,
+  *Hand off*, *Stop task* or *Abandon* is chosen. Histories from earlier
+  versions open as before.
+- During a task, an agent pane's *Stop* is *Pause*: only that agent's part
+  pauses. Pause cards say why a step paused (out of usage, failed, paused by
+  you) and offer *Resume*, *Retry step*, *Hand off* and *Stop task*; a
+  hand-off waits until the stopped turn is confirmed gone. The middle pane's
+  *Stop* keeps the task recoverable.
 - Split worktree tasks combine both parts' written replies, including parts
   with no file changes, before reviewing the merged result. Worktrees and
   task-scoped recovery refs are kept until approval; unfinished tasks report

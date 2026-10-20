@@ -437,7 +437,11 @@ for Codex, the one marked as the default)."
                               (set-attachments pane '()))
                      (error (e) (pane-note pane (princ-to-string e) "error")))))))
         (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (send-it)))
-        (gobject:connect stop :clicked (lambda (b) (declare (ignore b)) (agent-cancel agent)))
+        (gobject:connect stop :clicked (lambda (b) (declare (ignore b))
+                                         ;; In a task, only this agent's part pauses.
+                                         (if (and (workflow-running-p) (workflow-agent-p *workflow* agent))
+                                             (pause-workflow-agent *workflow* agent)
+                                             (agent-cancel agent))))
         (on-return input #'send-it))
       (setf (agent-listener agent) #'agent-pane-event)
       (multiple-value-bind (models efforts) (make-model-dropdowns pane)
@@ -526,6 +530,13 @@ for Codex, the one marked as the default)."
   (let ((agent (agent-pane-agent pane)))
     (gtk:button-set-label (pane-send pane) (if busy "Send now" "Send"))
     (gtk:widget-set-visible (agent-pane-stop pane) busy)
+    (let ((in-task (and (workflow-running-p) (workflow-agent-p *workflow* agent))))
+      (gtk:button-set-label (agent-pane-stop pane) (if in-task "Pause" "Stop"))
+      (gtk:widget-set-tooltip-text (agent-pane-stop pane)
+                                   (if in-task
+                                       (format nil "Pause ~a's part of the task; work that doesn't depend on it carries on"
+                                               (agent-name agent))
+                                       (format nil "Stop ~a" (agent-name agent)))))
     (gtk:widget-set-tooltip-text (pane-send pane)
                                  (if busy (format nil "Send to ~a while it keeps working" (agent-name agent))
                                      (format nil "Talk to ~a alone" (agent-name agent))))
@@ -888,6 +899,9 @@ comes without one (a turn stopped as the folder changes) isn't kept."
       (pane-note *middle* "Stop the agents before starting a new conversation." "error")
       (progn
         (finish-history)
+        (setf *workflow* nil
+              *recovery-card* nil)
+        (update-controls)
         (dolist (agent (list *claude* *codex*))
           (agent-new-conversation agent)
           (clear-agent-pane (agent-pane-of agent)))
@@ -954,10 +968,16 @@ comes without one (a turn stopped as the folder changes) isn't kept."
       (clear-box (pane-messages *middle*))
       (clear-checklist)
       (replay-history history)
-      (setf *history* history)
+      (setf *history* history
+            *workflow* nil
+            *recovery-card* nil)
       (pane-note *middle* (format nil "Carrying on the conversation from ~a. Each agent picks it up at its next message."
                                   (format-history-time (history-updated history)))
-                 "dim-label" "duet-note")))))
+                 "dim-label" "duet-note")
+      ;; A task that stopped partway: shown as it was left, nothing run.
+      (when (history-recoverable-p history)
+        (offer-recovery history))
+      (update-controls)))))
 
 (defun fill-history-list (box popover)
   (clear-box box)
@@ -1199,11 +1219,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                           (cond ((not running) "")
                                 ((workflow-pending-plan *workflow*) "Waiting for you to approve the plan")
                                 ((workflow-paused *workflow*)
-                                 (format nil "Paused: ~a out of usage"
-                                         (format nil "~{~a~^ and ~}"
-                                                 (remove-duplicates (mapcar (lambda (s) (agent-name (step-agent s)))
-                                                                            (workflow-paused *workflow*))
-                                                                    :test #'string=))))
+                                 (format nil "Paused: ~a" (pause-summary *workflow*)))
                                 (t (format nil "Working · ~{~a~^, ~}"
                                            (or (loop for a in (list *claude* *codex*)
                                                      when (agent-busy a) collect (agent-name a))
@@ -1275,7 +1291,9 @@ its part in the task (working, reviewing, waiting…), or its own status."
       (let ((working (in #'loop-author :working))
             (usage (usage-summary (agent-usage-windows agent))))
         (cond ((not workflow) (gtk:label-get-text (pane-status pane)))
-              ((find agent (workflow-paused workflow) :key #'step-agent) "Paused: out of usage")
+              ((find agent (workflow-paused workflow) :key #'step-agent)
+               (format nil "Paused: ~a" (step-reason-text (step-reason (find agent (workflow-paused workflow)
+                                                                             :key #'step-agent)))))
               ;; Usage left, as the agent's pane shows it, after its part in the task.
               (t (format nil "~a~@[ · ~a left~]"
                          (cond ((plusp (hash-table-count (agent-pane-approvals pane))) "Waiting for you")
@@ -1328,10 +1346,19 @@ doing, with its model and thinking level, shown in the conversation-only view."
       (setf *controls* (list* :activity strip :claude-activity claude :codex-activity codex *controls*))
       strip))))
 
-;;; A step paused because its agent ran out of usage
+;;; A step paused: its agent ran out of usage, failed, or was paused by the
+;;; user. Whatever is chosen goes through RECOVER-WORKFLOW (workflow.lisp),
+;;; as recovering a reopened task does (below).
 
 (defvar *pause-timers* '() "(step . glib source id): steps set to resume when usage resets.")
-(defvar *pause-cards* '() "(step . refresh function) for the pause cards still waiting on a choice.")
+(defvar *pause-cards* '()
+  "(step refresh settle) for the pause cards still waiting on a choice:
+REFRESH follows the agent's usage, SETTLE takes the buttons away with a word.")
+(defvar *closing* nil "True once the window is closing: no more cards.")
+
+(defparameter *shutdown-wait-seconds* 30
+  "How long a hand-off or resume waits for the stopped turn, and its editing
+processes, to be confirmed gone before the card says they haven't.")
 
 (defun clear-pause-timer (step)
   (let ((entry (assoc step *pause-timers*)))
@@ -1339,10 +1366,54 @@ doing, with its model and thinking level, shown in the conversation-only view."
       (ignore-errors (glib:source-remove (cdr entry)))
       (setf *pause-timers* (remove entry *pause-timers*)))))
 
-(defun clear-pause-timers ()
+(defun clear-pause-timers (&optional (why "Stopped"))
+  "Stop waiting for usage to reset, and settle the pause cards with WHY."
   (dolist (entry *pause-timers*) (ignore-errors (glib:source-remove (cdr entry))))
-  (setf *pause-timers* '()
-        *pause-cards* '()))
+  (let ((cards *pause-cards*))
+    (setf *pause-timers* '()
+          *pause-cards* '())
+    (dolist (entry cards) (ignore-errors (funcall (third entry) why)))))
+
+(defun later (thunk)
+  "Call THUNK from the main loop once what's under way now has finished."
+  (glib:timeout-add-seconds glib:+priority-default+ 0 (lambda () (unless *closing* (funcall thunk)) nil)))
+
+(defun attempt-recovery (workflow action report &key step acknowledge-changes (while (constantly t)))
+  "RECOVER-WORKFLOW, telling REPORT the outcome: :started, :stopped,
+:abandoned, :repository-changed, :blocked, :unavailable, or (:error text).
+Waiting for an agent's turn and editing processes to stop, nothing starts:
+it is tried again every 2 seconds, REPORT told :pending-shutdown each time,
+until they have stopped, or *SHUTDOWN-WAIT-SECONDS* pass and REPORT is told
+:shutdown-unconfirmed, or WHILE returns false (the user chose otherwise)."
+  (let ((started (get-universal-time)))
+    (flet ((try ()
+             (when (and (eq workflow *workflow*) (funcall while))
+               (let ((result (handler-case (recover-workflow workflow action :step step
+                                                             :acknowledge-changes acknowledge-changes)
+                               (error (e) (list :error (princ-to-string e))))))
+                 (cond ((not (eq result :pending-shutdown)) (funcall report result) nil)
+                       ((> (- (get-universal-time) started) *shutdown-wait-seconds*)
+                        (funcall report :shutdown-unconfirmed) nil)
+                       (t (funcall report :pending-shutdown) t))))))
+      (when (try)
+        (glib:timeout-add-seconds glib:+priority-default+ 2 #'try)))
+    (update-controls)))
+
+(defun recovery-outcome-text (result agent)
+  "What RESULT (ATTEMPT-RECOVERY's) means for the user; AGENT the one it was for."
+  (let ((name (if agent (agent-name agent) "The agent")))
+    (cond ((eq result :pending-shutdown)
+           (format nil "Waiting for ~a's stopped turn to finish stopping. Nothing starts until it has." name))
+          ((eq result :shutdown-unconfirmed)
+           (format nil "~a's stopped turn, or a process it started, still hasn't stopped, so nothing has been ~
+started: the same files could be edited twice. Try again in a moment, or stop the task." name))
+          ((eq result :repository-changed)
+           "The folder or a worktree has changed since this stopped. Look at what's there; Carry on anyway goes on from it as it is now.")
+          ((eq result :blocked)
+           "It can't carry on yet: a folder or worktree is missing or in the middle of a merge, or work this depends on isn't finished.")
+          ((eq result :unavailable) (format nil "~a is out of usage." name))
+          ((and (consp result) (eq (first result) :error)) (format nil "That didn't work: ~a" (second result)))
+          (t nil))))
 
 (defun resume-when-reset (workflow step reset)
   "Give STEP to its agent again a minute after RESET (a universal time)."
@@ -1351,8 +1422,16 @@ doing, with its model and thinking level, shown in the conversation-only view."
     (push (cons step (glib:timeout-add-seconds glib:+priority-default+ seconds
                                                (lambda ()
                                                  (setf *pause-timers* (remove step *pause-timers* :key #'car))
-                                                 (resume-step workflow step)
-                                                 (update-controls)
+                                                 (let ((entry (assoc step *pause-cards*)))
+                                                   (attempt-recovery
+                                                    workflow :resume
+                                                    (lambda (result)
+                                                      (let ((text (recovery-outcome-text result (step-agent step))))
+                                                        (cond ((member result '(:started :pending-shutdown)))
+                                                              (text (pane-note *middle* text "error")))
+                                                        (when (and entry (eq result :started))
+                                                          (funcall (third entry) "Carried on"))))
+                                                    :step step))
                                                  nil)))
           *pause-timers*)))
 
@@ -1360,29 +1439,61 @@ doing, with its model and thinking level, shown in the conversation-only view."
   "AGENT's usage changed: its cards may now know when it resets."
   (dolist (entry *pause-cards*)
     (when (eq (step-agent (car entry)) agent)
-      (funcall (cdr entry)))))
+      (funcall (second entry)))))
 
 (defun show-paused-step (workflow step)
-  "A card in the conversation: the step that paused, and what to do about it.
-It follows the agent's usage: a reset time learned later (Codex reads its
-usage after the turn) brings the Wait button."
+  "A step paused (ON-PAUSE). Stopping the task pauses every step under way:
+then the task's recovery card stands for them all, so wait to see."
+  (later (lambda ()
+           (when (and (eq workflow *workflow*) (workflow-live-p workflow)
+                      (member step (workflow-paused workflow)))
+             (show-paused-step-card workflow step)))))
+
+(defun show-paused-step-card (workflow step)
+  "A card in the conversation: the step that paused, why, and what to do
+about it. Out of usage, it follows the agent's usage: a reset time learned
+later (Codex reads its usage after the turn) brings the Wait button."
   (let* ((agent (step-agent step))
          (other (other-agent workflow agent))
+         (reason (step-reason step))
+         (usage (eq reason :out-of-usage))
+         (role (step-role step))
          (heading (make-instance 'gtk:label :xalign 0.0 :css-classes '("heading")))
          (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
          (status (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("dim-label") :visible nil))
          (wait-button nil)
-         (waiting-for nil))                     ; the reset being waited for, once Wait is chosen
-    (attention (format nil "~a is out of usage" (agent-name agent))
+         (waiting-for nil)                      ; the reset being waited for, once Wait is chosen
+         (attempt 0))                           ; which choice a pending wait belongs to
+    (attention (format nil "~a: ~a" (agent-name agent) (step-reason-text reason))
                (format nil "~a is paused." (string-capitalize (step-description step) :end 1)))
     (labels ((reset () (and (integerp (agent-out-until agent)) (agent-out-until agent)))
              (settled (text)
                (setf *pause-cards* (remove step *pause-cards* :key #'car))
                (clear-pause-timer step)
+               (incf attempt)
                (clear-box buttons)
                (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label")))
                (gtk:widget-set-visible status nil)
                (update-controls))
+             (say (text &optional (classes '("dim-label")))
+               (gtk:label-set-text status text)
+               (gtk:widget-set-css-classes status classes)
+               (gtk:widget-set-visible status t))
+             (choose (action done &key acknowledge-changes)
+               (let ((mine (incf attempt)))
+                 (attempt-recovery workflow action
+                                   (lambda (result)
+                                     (case result
+                                       ((:started :stopped) (settled done))
+                                       (t (say (recovery-outcome-text result (if (eq action :hand-off) other agent))
+                                               (if (eq result :pending-shutdown) '("dim-label") '("warning")))
+                                        (when (eq result :repository-changed) (offer-anyway action done)))))
+                                   :step step :acknowledge-changes acknowledge-changes
+                                   :while (lambda () (= attempt mine)))))
+             (offer-anyway (action done)
+               (unless (find "Carry on anyway" (gtk-children buttons) :key #'button-label-or-nil :test #'equal)
+                 (choice "Carry on anyway" "Go on from the folder and worktrees as they are now" '()
+                         (lambda () (choose action done :acknowledge-changes t)))))
              (choice (label tooltip classes action)
                (let ((b (make-instance 'gtk:button :label label :tooltip-text tooltip :css-classes classes)))
                  (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (funcall action)))
@@ -1393,13 +1504,16 @@ usage after the turn) brings the Wait button."
                  (when reset
                    (setf waiting-for reset)
                    (resume-when-reset workflow step reset)
-                   (gtk:label-set-text status (format nil "Waiting: ~a will carry on at about ~a. Leave the app open."
-                                                      (agent-name agent) (format-reset-time (+ reset 60))))
-                   (gtk:widget-set-visible status t))))
+                   (say (format nil "Waiting: ~a will carry on at about ~a. Leave the app open."
+                                (agent-name agent) (format-reset-time (+ reset 60)))))))
              (refresh ()
-               (let ((reset (reset)))
-                 (gtk:label-set-text heading (format nil "~a is out of usage~@[ until ~a~]" (agent-name agent)
-                                                     (and reset (format-reset-time reset))))
+               (let ((reset (and usage (reset))))
+                 (gtk:label-set-text heading
+                                     (if usage
+                                         (format nil "~a is out of usage~@[ until ~a~]" (agent-name agent)
+                                                 (and reset (format-reset-time reset)))
+                                         (format nil "~a: ~a" (string-capitalize (step-description step) :end 1)
+                                                 (step-reason-text reason))))
                  (when reset
                    (unless wait-button
                      (setf wait-button (choice "" (format nil "Send it to ~a again once its usage resets" (agent-name agent))
@@ -1408,41 +1522,390 @@ usage after the turn) brings the Wait button."
                    ;; Already waiting, for a reset that has moved: wait for the new one.
                    (when (and waiting-for (/= waiting-for reset))
                      (wait))))))
-      (choice "Stop" "Stop the whole task here" '("destructive-action")
-              (lambda () (stop-workflow workflow) (settled "Stopped")))
-      (let ((hand-off (choice (case (step-role step)
+      (choice "Stop task" "Stop both agents; the task can be recovered later" '("destructive-action")
+              (lambda () (incf attempt) (stop-workflow workflow) (settled "Stopped")))
+      (let ((hand-off (choice (case role
                                 (:review "Finish unreviewed")
                                 (:propose "Go without it")
-                                (t (format nil "Let ~a take over" (agent-name other))))
-                              (case (step-role step)
+                                (t (format nil "Hand off to ~a" (agent-name other))))
+                              (case role
                                 (:review "Finish this part without a review, and say so")
                                 (:propose (format nil "Carry on with ~a's proposal alone" (agent-name other)))
-                                (t (format nil "~a carries on from where ~a stopped; its work won't be reviewed"
+                                (t (format nil "~a carries on from what ~a has done so far; its work won't be reviewed"
                                            (agent-name other) (agent-name agent))))
                               '()
-                              (lambda () (settled (case (step-role step)
-                                                    (:review "Finished unreviewed")
-                                                    (:propose "Went without it")
-                                                    (t (format nil "Handed to ~a" (agent-name other)))))
-                                (hand-off-step workflow step)))))
+                              (lambda () (choose :hand-off (case role
+                                                             (:review "Finished unreviewed")
+                                                             (:propose "Went without it")
+                                                             (t (format nil "Handed to ~a" (agent-name other)))))))))
         ;; Only taking work over needs the other agent's usage.
-        (unless (or (member (step-role step) '(:review :propose)) (can-hand-off-p workflow step))
+        (when (or (eq role :check)
+                  (and (not (member role '(:review :propose))) (agent-out-of-usage-p other)))
           (gtk:widget-set-sensitive hand-off nil)
-          (gtk:widget-set-tooltip-text hand-off (format nil "~a is out of usage too" (agent-name other)))))
-      (choice "Try again" (format nil "Send it to ~a again now" (agent-name agent)) '()
-              (lambda () (settled "Tried again") (resume-step workflow step)))
+          (gtk:widget-set-tooltip-text hand-off (if (eq role :check) "A check is run again, not handed off"
+                                                    (format nil "~a is out of usage too" (agent-name other))))))
+      (choice (if usage "Try again" "Retry step")
+              (format nil "Give ~a the step again, as it was first given" (agent-name agent)) '()
+              (lambda () (choose :retry "Tried again")))
+      (unless usage
+        (choice "Resume" (format nil "~a carries on from where it stopped, shown what's already done first"
+                                 (agent-name agent))
+                '("suggested-action") (lambda () (choose :resume "Resumed"))))
       (refresh)
-      (push (cons step #'refresh) *pause-cards*)
+      (push (list step #'refresh #'settled) *pause-cards*)
       (pane-append *middle*
                    (gtk:build
                     (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
                              heading
-                             (gtk:label :label (format nil "~a is paused. Nothing done so far is lost."
-                                                       (string-capitalize (step-description step) :end 1))
+                             (gtk:label :label (format nil "~a is paused~:[~; while ~a carries on with work that doesn't depend on it~]. ~
+Nothing done so far is lost~@[: what it had written is kept~]."
+                                                       (string-capitalize (step-description step) :end 1)
+                                                       (agent-busy other) (agent-name other)
+                                                       (step-progress step))
                                         :xalign 0.0 :wrap t)
                              status
                              buttons))))
     (update-controls)))
+
+(defun gtk-children (box)
+  (loop for child = (gtk:widget-get-first-child box) then (gtk:widget-get-next-sibling child)
+        while child collect child))
+
+(defun button-label-or-nil (widget)
+  (and (typep widget 'gtk:button) (gtk:button-get-label widget)))
+
+(defun pause-summary (workflow)
+  "Who is paused, and why: \"Claude out of usage, ChatGPT paused or stopped by you\"."
+  (format nil "~{~a~^, ~}"
+          (remove-duplicates (mapcar (lambda (s) (format nil "~a ~a" (agent-name (step-agent s))
+                                                         (step-reason-text (step-reason s))))
+                                     (workflow-paused workflow))
+                             :test #'string=)))
+
+;;; Recovering a task that stopped: reopened after a restart, or stopped by
+;;; the user. Its checkpoint is saved with the history whenever it changes;
+;;; reopened, it is restored (RESTORE-WORKFLOW) but nothing runs until the
+;;; user chooses (docs/recovery-api.md).
+
+(defvar *checkpoint-failed* nil "The workflow whose checkpoint last failed to save, so it's said once.")
+(defvar *recovery-card* nil "(workflow . refresh function) for the recovery card still offering choices.")
+
+(defun save-workflow-checkpoint (workflow)
+  "WORKFLOW's state changed (ON-CHECKPOINT): keep its checkpoint with the
+history, saved at once, so a restart finds where the task had got to."
+  (when (and (eq workflow *workflow*) *directory* (not *closing*))
+    (unless *history* (setf *history* (make-history *directory*)))
+    (handler-case
+        (progn (record-history-checkpoint *history* (workflow-checkpoint workflow))
+               (save-current-history))
+      (error (e)
+        (unless (eq *checkpoint-failed* workflow)
+          (setf *checkpoint-failed* workflow)
+          (pane-note *middle* (format nil "The task's progress couldn't be saved for recovery: ~a" e) "error"))))))
+
+(defun workflow-callbacks ()
+  "The callbacks every workflow gets, new or restored."
+  (list :on-message #'middle-message :on-pause #'show-paused-step :on-plan #'show-plan-card
+        :on-finish #'workflow-finished :on-checkpoint #'save-workflow-checkpoint))
+
+(defun restore-history-workflow (history)
+  "HISTORY's task, restored with this app's agents: lead first, as saved.
+Nothing runs. Returns nil, and why, if it can't be."
+  (let* ((checkpoint (history-checkpoint history))
+         (lead-id (jget checkpoint "agents" 0 "id"))
+         (lead (if (equal lead-id "codex") *codex* *claude*)))
+    (handler-case (values (apply #'restore-workflow checkpoint
+                                 :lead lead :partner (if (eq lead *claude*) *codex* *claude*)
+                                 (workflow-callbacks))
+                          nil)
+      (error (e) (values nil (princ-to-string e))))))
+
+(defun truncated (text limit)
+  (if (> (length text) limit) (format nil "~a…" (subseq text 0 limit)) text))
+
+(defun recovery-detail-lines (summary inspection workflow)
+  "The recovery card's lines: (text . css classes), from the checkpoint's
+SUMMARY and, once it's read, INSPECTION's of the repository now."
+  (let ((lines '()))
+    (flet ((line (classes fmt &rest args) (push (cons (apply #'format nil fmt args) classes) lines)))
+      (let ((step (getf summary :step))
+            (integration (getf summary :integration)))
+        (when (getf summary :request)
+          (line '("dim-label") "The request: ~a" (truncated (getf summary :request) 200)))
+        (cond (step
+               (line '() "Stopped at ~a: ~a." (getf step :description) (step-reason-text (getf step :reason)))
+               (when (getf step :progress)
+                 (line '("dim-label") "What ~a had written by then: ~a" (or (getf step :agent) "it")
+                       (truncated (getf step :progress) 300)))
+               (let ((others (remove step (getf summary :steps))))
+                 (when others
+                   (line '() "Also waiting: ~{~a~^; ~}." (mapcar (lambda (s) (getf s :description)) others)))))
+              ((getf summary :pending-plan)
+               (line '() "Stopped while the plan was waiting for your approval."))
+              ((getf integration :state)
+               (line '() "Stopped while bringing the parts together (~a)." (getf integration :state)))
+              (t (line '() "No step was under way.")))
+        (when (getf integration :committed)
+          (line '("dim-label") "Committed on their branches: ~{~a~^; ~}." (getf integration :committed)))
+        (when (getf integration :merged)
+          (line '("dim-label") "Already merged, not to be repeated: ~{~a~^; ~}." (getf integration :merged)))
+        (dolist (l (getf summary :loops))
+          (line (if (getf l :unreviewed) '("warning") '("dim-label"))
+                "~a: ~a~@[, ~d review~:p done~]~:[~;, not reviewed~]"
+                (or (getf l :label) (format nil "~@[~a's ~]work" (getf l :author)))
+                (or (getf l :state) "unknown") (getf l :round) (getf l :unreviewed)))
+        (when (getf summary :unreviewed)
+          (line '("warning") "Work no one has reviewed: ~{~a~^, ~}. It stays marked unreviewed."
+                (getf summary :unreviewed)))
+        ;; The agents: from the inspection once there, else as saved.
+        (let ((agents (or (getf inspection :agents) (getf summary :agents))))
+          (when agents
+            (line '() "~{~a~^ · ~}"
+                  (mapcar (lambda (a)
+                            (let* ((agent (find (getf a :agent) (list *claude* *codex*) :key #'agent-name :test #'equal))
+                                   (until (or (and agent (integerp (agent-out-until agent)) (agent-out-until agent))
+                                              (getf a :unavailable-until)))
+                                   (out (and until (> until (get-universal-time)))))
+                              (format nil "~a: ~:[~:[available~;still working~]~;out of usage until ~a~]"
+                                      (getf a :agent) out (if out (format-reset-time until) (getf a :busy)))))
+                          agents))))
+        (dolist (tree (getf summary :worktrees))
+          (let ((now (find (getf tree :path) (getf inspection :repositories) :key (lambda (r) (getf r :path))
+                                                                                :test #'equal)))
+            (line (if (and now (not (getf now :available))) '("warning") '("dim-label"))
+                  "~@[~a's ~]worktree, ~a~@[ (~a)~]~:[~;: missing~]" (getf tree :agent) (getf tree :path)
+                  (getf tree :branch) (and now (not (getf now :available))))))
+        (cond
+          ((null inspection) (line '("dim-label") "Looking at the folder and worktrees as they are now…"))
+          (t
+           (when (getf inspection :changed)
+             (line '("warning") "The folder or a worktree has changed since the task stopped."))
+           (dolist (r (getf inspection :repositories))
+             (cond
+               ((not (getf r :available))
+                (line '("warning") "~a: ~a" (getf r :path) (or (getf r :error) "not there")))
+               (t
+                (line '() "~a~@[ on ~a~]~@[ at ~a~]: ~:[nothing uncommitted~;~:*~d changed file~:p~@[: ~{~a~^, ~}~]~]"
+                      (getf r :path) (getf r :branch) (getf r :head)
+                      (let ((files (getf r :files))) (and files (length files)))
+                      (let ((files (getf r :files)))
+                        (append (mapcar #'cdr (subseq files 0 (min 8 (length files))))
+                                (and (> (length files) 8) (list "…")))))
+                (when (getf r :new-commits) (line '("warning") "  New commits since it stopped."))
+                (when (getf r :branch-was) (line '("warning") "  The branch was ~a then." (getf r :branch-was)))
+                (when (getf r :operation)
+                  (line '("warning") "  A merge (or rebase, cherry-pick…) is in progress there.")))))
+           (when (getf inspection :recovery-refs)
+             (line '("dim-label") "Recovery refs kept for: ~{~a~^, ~}." (getf inspection :recovery-refs))))))
+      (unless workflow
+        (line '("warning") "This task can't be carried on here, only looked at or abandoned.")))
+    (nreverse lines)))
+
+(defun step-agent-other (step)
+  "The agent that would take over STEP (a CHECKPOINT-SUMMARY step)."
+  (let ((name (getf step :agent)))
+    (cond ((equal name (agent-name *claude*)) *codex*)
+          ((equal name (agent-name *codex*)) *claude*))))
+
+(defun show-recovery-card (workflow history &key restore-error)
+  "A card for a task that stopped before it finished: where it stopped, its
+progress, the agents, what the folder and worktrees look like now, and the
+choices. WORKFLOW is the task (restored, or stopped here), or nil when it
+couldn't be restored (RESTORE-ERROR says why): then it can only be looked at
+or abandoned. Nothing is done until a choice is made."
+  (let* ((card (make-instance 'gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")))
+         (heading (make-instance 'gtk:label :xalign 0.0 :css-classes '("heading")))
+         (details (make-instance 'gtk:box :orientation :vertical :spacing 2))
+         (status (make-instance 'gtk:label :xalign 0.0 :wrap t :visible nil))
+         (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+         (inspection nil)
+         (inspecting nil)
+         (attempt 0)
+         (confirm-abandon nil)
+         (anyway nil)                   ; the action to offer carrying on with, the folder having changed
+         (chosen nil)                   ; the id of the step chosen, when more than one waits
+         (steps (make-instance 'gtk:box :spacing 6 :visible nil))
+         (done nil))
+    (labels ((checkpoint ()
+               ;; As saved: strings where the workflow has keywords.
+               (or (and workflow (ignore-errors (json-copy (workflow-checkpoint workflow))))
+                   (and history (history-checkpoint history))))
+             (current-p () (or (null workflow) (eq workflow *workflow*)))
+             (say (text &optional (classes '("dim-label")))
+               (gtk:label-set-text status (or text ""))
+               (gtk:widget-set-css-classes status classes)
+               (gtk:widget-set-visible status (and text t)))
+             (settled (text)
+               (setf done t)
+               (incf attempt)
+               (say nil)
+               (when (eq (car *recovery-card*) workflow) (setf *recovery-card* nil))
+               (clear-box buttons)
+               (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label")))
+               (update-controls))
+             (look ()
+               (when (and workflow (not inspecting))
+                 (setf inspecting t)
+                 (let ((checkpoint (checkpoint)))
+                   (in-background "duet-recovery-inspection"
+                                  (lambda () (json-copy (recover-workflow workflow :review)))
+                                  (lambda (value why)
+                                    (setf inspecting nil)
+                                    (cond (why (say (format nil "Couldn't look at the folder: ~a" why) '("warning")))
+                                          (t (setf inspection (inspection-summary value checkpoint))))
+                                    (render))))))
+             (choose (action &key acknowledge-changes)
+               (let* ((mine (incf attempt))
+                      (summary (summary))
+                      (step (getf (getf summary :step) :id)))
+                 (setf anyway nil)
+                 (attempt-recovery
+                  workflow action
+                  (lambda (result)
+                    (case result
+                      (:started
+                       (let ((what (case action (:resume "Resumed") (:retry "Redoing the step") (t "Handed off"))))
+                         ;; Other steps still waiting keep the card, to choose for them too.
+                         (if (and workflow (workflow-paused workflow))
+                             (progn (setf chosen nil inspection nil)
+                                    (say (format nil "~a. Still waiting: ~{~a~^; ~}." what
+                                                 (mapcar #'step-description (workflow-paused workflow))))
+                                    (render) (look))
+                             (settled what))))
+                      (:awaiting-plan (settled "The plan is shown again below"))
+                      (:restored (setf inspection nil) (say "Restored the missing worktrees from their recovery refs. Uncommitted edits made in them couldn't be recovered.")
+                       (render) (look))
+                      (:stopped (setf inspection nil) (say "Stopped. The task can still be recovered here, or when its conversation is reopened.")
+                       (render) (look))
+                      (t (say (recovery-outcome-text
+                               result (let ((agent (find (getf (getf summary :step) :agent)
+                                                         (list *claude* *codex*) :key #'agent-name :test #'equal)))
+                                        (if (and agent (eq action :hand-off)) (other-agent workflow agent) agent)))
+                              (if (eq result :pending-shutdown) '("dim-label") '("warning")))
+                       (when (eq result :repository-changed)
+                         (setf inspection nil
+                               anyway action)
+                         (render)
+                         (look)))))
+                  :step step :acknowledge-changes acknowledge-changes
+                  :while (lambda () (and (not done) (= attempt mine))))))
+             (summary ()
+               ;; The steps waiting are those the workflow still has paused (a
+               ;; resumed one is running); the chosen one, if still waiting.
+               (let ((summary (if workflow
+                                  (checkpoint-summary (checkpoint)
+                                                      :waiting (mapcar #'step-id (workflow-paused workflow)))
+                                  (checkpoint-summary (checkpoint)))))
+                 (unless (find chosen (getf summary :steps) :key (lambda (s) (getf s :id)) :test #'equal)
+                   (setf chosen nil))
+                 (select-summary-step summary chosen)))
+             (show-steps (summary)
+               ;; More than one step waiting: choose which the buttons are for.
+               (let ((waiting (getf summary :steps)))
+                 (clear-box steps)
+                 (gtk:widget-set-visible steps (and (rest waiting) t))
+                 (when (rest waiting)
+                   (let ((menu (gtk:drop-down-new-from-strings (mapcar (lambda (s) (getf s :description)) waiting))))
+                     (gtk:drop-down-set-selected menu (or (position (getf (getf summary :step) :id) waiting
+                                                                    :key (lambda (s) (getf s :id)) :test #'equal)
+                                                          0))
+                     (gobject:connect menu "notify::selected"
+                                      (lambda (m p) (declare (ignore p))
+                                        (setf chosen (getf (nth (gtk:drop-down-get-selected m) waiting) :id))
+                                        ;; Not while the menu that changed is being replaced.
+                                        (later #'render)))
+                     (gtk:box-append steps (make-instance 'gtk:label :label "For:" :css-classes '("dim-label")))
+                     (gtk:box-append steps menu)))))
+             (abandon ()
+               (cond
+                 ((not confirm-abandon)
+                  (setf confirm-abandon t)
+                  (say "Abandon this task? It won't be offered for recovery again. Nothing is deleted: the folder, the worktrees and recovery refs stay as they are. Choose Abandon again to confirm."
+                       '("warning"))
+                  (render))
+                 (t
+                  (when workflow
+                    (incf attempt)
+                    (handler-case (recover-workflow workflow :abandon)
+                      (error (e) (pane-note *middle* (format nil "Abandoning: ~a" e) "error"))))
+                  (when history
+                    (abandon-history-task history)
+                    (if (eq history *history*) (save-current-history) (save-history history)))
+                  (settled "Abandoned. Nothing was deleted."))))
+             (button (label tooltip classes action)
+               (let ((b (make-instance 'gtk:button :label label :tooltip-text tooltip :css-classes classes)))
+                 (gobject:connect b :clicked (lambda (b) (declare (ignore b))
+                                               (cond ((not (current-p)) (settled "A newer task has started"))
+                                                     ((committing-p *middle*))
+                                                     (t (funcall action)))))
+                 (gtk:box-append buttons b)
+                 b))
+             (render ()
+               (unless done
+                 (let* ((summary (summary))
+                        (step (getf summary :step))
+                        (state (getf summary :state))
+                        (actions (if workflow (recovery-actions summary inspection) '(:abandon))))
+                   (gtk:label-set-text heading
+                                       (cond ((equal state "stopped") "The task is stopped")
+                                             ((member state *interrupted-states* :test #'equal)
+                                              "This task was interrupted")
+                                             (t "The task stopped before it finished")))
+                   (show-steps summary)
+                   (clear-box details)
+                   (dolist (line (recovery-detail-lines summary inspection workflow))
+                     (gtk:box-append details (make-instance 'gtk:label :label (car line) :xalign 0.0 :wrap t
+                                                                       :selectable t :css-classes (cdr line))))
+                   (clear-box buttons)
+                   (loop for (action label tooltip) in (recovery-choices actions :step-role (getf step :role)
+                                                                         :plan (getf summary :pending-plan)
+                                                                         :integration (getf (getf summary :integration) :state))
+                         for b = (button (cond ((and (eq action :abandon) confirm-abandon) "Abandon — confirm")
+                                               ((and (eq action :hand-off) (equal label "Hand off") (step-agent-other step))
+                                                (format nil "Hand off to ~a" (agent-name (step-agent-other step))))
+                                               (t label))
+                                         tooltip
+                                         (case action
+                                           (:abandon '("destructive-action"))
+                                           (:resume '("suggested-action"))
+                                           (t '()))
+                                         (let ((action action))
+                                           (case action
+                                             (:review (lambda () (setf inspection nil) (render) (look)))
+                                             (:abandon #'abandon)
+                                             (:stop (lambda () (choose :stop)))
+                                             (t (lambda () (choose action))))))
+                         ;; Carrying on waits until it's known what the folder looks like now.
+                         do (when (and (member action '(:resume :retry :hand-off :restore-worktrees)) (null inspection))
+                              (gtk:widget-set-sensitive b nil)
+                              (gtk:widget-set-tooltip-text b "Looking at the folder and worktrees first…")))
+                   (when anyway
+                     (let ((action anyway))
+                       (gtk:widget-set-sensitive
+                        (button "Carry on anyway" "Go on from the folder and worktrees as they are now" '()
+                                (lambda () (choose action :acknowledge-changes t)))
+                        (and inspection t))))))))
+      (when restore-error
+        (say (format nil "It can't be carried on here: ~a" restore-error) '("warning")))
+      (setf *recovery-card* (cons workflow (lambda () (unless done (setf inspection nil) (render) (look)))))
+      (render)
+      (look)
+      (gtk:box-append card heading)
+      (gtk:box-append card details)
+      (gtk:box-append card steps)
+      (gtk:box-append card status)
+      (gtk:box-append card buttons)
+      (pane-append *middle* card)
+      (update-controls))))
+
+(defun offer-recovery (history)
+  "HISTORY was reopened with a task that stopped before it finished: restore
+it, without running anything, and show its recovery card."
+  (multiple-value-bind (workflow why) (restore-history-workflow history)
+    (when workflow (setf *workflow* workflow))
+    (show-recovery-card workflow history :restore-error why)
+    (when (history-interrupted-p history)
+      (attention "A task was interrupted" "It's waiting for you to choose how to recover it."))))
 
 ;;; A turn gone quiet
 
@@ -1782,8 +2245,16 @@ and summary, with Changes and, when the work can be committed, Commit changes."
 ;;; A workflow stopped at its last round, unapproved
 
 (defun workflow-finished (workflow)
-  (clear-pause-timers)
+  (clear-pause-timers (if (eq (workflow-state workflow) :finished) "Finished" "Stopped"))
   (snapshot-task-end workflow)
+  ;; Stopped, it can be carried on: the recovery card says how. Abandoning
+  ;; stops it first, so wait to see whether it's still only stopped.
+  (when (eq (workflow-state workflow) :stopped)
+    (later (lambda ()
+             (when (and (eq workflow *workflow*) (eq (workflow-state workflow) :stopped))
+               (if (eq (car *recovery-card*) workflow)
+                   (funcall (cdr *recovery-card*))
+                   (show-recovery-card workflow *history*))))))
   (when (eq (workflow-state workflow) :finished)
     (attention "Both agents have finished"
                (format nil "~{~a~^; ~}"
@@ -1906,10 +2377,17 @@ and summary, with Changes and, when the work can be committed, Commit changes."
             ((and (worktrees-wanted-p) (setf problem (worktrees-problem *directory*)))
              (pane-note *middle* (format nil "Can't give each part its own worktree: ~a." problem) "error"))
             (t
+             ;; A task that can still be recovered keeps its conversation, and
+             ;; checkpoint: this one starts another.
+             (when (and *history* (history-recoverable-p *history*))
+               (finish-history)
+               (setf *recovery-card* nil)
+               (pane-note *middle* "The earlier task can still be recovered from its conversation in History; this one is kept separately."
+                          "dim-label" "duet-note"))
              (let* ((lead (selected-lead))
                     (partner (if (eq lead *claude*) *codex* *claude*)))
                (clear-text-view (control :input))
-               (setf *workflow* (make-instance 'workflow
+               (setf *workflow* (apply #'make-instance 'workflow
                                                :mode (selected-mode) :lead lead :partner partner
                                                :request (if (plusp (length text)) text "Review for bugs, regressions, and missed requirements.")
                                                :review-target (nth (gtk:drop-down-get-selected (control :review-target))
@@ -1919,14 +2397,11 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                                :review-count (gtk:spin-button-get-value-as-int (control :review-count))
                                                :review-agents (nth (gtk:drop-down-get-selected (control :review-agents)) '(:both :lead :partner))
                                                :max-rounds (gtk:spin-button-get-value-as-int (control :rounds))
-                                               :on-message #'middle-message
-                                               :on-pause #'show-paused-step
                                                :approve-plan (and (member (selected-mode) '(:divide :compare))
                                                                   (gtk:check-button-get-active (control :approve-plan)))
-                                               :on-plan #'show-plan-card
                                                :worktrees (worktrees-wanted-p)
                                                :check-command (folder-check-command *directory*)
-                                               :on-finish #'workflow-finished))
+                                               (workflow-callbacks)))
                (snapshot-task-start *workflow*)
                (start-workflow *workflow*)
                (update-controls))))))))
@@ -2371,6 +2846,9 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (glib:timeout-add-seconds glib:+priority-default+ 15 (lambda () (check-stalls) t))
     (gobject:connect window :close-request
                      (lambda (w) (declare (ignore w))
+                       ;; The last checkpoint saved stands: a task under way
+                       ;; now is found interrupted when reopened.
+                       (setf *closing* t)
                        (dolist (agent (list *claude* *codex*))
                          (ignore-errors (agent-cancel agent))
                          (ignore-errors (agent-shutdown agent)))
