@@ -69,3 +69,57 @@
       (ai::worktree-git repo "merge" "--abort")
       (true (ai::remove-worktree repo tree))
       (true (search "agent-duet/conflict" (ai::worktree-git repo "branch" "--list"))))))
+
+(define-test worktree-recovery-refs
+    :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let* ((base (ai::worktree-git-line repo "rev-parse" "HEAD"))
+           (changed (ai::create-worktree repo "changed"))
+           (unchanged (ai::create-worktree repo "unchanged"))
+           (other (ai::create-worktree repo "other")))
+      (setf trees (list changed unchanged other))
+      (write-worktree-file changed "part.txt" "part work")
+      (let ((commit (ai::commit-worktree changed "part")))
+        ;; The default keeps no refs.
+        (true (ai::remove-worktree repo other :delete-branch t))
+        (is equal '() (ai::worktree-recovery-refs repo "task1"))
+        (multiple-value-bind (head differs) (ai::retain-worktree repo changed "task1" "lead")
+          (is string= commit head)
+          (true differs))
+        (true (ai::remove-worktree repo changed :delete-branch t))
+        (true (ai::remove-worktree repo unchanged :delete-branch t :recovery-task "task1"))
+        (false (probe-file changed))
+        (false (probe-file unchanged))
+        (is string= "" (ai::worktree-git repo "branch" "--list" "agent-duet/*"))
+        (is equal (list (list :part "lead" :head commit :base base :changed t)
+                        (list :part "unchanged" :head base :base base :changed nil))
+            (ai::worktree-recovery-refs repo "task1"))
+        ;; The work survives the worktree and branch, and the refs keep it from gc.
+        (is string= (format nil "part work~%")
+            (ai::worktree-git repo "show" "refs/agent-duet/tasks/task1/lead/head:part.txt"))
+        (is equal '() (ai::worktree-recovery-refs repo "task"))
+        (fail (ai::worktree-recovery-refs repo "a/b"))
+        (fail (ai::delete-worktree-recovery-refs repo ""))
+        (is = 2 (ai::delete-worktree-recovery-refs repo "task1" "unchanged"))
+        (is equal '("lead") (mapcar (lambda (e) (getf e :part)) (ai::worktree-recovery-refs repo "task1")))
+        (is = 2 (ai::delete-worktree-recovery-refs repo "task1"))
+        (is = 0 (ai::delete-worktree-recovery-refs repo "task1"))
+        (is string= "" (ai::worktree-git repo "for-each-ref" "refs/agent-duet/"))))))
+
+(define-test worktree-recovery-retention-failure
+    :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let ((tree (ai::create-worktree repo "kept")))
+      (push tree trees)
+      ;; An unusable part name: nothing is removed.
+      (fail (ai::remove-worktree repo tree :delete-branch t :recovery-task "task" :recovery-part "bad name~"))
+      (true (probe-file tree))
+      (true (search "agent-duet/kept" (ai::worktree-git repo "branch" "--list")))
+      (is equal '() (ai::worktree-recovery-refs repo "task"))
+      ;; Retaining again replaces the earlier refs.
+      (ai::retain-worktree repo tree "task")
+      (write-worktree-file tree "later.txt" "later")
+      (let ((commit (ai::commit-worktree tree "later")))
+        (ai::retain-worktree repo tree "task")
+        (is string= commit (getf (first (ai::worktree-recovery-refs repo "task")) :head))
+        (is = 1 (length (ai::worktree-recovery-refs repo "task")))))))

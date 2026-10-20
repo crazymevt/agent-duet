@@ -11,9 +11,17 @@
 
 ## Next (agreed by Claude and ChatGPT)
 
-Top five, in order:
+Agreed priorities now, in order:
 
-- [ ] **CI:** A GitHub Actions workflow running `make test` on macOS and Linux (the tests need no GTK or CLIs), plus a Linux build check, before workflow behavior grows further.
+1. **Preserve split-task results and recovery refs:** Keep each part's written result (its final reply) for the merged-result review, naming parts that changed no files, so a text-only task still ends in a combined answer without needing a nonempty diff. Keep each part's committed state under `refs/agent-duet/tasks/<task>/<part>/{head,base}` (`retain-worktree`, `remove-worktree :recovery-task`), so its worktree and branch can go before the merged result is approved; delete the refs (`delete-worktree-recovery-refs`) only after approval. *Recovery refs are in `worktree.lisp`; keeping written results and wiring both into the workflow are in progress.*
+2. **Review-only mode** (below).
+3. **Restart recovery** (below), using the recovery refs for parts whose worktrees are gone.
+4. **End-of-task summary card** (below), with whatever usage and time data the CLIs report.
+5. **Commit at the end**, then **Undo a task** (below).
+
+The earlier top five, and the rest:
+
+- [x] **CI:** A GitHub Actions workflow running `make test` on macOS and Linux (the tests need no GTK or CLIs), plus a Linux build check, before workflow behavior grows further.
 - [x] **Task changes view:** Record the starting state when a task begins (`HEAD`, the index, and the working tree's contents, tracked files including unstaged changes and untracked ones, e.g. as commits under `refs/agent-duet/<task>`), and the end state the same way when it finishes, and show what changed between the two, per file, in a window like Documents. Viewing only; undo is a separate item below.
 - [ ] **Review-only mode:** One or both agents review uncommitted changes, a branch or the last N commits, producing the same `F1`… checklist; **Fix these** turns it into a *Write & review* task. Enforced read-only, not just asked: Claude without edit tools (`--disallowedTools Edit,Write,NotebookEdit`, commands limited to read-only ones), Codex in the `read-only` sandbox, whatever the permission setting. A branch is reviewed as the changes it introduces (`git diff base...branch`, from the merge base), with comparing branch tips (`base..branch`) as a separate choice.
 - [x] **Stall detection:** A turn with no events for N minutes gets a card: *Keep waiting* / *Interrupt and retry* / *Stop*. Time spent waiting on the user (a permission card, a question, plan approval, a usage pause) doesn't count. *Interrupt and retry* only resubmits once the interrupted turn has ended (its turn token cleared); if it doesn't end, it says so and offers *Stop*.
