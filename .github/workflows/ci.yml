@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / make ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: test
+          - os: ubuntu-latest
+            target: test
+          - os: ubuntu-latest
+            target: load
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SBCL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sbcl
+      - name: Install SBCL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sbcl
+      - name: Install GTK stack
+        if: matrix.target == 'load'
+        run: sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+      - uses: actions/cache@v4
+        with:
+          path: ~/quicklisp
+          key: quicklisp-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('agent-duet.asd') }}
+      - name: Install Quicklisp and enable it in SBCL
+        shell: bash
+        run: |
+          if [ ! -f "$HOME/quicklisp/setup.lisp" ]; then
+            curl -fsSLo "$RUNNER_TEMP/quicklisp.lisp" https://beta.quicklisp.org/quicklisp.lisp
+            sbcl --no-userinit --non-interactive --load "$RUNNER_TEMP/quicklisp.lisp" \
+              --eval '(quicklisp-quickstart:install :path (merge-pathnames "quicklisp/" (user-homedir-pathname)))'
+          fi
+          echo '(load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))' > "$HOME/.sbclrc"
+      - name: Install the project's GTK bindings
+        if: matrix.target == 'load'
+        shell: bash
+        run: |
+          # These bindings define gtk4 and gtk4-adwaita (not cl-gtk4).
+          if [ ! -d "$HOME/quicklisp/local-projects/gtk4/.git" ]; then
+            git clone https://github.com/crazymevt/gtk4.git "$HOME/quicklisp/local-projects/gtk4"
+          fi
+          git -C "$HOME/quicklisp/local-projects/gtk4" checkout 4f7ac6daf9de3f4fce1ca75b0f5dbf56681fac70
+      - run: make ${{ matrix.target }}

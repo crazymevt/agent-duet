@@ -13,5 +13,9 @@
    #:review-verdict #:parse-plan
    ;; settings
    #:*claude-program* #:*claude-model* #:*codex-program* #:*codex-model* #:*default-max-rounds*
+   ;; snapshots and changes window
+   #:snapshot #:snapshot-label #:snapshot-head #:snapshot-index #:snapshot-working-tree #:snapshot-time
+   #:snapshot-change #:snapshot-change-path #:snapshot-change-status #:snapshot-change-old-path #:snapshot-change-diff
+   #:snapshot-folder #:snapshot-changes #:delete-snapshot #:prune-snapshots #:show-changes-window
    ;; JSON
    #:parse-json #:json-string #:jobj #:jget))
