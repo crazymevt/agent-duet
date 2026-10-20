@@ -108,6 +108,7 @@
    (shutdown-pids :initform nil :accessor workflow-shutdown-pids)
    (steps :initform nil :accessor workflow-steps)
    (recovery-baseline :initform nil :accessor workflow-recovery-baseline)
+   (recovery-capture :initform nil :accessor workflow-recovery-capture)
    (integration-state :initform nil :accessor workflow-integration-state)
    (on-checkpoint :initarg :on-checkpoint :initform nil :accessor workflow-on-checkpoint)
    (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
@@ -141,7 +142,7 @@
 again, or to the other agent, after the first ran out of usage."
   (id (make-uuid))
   (generation 0) (state :new) reason progress
-  agent prompt original-prompt then target confirming (check-fixes 0) repositories peer-progress
+  agent prompt original-prompt then target confirming (check-fixes 0) repositories repository-capture
   role                                  ; :propose, :plan, :work, :review or :resolve
   loop)                                 ; the review loop it belongs to (not for :plan)
 
@@ -196,6 +197,9 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                             (pause-step workflow step))
                           (progn
                             (setf (step-state step) :completed (step-progress step) text)
+                            ;; Refresh restart state before the continuation can
+                            ;; start another turn or pause. Its newer capture wins.
+                            (refresh-recovery-baseline workflow nil)
                             (handler-case (funcall (step-then step) text nil)
                               (error (e)
                                 (setf (step-reason step) :continuation-failed
@@ -264,6 +268,56 @@ unapproved has its author address the last review. True if it carried on."
                        (or (and loop (loop-label loop))
                            (format nil "~a's work" (agent-name (loop-author loop)))))))))
 
+(defstruct recovery-capture thread repositories ready error steps)
+
+(defun captured-recovery-repositories (capture fallback)
+  "Read a ready worker result without blocking checkpoint serialization."
+  (if (and capture (recovery-capture-ready capture) (not (recovery-capture-error capture)))
+      (recovery-capture-repositories capture) fallback))
+
+(defun apply-recovery-capture (workflow capture)
+  "Publish only the current capture, on the agent's delivery thread."
+  (when (and (recovery-capture-ready capture) (not (recovery-capture-error capture))
+             (not (eq (workflow-state workflow) :abandoned)))
+    (let ((changed nil))
+      (when (eq capture (workflow-recovery-capture workflow))
+        (setf (workflow-recovery-baseline workflow) (recovery-capture-repositories capture)
+              (workflow-recovery-capture workflow) nil
+              changed t))
+      (dolist (entry (recovery-capture-steps capture))
+        (let ((step (car entry)))
+          (when (and (eq capture (step-repository-capture step))
+                     (= (cdr entry) (step-generation step)) (eq (step-state step) :paused))
+            (setf (step-repositories step) (recovery-capture-repositories capture)
+                  (step-repository-capture step) nil
+                  changed t))))
+      (when changed (checkpoint-changed workflow)))))
+
+(defun refresh-recovery-baseline (workflow steps)
+  "Capture completed-step or pause/stop state off GTK; newer captures win."
+  (let ((capture (make-recovery-capture
+                  :steps (mapcar (lambda (s) (cons s (step-generation s))) steps))))
+    (setf (workflow-recovery-capture workflow) capture)
+    (dolist (step steps) (setf (step-repository-capture step) capture))
+    (setf (recovery-capture-thread capture)
+          (sb-thread:make-thread
+           (lambda ()
+             (handler-case (setf (recovery-capture-repositories capture) (workflow-repositories workflow))
+               (error (e) (setf (recovery-capture-error capture) (princ-to-string e))))
+             (setf (recovery-capture-ready capture) t)
+             (funcall (agent-deliver (workflow-lead workflow))
+                      (lambda () (apply-recovery-capture workflow capture))))
+           :name "workflow repository snapshot"))
+    capture))
+
+(defun await-recovery-captures (workflow)
+  "Wait only from inspection workers or headless callers, never GTK."
+  (dolist (capture (remove-duplicates
+                    (remove nil (cons (workflow-recovery-capture workflow)
+                                      (mapcar #'step-repository-capture (workflow-paused workflow))))))
+    (when (and (not (recovery-capture-ready capture)) (recovery-capture-thread capture))
+      (sb-thread:join-thread (recovery-capture-thread capture)))))
+
 (defun pause-step (workflow step)
   (when (and (null (step-progress step))
              (plusp (length (agent-partial-text (step-agent step)))))
@@ -271,9 +325,8 @@ unapproved has its author address the last review. True if it carried on."
   (setf (step-state step) :paused)
   (pushnew step (workflow-paused workflow) :test #'eq)
   (unless (step-reason step) (setf (step-reason step) :out-of-usage))
-  (setf (step-repositories step) (workflow-repositories workflow)
-        (step-peer-progress step) (workflow-peer-progress workflow (step-agent step))
-        (workflow-recovery-baseline workflow) (step-repositories step))
+  (setf (step-repositories step) (workflow-recovery-baseline workflow))
+  (refresh-recovery-baseline workflow (list step))
   (when (step-loop step)
     (update-loop-state workflow (step-loop step) :paused))
   (note workflow "~a paused (~a). Available progress: ~a"
@@ -1076,16 +1129,20 @@ still open, and is asked once to settle them (that's no new round)."
   (when (member (workflow-state workflow) '(:running :paused))
     (pause-workflow-agent workflow (workflow-lead workflow))
     (pause-workflow-agent workflow (workflow-partner workflow))
-    (dolist (l (workflow-loops workflow))
-      (when (eq (loop-state l) :checking)
-        (let ((step (make-step :agent (loop-author l) :role :check :loop l :state :paused
-                               :reason :interrupted :prompt (workflow-check-command workflow))))
-          (push step (workflow-steps workflow)) (push step (workflow-paused workflow)))))
     (cancel-workflow-checks workflow)
+    ;; PAUSE-WORKFLOW-AGENT has captured newly interrupted steps. Preserve
+    ;; older pause baselines so user edits made before Stop remain visible.
+    (let ((missing
+            (remove-if-not
+             (lambda (step)
+               (let ((capture (step-repository-capture step)))
+                 (or (and capture (recovery-capture-ready capture) (recovery-capture-error capture))
+                     (not (or capture (step-repositories step))))))
+             (workflow-paused workflow))))
+      (when missing (refresh-recovery-baseline workflow missing)))
     (setf (workflow-state workflow) :stopped)
     (dolist (loop (workflow-loops workflow))
       (when (eq (loop-state loop) :checking) (setf (loop-state loop) :paused)))
-    (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
     (restore-review-access workflow)
     (leave-worktrees workflow)
     (capture-workflow-completion workflow)
@@ -1661,7 +1718,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
 (defun checkpoint-step (workflow step)
   (jobj "id" (step-id step) "agent" (agent-id (step-agent step))
         "prompt" (step-prompt step) "original-prompt" (step-original-prompt step)
-        "repositories" (step-repositories step)
+        "repositories" (captured-recovery-repositories (step-repository-capture step) (step-repositories step))
         "target" (step-target step) "confirming" (step-confirming step) "check-fixes" (step-check-fixes step)
         "role" (step-role step)
         "loop" (position (step-loop step) (workflow-loops workflow))
@@ -1705,7 +1762,10 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                   (workflow-trees workflow)) 'vector)
           "shutdown-pids" #()
           "shutdown-processes" (coerce (workflow-process-records workflow) 'vector)
-          "repositories" (or (workflow-recovery-baseline workflow) #())
+          "repositories" (or (captured-recovery-repositories (workflow-recovery-capture workflow)
+                                                             (workflow-recovery-baseline workflow)) #())
+          "repository-snapshot-pending" (if (and (workflow-recovery-capture workflow)
+                                                   (not (recovery-capture-ready (workflow-recovery-capture workflow)))) t :false)
           "error" (workflow-completion-error workflow)
           "merged-loop" (position (workflow-merged-loop workflow) (workflow-loops workflow))
           "loops" (coerce
@@ -1727,7 +1787,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                                                         "round" (finding-round f))) (loop-findings l)) 'vector)))
                            (workflow-loops workflow)) 'vector)
           "steps" (coerce (mapcar (lambda (s) (checkpoint-step workflow s))
-                                  (workflow-steps workflow)) 'vector))))
+                                  (remove-if-not (lambda (s) (member (step-state s) '(:new :running :paused)))
+                                                 (workflow-steps workflow))) 'vector))))
 
 (defun restored-step-continuation (workflow step)
   "Rebuild only known continuations; the saved data supplies no executable code."
@@ -1888,15 +1949,17 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
 
 (defun inspect-workflow-recovery (workflow)
   "Inspection is read-only and safe even when both agents are unavailable."
-  (let ((now (workflow-repositories workflow)))
+  (await-recovery-captures workflow)
+  (let ((now (workflow-repositories workflow))
+        (baseline (captured-recovery-repositories (workflow-recovery-capture workflow)
+                                                   (workflow-recovery-baseline workflow))))
     (jobj "pending-plan" (and (workflow-pending-plan workflow)
                                    (jobj "lead" (getf (workflow-pending-plan workflow) :lead)
                                          "partner" (getf (workflow-pending-plan workflow) :partner)))
           "state" (workflow-state workflow) "integration" (workflow-integration-state workflow)
           "merged-refs" (coerce (workflow-merged-refs workflow) 'vector)
           "repositories" now
-          "repository-changed" (if (and (workflow-recovery-baseline workflow)
-                                         (not (equalp now (workflow-recovery-baseline workflow)))) t :false)
+          "repository-changed" (if (and baseline (not (equalp now baseline))) t :false)
           "recovery-refs" (coerce (mapcar (lambda (entry)
                                             (jobj "part" (getf entry :part) "head" (getf entry :head)
                                                   "base" (getf entry :base)))
@@ -1938,7 +2001,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           (if (step-loop step) (or (loop-last-review (step-loop step)) "") "")
           (json-string (or inspection (inspect-workflow-recovery workflow)))))
 
-(defun recover-workflow (workflow action &key step acknowledge-changes)
+(defun recover-workflow (workflow action &key step acknowledge-changes inspection)
   "Only explicit actions may start recovered work. A pending handoff stays paused."
   (when (eq action :restore-worktrees)
     (return-from recover-workflow (restore-workflow-worktrees workflow)))
@@ -1955,7 +2018,15 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
   (unless (member action '(:resume :retry :hand-off)) (error "Unknown recovery action ~a" action))
   (let* ((step (if (stringp step) (find step (workflow-paused workflow) :key #'step-id :test #'equal)
                    (or step (first (workflow-paused workflow)))))
-         (inspection (inspect-workflow-recovery workflow)))
+         (inspection (or inspection (inspect-workflow-recovery workflow))))
+    ;; A supplied inspection must have waited for the pause snapshot. Never
+    ;; block GTK here, or treat an unfinished snapshot as permission to resume.
+    (dolist (capture (remove-duplicates
+                      (remove nil (list (workflow-recovery-capture workflow)
+                                        (and step (step-repository-capture step))))))
+      (unless (recovery-capture-ready capture) (return-from recover-workflow :pending-shutdown))
+      (when (recovery-capture-error capture) (return-from recover-workflow :blocked))
+      (apply-recovery-capture workflow capture))
     (when (and (recovery-step-repository-changed-p workflow step inspection) (not acknowledge-changes))
       (return-from recover-workflow :repository-changed))
     (when (some (lambda (r) (or (and (not (jtrue-p (jget r "available")))
@@ -2006,7 +2077,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           (push (cons agent (agent-read-only-p agent)) (workflow-review-access workflow)))
         (setf (agent-read-only-p agent) t))
       (setf (workflow-state workflow) :running
-            (workflow-recovery-baseline workflow) (jget inspection "repositories"))
+            (workflow-recovery-baseline workflow) (jget inspection "repositories")
+            (workflow-recovery-capture workflow) nil)
       (cond ((eq (step-role step) :check)
              (unpause workflow step) (setf (step-state step) :completed)
              (loop-check workflow (step-loop step) (loop-check-fixes (step-loop step))))
@@ -2134,32 +2206,25 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                 (and (agent-busy a) (agent-process-record a)
                                      (list (agent-process-record a)))))) :test #'equalp))
 
-(defun workflow-peer-progress (workflow agent)
-  (loop for s in (workflow-steps workflow) unless (eq agent (step-agent s))
-        collect (list (step-id s) (step-generation s) (step-state s))))
-
 (defun recovery-step-repository-changed-p (workflow step inspection)
-  "Ignore another part's worktree, and expected peer progress in a live shared folder.
-Restart/whole-task recovery still requires acknowledging changes."
-  (if (null step) (jtrue-p (jget inspection "repository-changed"))
+  "Compare each paused step against its own snapshot, including shared folders."
+  (if (null step)
+      (jtrue-p (jget inspection "repository-changed"))
       (let* ((tree (and (step-loop step) (loop-tree (step-loop step))))
-             (baseline (or (step-repositories step) (workflow-recovery-baseline workflow)))
-             (peer (other-agent workflow (step-agent step))))
-        (cond
-          ((and (null tree) (workflow-live-p workflow)
-                (or (agent-busy peer)
-                    (and (step-peer-progress step)
-                         (not (equal (step-peer-progress step)
-                                     (workflow-peer-progress workflow (step-agent step))))))) nil)
-          ((and tree baseline)
-           (some (lambda (path)
-                   (let ((before (find path (jlist baseline) :key (lambda (r) (jget r "path")) :test #'equal))
-                         (now (find path (jlist (jget inspection "repositories")) :key (lambda (r) (jget r "path")) :test #'equal)))
-                     (not (recovery-repositories-equal-p before now))))
-                 (remove-duplicates (remove nil (list (namestring tree)
-                                                      (and (workflow-home workflow) (namestring (workflow-home workflow)))))
-                                    :test #'equal)))
-          (t (jtrue-p (jget inspection "repository-changed")))))))
+             (home (or (workflow-home workflow) (agent-directory (step-agent step))))
+             (baseline (captured-recovery-repositories
+                        (step-repository-capture step)
+                        (or (step-repositories step) (workflow-recovery-baseline workflow))))
+             (paths (remove-duplicates
+                     (mapcar #'namestring (remove nil (list tree home))) :test #'equal)))
+        (if (and baseline paths)
+            (some (lambda (path)
+                    (let ((before (find path (jlist baseline) :key (lambda (r) (jget r "path")) :test #'equal))
+                          (now (find path (jlist (jget inspection "repositories"))
+                                     :key (lambda (r) (jget r "path")) :test #'equal)))
+                      (not (recovery-repositories-equal-p before now))))
+                  paths)
+            (jtrue-p (jget inspection "repository-changed"))))))
 
 (defun recovery-repositories-equal-p (before now)
   "Registered peer worktrees may advance without changing this repository."

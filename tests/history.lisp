@@ -422,3 +422,8 @@
                                             (vector (ai::jobj "id" "r" "agent" "claude" "role" "review" "state" "running"))))
                           :steps)
                 :key (lambda (s) (getf s :id)) :test #'equal))))
+
+(define-test recovery-reason-wording :parent agent-duet
+  (is equal "waiting for prerequisite work" (ai::step-reason-text :dependency))
+  (is equal "prerequisite changed; needs revalidation" (ai::step-reason-text "prerequisite-changed"))
+  (is equal "could not continue after the step finished" (ai::step-reason-text :continuation-failed)))

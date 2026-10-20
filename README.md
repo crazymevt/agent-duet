@@ -82,7 +82,11 @@ worktree for its part, so the parts can't get in each other's way:
 - Each agent works on its part in a new conversation in its worktree, on
   a branch `agent-duet/claude-…` or `agent-duet/codex-…`. The reviewer is
   shown the other's diff and where its worktree is.
-- When both parts are done, each is committed on its branch, both agents
+- Only approved parts, or completed parts explicitly accepted without review,
+  can be merged. Unresolved reviews and failing checks leave both worktrees
+  intact without merging. Choose **Continue** for more review rounds; there
+  is no override for failed or incomplete work.
+- When both parts are eligible, each is committed on its branch, both agents
   come back to the folder (in new conversations), and the branches are
   merged into your current branch. If they conflict, the lead resolves the
   conflicts and concludes the merge. Then the other reviews the merged
@@ -134,8 +138,9 @@ runs out of usage, and when a plan is waiting for you.
 A step pauses, rather than failing the task, when its agent runs out of
 usage, when its turn fails, or when you pause that agent: during a task, the
 **Stop** button in an agent's pane is **Pause**, and pauses only that
-agent's part. Work that doesn't depend on it carries on; work that does
-waits. The middle pane's **Stop** stops both agents, but the task can still
+agent's part. Independent parts carry on; checks and reviews wait for their
+required result. The split-plan UI does not yet support declaring dependencies
+between parts. The middle pane's **Stop** stops both agents, but the task can still
 be carried on. A card in the middle pane offers:
 
 - **Wait until 3:05 PM** (out of usage, when the reset time is known): it's

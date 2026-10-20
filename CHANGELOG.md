@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Split parts with unresolved reviews or failing checks stay in their worktrees
+  without merging. Continue offers more review rounds; failed or incomplete
+  work cannot be forced into integration.
+
 - Recovering a task: its state is saved with the conversation as it goes.
   Reopening one that was interrupted (the app quit mid-task) or stopped
   shows where it stopped, what was done and written, each agent's

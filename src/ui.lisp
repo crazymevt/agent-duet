@@ -1386,17 +1386,29 @@ it is tried again every 2 seconds, REPORT told :pending-shutdown each time,
 until they have stopped, or *SHUTDOWN-WAIT-SECONDS* pass and REPORT is told
 :shutdown-unconfirmed, or WHILE returns false (the user chose otherwise)."
   (let ((started (get-universal-time)))
-    (flet ((try ()
-             (when (and (eq workflow *workflow*) (funcall while))
-               (let ((result (handler-case (recover-workflow workflow action :step step
-                                                             :acknowledge-changes acknowledge-changes)
-                               (error (e) (list :error (princ-to-string e))))))
-                 (cond ((not (eq result :pending-shutdown)) (funcall report result) nil)
-                       ((> (- (get-universal-time) started) *shutdown-wait-seconds*)
-                        (funcall report :shutdown-unconfirmed) nil)
-                       (t (funcall report :pending-shutdown) t))))))
-      (when (try)
-        (glib:timeout-add-seconds glib:+priority-default+ 2 #'try)))
+    (labels ((current-p () (and (eq workflow *workflow*) (funcall while)))
+             (try ()
+               (when (current-p)
+                 ;; Inspect on a worker; all workflow and GTK mutations stay on
+                 ;; the main loop. Each retry gets a fresh inspection.
+                 (in-background
+                  "recovery preflight"
+                  (lambda () (inspect-workflow-recovery workflow))
+                  (lambda (inspection why)
+                    (when (current-p)
+                      (let ((result (if why (list :error why)
+                                        (handler-case
+                                            (recover-workflow workflow action :step step
+                                                              :inspection inspection
+                                                              :acknowledge-changes acknowledge-changes)
+                                          (error (e) (list :error (princ-to-string e)))))))
+                        (cond ((not (eq result :pending-shutdown)) (funcall report result))
+                              ((> (- (get-universal-time) started) *shutdown-wait-seconds*)
+                               (funcall report :shutdown-unconfirmed))
+                              (t (funcall report :pending-shutdown)
+                                 (glib:timeout-add-seconds glib:+priority-default+ 2
+                                                           (lambda () (try) nil)))))))))))
+      (try))
     (update-controls)))
 
 (defun recovery-outcome-text (result agent)
@@ -1746,13 +1758,13 @@ or abandoned. Nothing is done until a choice is made."
              (look ()
                (when (and workflow (not inspecting))
                  (setf inspecting t)
-                 (let ((checkpoint (checkpoint)))
+                 (progn
                    (in-background "duet-recovery-inspection"
                                   (lambda () (json-copy (recover-workflow workflow :review)))
                                   (lambda (value why)
                                     (setf inspecting nil)
                                     (cond (why (say (format nil "Couldn't look at the folder: ~a" why) '("warning")))
-                                          (t (setf inspection (inspection-summary value checkpoint))))
+                                          (t (setf inspection (inspection-summary value (checkpoint)))))
                                     (render))))))
              (choose (action &key acknowledge-changes)
                (let* ((mine (incf attempt))

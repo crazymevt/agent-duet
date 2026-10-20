@@ -2321,3 +2321,74 @@ VERDICT: APPROVED" nil)
         (when (ai::recovery-process-alive-p record) (ignore-errors (sb-posix:kill (ai:jget record "pid") 15))))
       (when (sb-ext:process-alive-p root) (sb-ext:process-kill root 15))
       (sb-ext:process-wait root))))
+
+(define-test recovery-checkpoint-excludes-finished-steps :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (declare (ignore partner))
+    (dotimes (i 100)
+      (push (ai::make-step :id (format nil "old-~d" i) :agent lead
+                           :role :work :state (if (evenp i) :completed :superseded) :prompt "Past prompt"
+                           :progress "Past reply")
+            (ai::workflow-steps workflow)))
+    (let* ((checkpoint (ai::json-copy (ai:workflow-checkpoint workflow)))
+           (steps (ai::jlist (ai:jget checkpoint "steps"))))
+      (is = 1 (length steps))
+      (false (search "Past prompt" (ai:json-string checkpoint))))))
+
+(define-test recovery-pause-and-stop-snapshot-off-caller-thread :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (declare (ignore partner))
+    (let ((old (symbol-function 'ai::workflow-repositories))
+          (caller sb-thread:*current-thread*)
+          (threads nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ai::workflow-repositories)
+                   (lambda (w)
+                     (push sb-thread:*current-thread* threads)
+                     (funcall old w)))
+             (true (ai:pause-workflow-agent workflow lead))
+             (ai:stop-workflow workflow)
+             (ai::await-recovery-captures workflow)
+             (is eq :stopped (ai:workflow-state workflow))
+             (true threads)
+             (false (member caller threads)))
+        (ai::await-recovery-captures workflow)
+        (setf (symbol-function 'ai::workflow-repositories) old)))))
+
+(define-test recovery-precomputed-inspection :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (declare (ignore partner))
+    (ai:pause-workflow-agent workflow lead)
+    (let ((inspection (ai:inspect-workflow-recovery workflow))
+          (old (symbol-function 'ai:inspect-workflow-recovery)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ai:inspect-workflow-recovery)
+                   (lambda (w) (declare (ignore w)) (error "Repeated repository inspection")))
+             (is eq :pending-shutdown
+                 (ai:recover-workflow workflow :resume :inspection inspection)))
+        (setf (symbol-function 'ai:inspect-workflow-recovery) old)))))
+
+(define-test recovery-pending-snapshot-does-not-block-checkpoint :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (declare (ignore partner))
+    (let ((old (symbol-function 'ai::workflow-repositories))
+          (entered (sb-thread:make-semaphore))
+          (release (sb-thread:make-semaphore)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ai::workflow-repositories)
+                   (lambda (w)
+                     (sb-thread:signal-semaphore entered)
+                     (sb-thread:wait-on-semaphore release)
+                     (funcall old w)))
+             (ai:pause-workflow-agent workflow lead)
+             (true (sb-thread:wait-on-semaphore entered :timeout 10))
+             (is eq t (ai:jget (ai:workflow-checkpoint workflow) "repository-snapshot-pending"))
+             (true (ai:json-string (ai:workflow-checkpoint workflow)))
+             (is eq :pending-shutdown
+                 (ai:recover-workflow workflow :resume :inspection (ai::jobj "repositories" #()))))
+        (sb-thread:signal-semaphore release)
+        (ai::await-recovery-captures workflow)
+        (setf (symbol-function 'ai::workflow-repositories) old)))))

@@ -66,7 +66,7 @@ changed branch, an operation in progress, missing).
 
 ## Acting
 
-`(recover-workflow workflow action &key step acknowledge-changes)`, STEP a
+`(recover-workflow workflow action &key step acknowledge-changes inspection)`, STEP a
 step or its id, by default the first paused:
 
 | action | result |
@@ -101,3 +101,24 @@ reason `:interrupted`. `(stop-workflow workflow)` stops both, keeping the
 task recoverable. `:on-pause` is called `(workflow step)` for every pause;
 `(step-reason step)` is `:out-of-usage`, `:interrupted`, `:failed`,
 `:restart` or `:integration-unresolved` (`step-reason-text` says it in words).
+
+Checkpoint step records include only new, running and paused steps. Completed
+results remain in loop summaries and conversation history, not old step prompts.
+Completed steps and new pauses refresh the repository baseline on a worker and
+publish it through
+the agent delivery callback. Recovery inspection waits for this snapshot off GTK;
+checkpoint serialization never waits. A pending snapshot is marked in the saved
+checkpoint, and ready snapshots replace the cached repositories and paused-step
+baselines. Each paused step keeps its own snapshot, even if a peer pauses later or the
+whole task is stopped. Stop captures only steps without a snapshot (or with a
+failed capture), preserving user edits made between Pause and Stop.
+Superseded captures cannot overwrite newer recovery state. Recovery actions in
+the UI inspect repositories on a worker, then apply the action on the GTK thread using
+that inspection. Pending shutdown retries inspect again on a worker.
+
+Dependency APIs are groundwork for the unchecked prerequisite/dependency TODO
+items. The current split-plan UI does not declare dependency edges; it schedules
+independent parts. These APIs do not yet implement automatic dependency discovery.
+
+The optional `:inspection` argument is a fresh engine inspection prepared by
+the UI worker for this attempt; callers must not reuse it across attempts.
