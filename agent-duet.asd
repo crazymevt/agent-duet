@@ -11,6 +11,7 @@
   :components ((:file "package")
                (:file "json")
                (:file "markdown")
+               (:file "cli-process")
                (:file "claude")
                (:file "codex")
                (:file "usage")

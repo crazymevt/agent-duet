@@ -304,18 +304,17 @@ ON-EXIT with the exit code."
                                       :environment (append environment (sb-ext:posix-environ))
                                       :external-format :utf-8))
          (cp (make-claude-process :process process)))
-    (sb-thread:make-thread
+    (watch-cli-output
+     process
      (lambda ()
        (let ((stream (sb-ext:process-output process)))
-         (loop for line = (ignore-errors (read-line stream nil))
+         (loop for line = (read-line stream nil)
                while line
                do (let ((events (parse-claude-event line)))
                     (when events
-                      (funcall deliver (lambda () (dolist (e events) (when on-event (funcall on-event e))))))))
-         (sb-ext:process-wait process)
-         (let ((code (sb-ext:process-exit-code process)))
-           (funcall deliver (lambda () (when on-exit (funcall on-exit code)))))))
-     :name "claude output")
+                      (funcall deliver (lambda () (dolist (e events) (when on-event (funcall on-event e))))))))))
+     (lambda (code)
+       (funcall deliver (lambda () (when on-exit (funcall on-exit code))))))
     (sb-thread:make-thread
      (lambda ()
        (let ((stream (sb-ext:process-error process)))

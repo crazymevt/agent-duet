@@ -65,6 +65,7 @@
         (when (probe-file "expect-steer")
           (setf reply (format nil "~a: ~a + ~a" reply (fake-text message) (fake-text (fake-read)))))
         (fake-send (jobj "type" "system" "subtype" "init" "session_id" session))
+        (fake-disconnect)
         (when (probe-file "permission-request")
           (setf reply (format nil "~a (~a)" reply (fake-ask-permission))))
         (fake-send (jobj "type" "result" "subtype" "success" "is_error" :false

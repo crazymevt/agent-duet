@@ -28,6 +28,7 @@
       ((equal method "turn/start")
        (fake-send (jobj "id" id "result" (jobj "turn" (jobj "id" "turn-1"))))
        (fake-send (jobj "method" "turn/started" "params" (jobj "turn" (jobj "id" "turn-1"))))
+       (fake-disconnect)
        (cond ((probe-file "await-steer"))
              ((probe-file "request-approval")
               (fake-send (jobj "id" "approval-1" "method" "item/commandExecution/requestApproval"

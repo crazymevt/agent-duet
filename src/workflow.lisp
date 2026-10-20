@@ -190,11 +190,13 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                           (progn
                             (setf (step-reason step)
                                   (case error (:out-of-usage :out-of-usage)
-                                    (:interrupted :interrupted) (t :failed))
+                                    (:interrupted :interrupted) (:disconnected :disconnected) (t :failed))
                                   (step-progress step)
                                   (if (plusp (length (agent-partial-text (step-agent step))))
                                       (format nil "~a~%~%Partial reply:~%~a" text (agent-partial-text (step-agent step))) text))
-                            (pause-step workflow step))
+                            (pause-step workflow step)
+                            (when (and (eq error :disconnected) (step-loop step))
+                              (invalidate-dependent-loops workflow (step-loop step))))
                           (progn
                             (setf (step-state step) :completed (step-progress step) text)
                             ;; Refresh restart state before the continuation can

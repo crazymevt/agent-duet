@@ -1,5 +1,6 @@
 ;;;; Shared, dependency-free bootstrap for the fake CLI processes.
 (require :asdf)
+(require :sb-posix)
 (load (merge-pathnames "../src/package.lisp" *load-truename*))
 (load (merge-pathnames "../src/json.lisp" *load-truename*))
 (in-package #:agent-duet)
@@ -21,3 +22,15 @@
                    (jobj "item" (jobj "type" "agentMessage" "id" id "text" text))))
   (fake-send (jobj "method" "turn/completed" "params"
                    (jobj "turn" (jobj "id" "turn-1" "status" "completed")))))
+
+(defun fake-disconnect ()
+  (when (probe-file "disconnect")
+    (fake-write "partial.txt" "partial work")
+    (cond ((probe-file "close-output")
+           (sb-posix:close 1)
+           (loop (sleep 1)))
+          ((probe-file "child-output")
+           (sb-ext:run-program "/bin/sleep" '("3") :wait nil
+                               :output *standard-output* :error *error-output*)
+           (uiop:quit 23))
+          (t (uiop:quit 23)))))

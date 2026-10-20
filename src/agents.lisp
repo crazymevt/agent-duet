@@ -633,14 +633,33 @@ folder): carry on the turn in a new conversation."
 (defmethod agent-usage-windows ((agent claude-agent))
   (claude-usage-windows (claude-agent-limits agent)))
 
+(defun agent-transport-lost (agent why)
+  "Retire the disconnected transport before publishing a recoverable failure.
+Keep editor identities so recovery cannot race surviving editing processes."
+  (let ((busy (agent-busy agent))
+        (waiting (mapcar #'second (agent-queue agent))))
+    ;; Prevent shutdown from finishing with a generic error or starting queued work.
+    (when (agent-retry-pending-p agent)
+      ;; The queued retry receives :disconnected and becomes explicit recovery.
+      ;; Settle the stall card too; the old turn is no longer pending shutdown.
+      (setf (agent-retry agent) :dropped))
+    (setf (agent-busy agent) nil (agent-queue agent) nil)
+    (unwind-protect (agent-shutdown agent)
+      (setf (agent-busy agent) busy))
+    (when busy (agent-emit agent :note :text why))
+    (agent-turn-finished agent why :disconnected)
+    (dolist (callback waiting)
+      (when callback
+        (handler-case (funcall callback why :disconnected)
+          (error (e) (agent-emit agent :note :text (format nil "Error after disconnecting ~a: ~a"
+                                                         (agent-name agent) e))))))))
+
 (defun claude-agent-exited (agent cp code)
   (when (eq cp (claude-agent-process agent))
-    (setf (claude-agent-process agent) nil)
-    (when (agent-busy agent)
-      (let ((why (format nil "Claude Code exited (status ~a).~@[~%~a~]" code
-                         (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s)))))
-        (unless (cp-stopped cp) (agent-emit agent :note :text why))
-        (agent-turn-finished agent why t)))))
+    (agent-transport-lost agent
+                          (format nil "Claude Code ~a.~@[~%~a~]"
+                                  (if code (format nil "exited (status ~a)" code) "connection closed")
+                                  (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s))))))
 
 (defun claude-agent-send (agent cp text images &key on-error)
   "Send TEXT, with IMAGES, to CP, after what was sent before. A message with
@@ -865,13 +884,10 @@ rather than using a server with no thread."
 
 (defun codex-agent-exited (agent server code)
   (when (eq server (codex-agent-server agent))
-    (setf (codex-agent-server agent) nil)
-    (agent-deny-approvals agent)
-    (when (agent-busy agent)
-      (let ((why (format nil "Codex exited (status ~a).~@[~%~a~]" code
-                         (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s)))))
-        (agent-emit agent :note :text why)
-        (agent-turn-finished agent why t)))))
+    (agent-transport-lost agent
+                          (format nil "Codex ~a.~@[~%~a~]"
+                                  (if code (format nil "exited (status ~a)" code) "connection closed")
+                                  (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s))))))
 
 (defmethod agent-begin-turn ((agent codex-agent) prompt)
   (setf (codex-agent-last-text agent) nil)

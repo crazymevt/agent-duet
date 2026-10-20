@@ -36,7 +36,7 @@ The earlier top five, and the rest:
 - [x] **Safe handoff while an agent is stopping:** Confirm the original turn and its editing processes have stopped before the replacement agent edits the same work; keep the handoff pending if shutdown cannot be confirmed.
 - [x] **Repository changes during a pause:** Before resuming, detect user edits, new commits, branch changes, and missing worktrees; reconcile available progress with the current repository before continuing.
 - [x] **Interrupted integration:** Record completed commits and merges and recover from partial integration or unresolved conflicts without repeating completed operations or losing either part's work.
-- [ ] **Hung or disconnected agents:** Extend stall handling to distinguish slow turns from lost connections or exited processes, preserve progress, and offer recovery without leaving dependent work waiting indefinitely.
+- [x] **Hung or disconnected agents:** Quiet live turns retain stall handling; stdout EOF/read failure and process exit independently trigger recovery, including when a child holds stdout open. Preserve partial work, clear permissions, pause dependent work, and offer explicit resume/retry/handoff.
 - [x] **Both agents unavailable:** Keep the task paused and recoverable, show each agent's reason for being unavailable, and allow recovery when either becomes available.
 - [ ] **Changed prerequisites:** If a prerequisite changes after dependent work starts, notify the dependent agent and revalidate affected implementation, checks, and reviews before completion.
 - [ ] **Circular dependencies or mutual waiting:** Detect when agents are blocked on each other and request a revised plan or dependency order.

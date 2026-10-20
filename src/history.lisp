@@ -131,6 +131,7 @@ offers recovery unprompted."
       (:out-of-usage "out of usage")
       (:interrupted "paused or stopped by you")
       (:failed "failed")
+      (:disconnected "agent disconnected or exited")
       (:dependency "waiting for prerequisite work")
       (:prerequisite-changed "prerequisite changed; needs revalidation")
       (:continuation-failed "could not continue after the step finished")

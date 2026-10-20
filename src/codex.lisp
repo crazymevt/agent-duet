@@ -312,33 +312,33 @@ the rest of the session) or :deny."
                            (codex-deliver-event server (make-codex-event :kind :stderr :text line)))))))
            :name "codex app-server stderr"))
     (setf (codex-stdout-thread server)
-          (sb-thread:make-thread
+          (watch-cli-output
+           process
            (lambda ()
              (let ((stream (sb-ext:process-output process)))
-               (loop for line = (ignore-errors (read-line stream nil))
+               (loop for line = (read-line stream nil)
                      while line
                      do (handler-case (codex-handle-line server line)
                           (error (e)
-                                 (codex-deliver-event server (make-codex-event :kind :protocol-error
-                                                                               :text (princ-to-string e)))))))
-             (sb-ext:process-wait process)
-             (codex-fail-pending server "the Codex app-server exited")
-             (let ((exit-code (sb-ext:process-exit-code process)))
-               (unwind-protect
-                   ;; Notify before draining stderr: descendants may still
-                   ;; hold that pipe open after the app-server has exited.
-                   (unless (codex-stopped server)
-                     (funcall deliver (lambda () (when on-exit (funcall on-exit exit-code)))))
-                 (let ((stderr-thread (codex-stderr-thread server)))
-                   (when (and stderr-thread (not (eq stderr-thread sb-thread:*current-thread*)))
-                     (ignore-errors (sb-thread:join-thread stderr-thread :timeout 0.25 :default nil))
-                     (when (sb-thread:thread-alive-p stderr-thread)
-                       ;; This reader owns no state: release a blocked read
-                       ;; before closing its stream.
-                       (sb-thread:terminate-thread stderr-thread)
-                       (ignore-errors (sb-thread:join-thread stderr-thread :timeout 0.25 :default nil)))))
-                 (ignore-errors (sb-ext:process-close process)))))
-           :name "codex app-server output"))
+                            (codex-deliver-event server (make-codex-event :kind :protocol-error
+                                                                         :text (princ-to-string e))))))))
+           (lambda (exit-code)
+             ;; Publish loss before waking request workers, whose failures must
+             ;; not consume the turn with a generic error first.
+             (unless (codex-stopped server)
+               (funcall deliver (lambda () (when on-exit (funcall on-exit exit-code)))))
+             (codex-fail-pending server "the Codex app-server disconnected"))
+           :cleanup
+           (lambda ()
+             ;; Disposal belongs to the exit watcher, even if EOF reported the
+             ;; loss before the process was reaped or shutdown was deliberate.
+             (let ((stderr-thread (codex-stderr-thread server)))
+               (when stderr-thread
+                 (ignore-errors (sb-thread:join-thread stderr-thread :timeout 0.25 :default nil))
+                 (when (sb-thread:thread-alive-p stderr-thread)
+                   (sb-thread:terminate-thread stderr-thread)
+                   (ignore-errors (sb-thread:join-thread stderr-thread :default nil)))))
+             (ignore-errors (sb-ext:process-close process)))))
     server))
 
 (defun codex-alive-p (server)

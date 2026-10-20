@@ -100,7 +100,7 @@ left.
 reason `:interrupted`. `(stop-workflow workflow)` stops both, keeping the
 task recoverable. `:on-pause` is called `(workflow step)` for every pause;
 `(step-reason step)` is `:out-of-usage`, `:interrupted`, `:failed`,
-`:restart` or `:integration-unresolved` (`step-reason-text` says it in words).
+`:restart`, `:disconnected` or `:integration-unresolved` (`step-reason-text` says it in words).
 
 Checkpoint step records include only new, running and paused steps. Completed
 results remain in loop summaries and conversation history, not old step prompts.
@@ -122,3 +122,27 @@ independent parts. These APIs do not yet implement automatic dependency discover
 
 The optional `:inspection` argument is a fresh engine inspection prepared by
 the UI worker for this attempt; callers must not reuse it across attempts.
+
+## Lost agent connections
+
+Both CLI adapters detect stdout EOF/read failure independently of process exit.
+An exit watcher allows a short bounded stdout drain, then reports exit even if a
+child keeps the pipe open. Each transport reports loss once; events from retired
+transports are ignored. A quiet live transport still uses the stall card.
+
+A lost transport is retired before the running turn reports `:disconnected`.
+Pending permissions are cleared and queued assignments receive the same failure
+instead of starting automatically. The workflow preserves partial reply text and
+files, pauses the failed step and invalidates declared dependent loops, keeping
+written results for explicit recovery. The existing process-identity and shutdown
+gates still apply to resume and handoff. No automatic retry occurs.
+
+A pending stall retry is marked dropped if its transport disconnects; its queued
+assignment receives `:disconnected` and uses explicit recovery instead. The stall
+card therefore stops waiting for a turn that has already ended. Automatic
+dependent-loop invalidation here applies to `:disconnected`; other failure and
+usage pauses retain their existing dependency handling.
+
+Codex resource disposal runs on the exit watcher after the process is reaped and
+the stdout reader finishes, independently of the once-only loss notification.
+Inherited output pipes can delay disposal, but cannot delay the recovery card.
