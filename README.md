@@ -122,6 +122,26 @@ instead of failing, and a card in the middle pane offers:
 Nothing done so far is lost. While an agent is out, with a known reset time,
 it turns prompts away without trying; its status line says until when.
 
+## A turn gone quiet
+
+When an agent's turn goes 5 minutes without any event (no text, tool call or
+output), a card asks what to do: in the middle pane during a task, in the
+agent's pane otherwise.
+
+- **Keep waiting**: give it another 5 minutes.
+- **Interrupt and retry**: interrupt the turn, and send the same prompt again
+  once that turn has ended, so the two never overlap. During a task, the
+  reply carries the task on as the first would have. If the turn hasn't
+  ended 20 seconds after the interrupt, the card says so and offers **Stop**.
+- **Stop**: end the turn, and the agent's process, which a stuck turn may
+  not answer an interrupt from (the conversation carries on with the next
+  message); during a task, the task stops too.
+
+Time spent waiting on you doesn't count: a permission card or a question,
+a plan waiting for approval, a pause for usage. If the agent speaks up while
+the card is open, the card says so and goes away. The time is
+`:stall-minutes` in the settings file (`0` turns it off).
+
 ## Folder, models and look
 
 - **Folder** (top left): where both agents work. Its menu lists recent folders
@@ -142,7 +162,8 @@ it turns prompts away without trying; its status line says until when.
 - **Dark / Light / System** (top right).
 
 These, the permission setting, the recent folders and each folder's check
-command are remembered in `~/.config/agent-duet/settings.lisp`.
+command are remembered in `~/.config/agent-duet/settings.lisp`, with how
+long a turn may be quiet (see above).
 
 ## Terminal
 
@@ -162,6 +183,22 @@ links. Links to other Markdown files open in the preview, `#anchors` scroll to
 their heading, and web links open in the browser. The preview redraws itself
 when the file changes, so you can watch a design document as an agent writes
 it. Hidden folders and build folders (`node_modules`, `build`, …) are skipped.
+
+## Changes
+
+In a git repository with at least one commit, the folder's state is recorded
+when a task starts and again when it finishes: `HEAD`, the index, and the
+working tree's contents (tracked files with their unstaged changes, and
+untracked files that aren't ignored). This doesn't touch your index, files or
+stash: the snapshots are commits kept under `refs/agent-duet/snapshots/`, the
+latest 50.
+
+**Changes** in the header opens a window with what the latest task changed:
+the files on the left (A added, M modified, D deleted, R renamed; type to
+filter), and the one you pick's diff on the right. While a task runs, it
+shows the changes so far. It's for viewing only. The comparison is of the
+folder's contents, so edits you made in the folder while the task ran are in
+it too.
 
 ## What they may do
 
@@ -226,6 +263,9 @@ used (your home folder the first time). Its output goes to
 - `src/ui.lisp`: the window.
 - `src/terminal.lisp`: the Terminal panel (VTE through CFFI, from Cadre).
 - `src/preview.lisp`: the Documents window (Cadre's Markdown preview, read-only).
+- `src/snapshot.lisp`: recording a folder's state as git commits, and the
+  changes between two such snapshots. No GTK.
+- `src/changes.lisp`: the Changes window.
 
 ## Tests
 

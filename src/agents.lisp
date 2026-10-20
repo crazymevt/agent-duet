@@ -25,6 +25,11 @@
 ;;;;
 ;;;; The model, effort and permission can change at any time; a turn uses
 ;;;; the ones in force when it starts.
+;;;;
+;;;; A turn that goes quiet is noticed (AGENT-CHECK-STALL): no event for
+;;;; a while, and nothing asked of the user. The user may keep waiting
+;;;; (AGENT-KEEP-WAITING), have the turn interrupted and its prompt given
+;;;; again once it has ended (AGENT-RETRY-TURN), or end it (AGENT-END-TURN).
 
 (in-package #:agent-duet)
 
@@ -54,7 +59,15 @@ read-only ones), Codex runs them in its sandbox without asking.
    (approvals :initform '() :accessor agent-approvals :documentation "Unanswered (id . answer-function)s")
    (stderr :initform '() :accessor agent-stderr :documentation "The last lines of standard error, newest first")
    (out-until :initform nil :accessor agent-out-until
-              :documentation "When out of usage: the universal time it resets, or :unknown")))
+              :documentation "When out of usage: the universal time it resets, or :unknown")
+   (turn :initform nil :accessor agent-turn :documentation "The running turn's (prompt callback attachments)")
+   (last-activity :initform (clock-seconds) :accessor agent-last-activity
+                  :documentation "When the running turn last showed signs of life (CLOCK-SECONDS)")
+   (stall-noticed :initform nil :accessor agent-stall-noticed
+                  :documentation "True once AGENT-CHECK-STALL has reported this silence")
+   (retry :initform nil :accessor agent-retry
+          :documentation "AGENT-RETRY-TURN's progress: (:pending entry) until the turn is given again,
+then :sent; :dropped if cancelled first")))
 
 (defgeneric agent-usage-windows (agent)
   (:documentation "The account's usage WINDOWs, as far as known.")
@@ -106,6 +119,7 @@ read-only ones), Codex runs them in its sandbox without asking.
 (defmethod agent-conversation-handle ((agent agent)) nil)
 
 (defun agent-emit (agent kind &rest plist)
+  (agent-touch agent)
   (when (agent-listener agent)
     (apply (agent-listener agent) agent kind plist)))
 
@@ -139,9 +153,13 @@ Preserve the running callback."
 (defun agent-next (agent)
   (let ((next (pop (agent-queue agent))))
     (when next
+      (when (and (consp (agent-retry agent)) (eq next (second (agent-retry agent))))
+        (setf (agent-retry agent) :sent))
       (destructuring-bind (prompt callback attachments) next
         (let ((text (prompt-with-attachments prompt attachments)))
           (setf (agent-busy agent) t
+                (agent-turn agent) next
+                (agent-stall-noticed agent) nil
                 (agent-callback agent) callback
                 (agent-turn-images agent) (attachment-images attachments)
                 (agent-turn-token agent) (list t))
@@ -159,7 +177,7 @@ Preserve the running callback."
   (unless error (agent-has-usage agent))
   (when (agent-busy agent)
     (let ((callback (agent-callback agent)))
-      (setf (agent-busy agent) nil (agent-callback agent) nil)
+      (setf (agent-busy agent) nil (agent-callback agent) nil (agent-turn agent) nil)
       (agent-deny-approvals agent)
       (agent-emit agent :turn-done :text text :error error)
       (agent-emit agent :busy :busy nil)
@@ -177,6 +195,8 @@ it would wait for ever."
   (let ((waiting (mapcar #'second (agent-queue agent)))
         (running (and (agent-busy agent) (agent-callback agent))))
     (setf (agent-queue agent) '())
+    (when (consp (agent-retry agent))
+      (setf (agent-retry agent) :dropped))
     (setf (car (agent-turn-token agent)) nil)
     (agent-deny-approvals agent)
     (when (agent-busy agent)
@@ -185,6 +205,70 @@ it would wait for ever."
     (dolist (callback (remove nil (cons running waiting)))
       (handler-case (funcall callback *stopped-text* t)
         (error (e) (agent-emit agent :note :text (format nil "Error after stopping ~a: ~a" (agent-name agent) e)))))))
+
+;;; A turn gone quiet
+
+(defvar *stall-minutes* 5 "How long a turn may go without an event before the user is asked about it.")
+
+(defun clock-seconds ()
+  "Seconds on a clock that only goes forward."
+  (floor (get-internal-real-time) internal-time-units-per-second))
+
+(defun agent-touch (agent)
+  "AGENT showed signs of life: its silence starts again."
+  (setf (agent-last-activity agent) (clock-seconds)
+        (agent-stall-noticed agent) nil))
+
+(defun agent-waiting-for-user-p (agent)
+  "Whether AGENT's turn waits on the user: a permission or a question."
+  (and (agent-approvals agent) t))
+
+(defun agent-silence (agent &optional (now (clock-seconds)))
+  "How long AGENT's running turn has gone without an event, in seconds; nil
+when that doesn't count: no turn going on, one being stopped, or one
+waiting on the user. Plan approval and usage pauses come between turns."
+  (when (and (agent-busy agent) (car (agent-turn-token agent))
+             (not (agent-waiting-for-user-p agent)))
+    (max 0 (- now (agent-last-activity agent)))))
+
+(defun agent-check-stall (agent &optional (limit (* 60 *stall-minutes*)) (now (clock-seconds)))
+  "True, once for each silence, when AGENT's turn has gone LIMIT seconds
+without an event (AGENT-SILENCE)."
+  (let ((silence (agent-silence agent now)))
+    (when (and silence (>= silence limit) (not (agent-stall-noticed agent)))
+      (setf (agent-stall-noticed agent) t))))
+
+(defun agent-keep-waiting (agent)
+  "Give AGENT's quiet turn another while."
+  (agent-touch agent))
+
+(defun agent-retry-turn (agent)
+  "Interrupt AGENT's running turn and give its prompt again, to whoever was
+waiting on it, once that turn has ended: the turn's token is cleared now,
+and the prompt goes first in the queue, so it starts only when the
+interrupted turn is over. True if there was a turn to retry. Watch
+AGENT-RETRY for when it is sent."
+  (let ((entry (agent-turn agent)))
+    (when (and (agent-busy agent) (car (agent-turn-token agent)) entry)
+      (setf (car (agent-turn-token agent)) nil
+            (agent-callback agent) nil
+            (agent-retry agent) (list :pending entry))
+      (push entry (agent-queue agent))
+      (agent-deny-approvals agent)
+      (ignore-errors (agent-interrupt agent))
+      t)))
+
+(defun agent-retry-pending-p (agent)
+  (consp (agent-retry agent)))
+
+(defun agent-end-turn (agent)
+  "End AGENT's turn and what waits behind it, even if it doesn't answer an
+interrupt: its process goes (the conversation carries on with the next
+prompt)."
+  (agent-cancel agent)
+  (agent-shutdown agent)
+  (when (agent-busy agent)
+    (agent-turn-finished agent *stopped-text* t)))
 
 ;;; Approvals
 
@@ -385,6 +469,8 @@ when it isn't running with the current settings."
                         (list (cons "answers" (cons :object answers))))))
 
 (defun claude-agent-event (agent cp event)
+  ;; A subagent's events aren't shown, but they are signs of life.
+  (when (eq cp (claude-agent-process agent)) (agent-touch agent))
   (when (and (eq cp (claude-agent-process agent)) (not (event-subagent event)))
     (case (event-kind event)
       (:init (when (event-session-id event)
@@ -648,6 +734,7 @@ rather than using a server with no thread."
 
 (defun codex-agent-event (agent server event)
   (when (eq server (codex-agent-server agent))
+    (agent-touch agent)
     (case (codex-event-kind event)
       (:text-delta (agent-emit agent :delta :text (codex-event-text event)))
       (:text (setf (codex-agent-last-text agent) (codex-event-text event))

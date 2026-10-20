@@ -43,6 +43,11 @@
 ;;;; other agent, or STOP-WORKFLOW. Work handed off goes unreviewed when the
 ;;;; one that ran out was to review it, and says so.
 ;;;;
+;;;; A turn that goes quiet (agents.lisp) can be retried within the
+;;;; workflow: the step's prompt is given again once the interrupted turn
+;;;; has ended, and its reply goes on as the first one's would have
+;;;; (RETRY-STALLED-TURN). Or the task can be stopped (STOP-STALLED-TURN).
+;;;;
 ;;;; A workflow that finished with a loop still unapproved after MAX-ROUNDS
 ;;;; can be carried on for more rounds (CONTINUE-WORKFLOW): the author
 ;;;; addresses the last review, as it would have in another round. Only
@@ -877,6 +882,107 @@ still open, and is asked once to settle them (that's no new round)."
     (leave-worktrees workflow)
     (when (workflow-on-finish workflow)
       (funcall (workflow-on-finish workflow) workflow))))
+
+;;; A turn gone quiet
+
+(defun workflow-agent-p (workflow agent)
+  "Whether WORKFLOW (or nil) is running with AGENT in it."
+  (and workflow (workflow-live-p workflow)
+       (member agent (list (workflow-lead workflow) (workflow-partner workflow)))
+       t))
+
+(defun retry-stalled-turn (workflow agent)
+  "Interrupt AGENT's quiet turn and give it the same prompt once that turn
+has ended (AGENT-RETRY-TURN); within WORKFLOW (or nil), its reply carries
+the step on. True if there was a turn to retry."
+  (when (agent-retry-turn agent)
+    (when (workflow-agent-p workflow agent)
+      (note workflow "~a's turn was quiet too long: interrupting it, to give the same prompt again once it has ended."
+            (agent-name agent)))
+    t))
+
+(defun stop-stalled-turn (workflow agent)
+  "Stop the task AGENT's quiet turn is part of, if any (WORKFLOW, or nil),
+and end the turn, even if it doesn't answer an interrupt (AGENT-END-TURN)."
+  (when (workflow-agent-p workflow agent)
+    (stop-workflow workflow))
+  (agent-end-turn agent))
+
+;;; What a task changed: the folder's state as it starts and once it has
+;;; ended, as snapshots (snapshot.lisp)
+
+(defvar *task-snapshot* 'snapshot-folder
+  "Takes (directory label); returns a snapshot, or nil outside a git repository with a commit.")
+(defvar *task-snapshot-delete* 'delete-snapshot "Takes (directory snapshot).")
+(defvar *task-snapshot-prune* 'prune-snapshots "Takes (directory).")
+
+(defstruct (task-changes (:constructor %make-task-changes))
+  workflow directory label
+  start                                 ; the snapshot as it started, or nil
+  end                                   ; the snapshot as it last ended, or nil
+  (final nil))                          ; nil while it runs, :pending until its agents
+                                        ; have stopped, then :taken or :failed
+
+(defun task-snapshot (task suffix)
+  "A snapshot of TASK's folder, labelled with SUFFIX; nil and why on failure."
+  (handler-case
+      (values (funcall *task-snapshot* (task-changes-directory task)
+                       (format nil "~a-~a" (task-changes-label task) suffix)))
+    (error (e) (values nil (princ-to-string e)))))
+
+(defun begin-task-changes (workflow directory)
+  "Record DIRECTORY as WORKFLOW starts. Returns the TASK-CHANGES, and why its
+start couldn't be recorded, if it failed (outside a git repository, it
+just has no start)."
+  (let ((task (%make-task-changes :workflow workflow :directory directory
+                                  :label (format nil "task-~d-~a" (get-universal-time)
+                                                 (subseq (make-uuid) 0 8)))))
+    (multiple-value-bind (start why) (task-snapshot task "start")
+      (setf (task-changes-start task) start)
+      (values task why))))
+
+(defun end-task-changes (task)
+  "TASK's workflow has ended (finished, failed or stopped): its end is to be
+recorded once its agents have stopped too (FINISH-TASK-CHANGES)."
+  (when (task-changes-start task)
+    (setf (task-changes-final task) :pending)))
+
+(defun task-agents-idle-p (task)
+  (let ((workflow (task-changes-workflow task)))
+    (notany #'agent-busy (list (workflow-lead workflow) (workflow-partner workflow)))))
+
+(defun finish-task-changes (task)
+  "Record TASK's end if it's waiting to be and nothing of the task is still
+running: a stopped agent may write until its turn has ended. Returns
+:taken; :failed and why; or nil when it isn't time. A new end replaces
+the one from before a continuation only once it's taken."
+  (when (and (eq (task-changes-final task) :pending)
+             (not (workflow-live-p (task-changes-workflow task)))
+             (task-agents-idle-p task))
+    (multiple-value-bind (end why) (task-snapshot task (format nil "end-~a" (subseq (make-uuid) 0 8)))
+      (let ((directory (task-changes-directory task))
+            (old (task-changes-end task)))
+        (cond (end
+               (setf (task-changes-end task) end
+                     (task-changes-final task) :taken)
+               (when old (ignore-errors (funcall *task-snapshot-delete* directory old)))
+               (ignore-errors (funcall *task-snapshot-prune* directory))
+               :taken)
+              (t
+               (setf (task-changes-final task) :failed)
+               (values :failed (or why "the folder is no longer a git repository with a commit"))))))))
+
+(defun task-changes-range (task)
+  "What TASK's changes are, as (values kind start end), KIND being
+:unrecorded (no start), :live (still running or ending: from START to
+now), :final (from START to END), or :failed (its end couldn't be recorded)."
+  (cond ((null (task-changes-start task)) :unrecorded)
+        ((or (workflow-live-p (task-changes-workflow task))
+             (member (task-changes-final task) '(nil :pending)))
+         (values :live (task-changes-start task) nil))
+        ((eq (task-changes-final task) :failed) :failed)
+        (t (values :final (task-changes-start task) (task-changes-end task)))))
+
 ;;; Separate worktrees
 
 (defun worktrees-problem (directory)

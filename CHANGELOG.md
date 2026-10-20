@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A turn with no events for 5 minutes (`:stall-minutes` in the settings)
+  gets a card: *Keep waiting*, *Interrupt and retry* (the same prompt is
+  sent again only once the interrupted turn has ended; if it doesn't end,
+  the card says so and offers *Stop*), or *Stop*. Time waiting on the user
+  (approvals, questions, plan approval, usage pauses) doesn't count.
+- *Changes*: the folder's state is recorded (as git commits under
+  `refs/agent-duet/snapshots/`, without touching the index, files or stash)
+  when a task starts and finishes, and **Changes** in the header shows what
+  the latest task changed, file by file, with each file's diff.
 - *Check* command per folder (`make test`, `npm test`, …): it runs after
   each round of work, before the review. A failure goes back to the author
   with its output (up to twice a round), and the review prompt says how the

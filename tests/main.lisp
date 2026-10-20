@@ -715,6 +715,270 @@ VERDICT: CHANGES REQUESTED"))))
     (true (every #'third results))
     (false (ai::agent-queue agent))))
 
+;;; A turn gone quiet
+
+(defun go-quiet (agent seconds)
+  "Make AGENT's last sign of life SECONDS ago."
+  (setf (ai::agent-last-activity agent) (- (ai::clock-seconds) seconds)))
+
+(define-test stall-after-silence
+    :parent agent-duet
+  (let ((agent (make-instance 'hanging-agent :id :claude :name "Claude" :replies '())))
+    ;; Idle: nothing to stall.
+    (go-quiet agent 1000)
+    (false (ai::agent-silence agent))
+    (ai:agent-submit agent "work")
+    (false (ai::agent-check-stall agent 300))
+    (go-quiet agent 299)
+    (false (ai::agent-check-stall agent 300))
+    (go-quiet agent 301)
+    (true (ai::agent-check-stall agent 300))
+    ;; Reported once for each silence.
+    (false (ai::agent-check-stall agent 300))
+    ;; An event starts the silence again.
+    (ai::agent-emit agent :delta :text "still here")
+    (false (ai::agent-check-stall agent 300))
+    (go-quiet agent 301)
+    (true (ai::agent-check-stall agent 300))
+    ;; Keep waiting: another while.
+    (ai::agent-keep-waiting agent)
+    (false (ai::agent-check-stall agent 300))
+    (go-quiet agent 301)
+    (true (ai::agent-check-stall agent 300))
+    ;; A turn being stopped isn't stalled.
+    (go-quiet agent 1000)
+    (ai:agent-cancel agent)
+    (false (ai::agent-silence agent))))
+
+(define-test stall-not-while-waiting-for-user
+    :parent agent-duet
+  ;; A permission or a question waiting doesn't count.
+  (let ((agent (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+        (answer nil))
+    (ai:agent-submit agent "work")
+    (ai::agent-ask-approval agent "a1" "$ make test" nil (lambda (d) (setf answer d)))
+    (go-quiet agent 1000)
+    (false (ai::agent-silence agent))
+    (false (ai::agent-check-stall agent 300))
+    ;; Answered: the silence starts from there.
+    (ai::agent-answer-approval agent "a1" :allow)
+    (is eq :allow answer)
+    (false (ai::agent-check-stall agent 300))
+    (ai::agent-ask-question agent "q1" '() (lambda (d) (declare (ignore d))))
+    (go-quiet agent 1000)
+    (false (ai::agent-check-stall agent 300)))
+  ;; A plan waiting for approval: neither agent is in a turn.
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :divide
+                (responder "Split the work" (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B") "Did A")
+                (says "Did B")
+                :on-plan (lambda (&rest args) (declare (ignore args))))
+    (declare (ignore messages))
+    (true (ai:workflow-pending-plan workflow))
+    (dolist (agent (list claude codex))
+      (go-quiet agent 1000)
+      (false (ai::agent-check-stall agent 300))))
+  ;; Paused for want of usage: nor here.
+  (multiple-value-bind (workflow paused claude codex)
+      (run-pausing :review (list (says "Wrote it")) (list (says :out-of-usage)))
+    (true paused)
+    (is eq :running (ai:workflow-state workflow))
+    (dolist (agent (list claude codex))
+      (go-quiet agent 1000)
+      (false (ai::agent-check-stall agent 300)))))
+
+(define-test stall-retry-after-turn-ends
+    :parent agent-duet
+  (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT"
+                               :replies (list (says (format nil "Fine.~%VERDICT: APPROVED")))))
+         (workflow (make-instance 'ai:workflow :mode :review :lead claude :partner codex :request "Add frobnicate")))
+    (ai:start-workflow workflow)
+    (go-quiet claude 400)
+    (true (ai::agent-check-stall claude 300))
+    (true (ai::retry-stalled-turn workflow claude))
+    ;; Interrupted, but not over yet: nothing is sent again.
+    (is = 1 (length (fake-prompts claude)))
+    (true (ai::agent-retry-pending-p claude))
+    (false (car (ai::agent-turn-token claude)))
+    (false (ai::agent-check-stall claude 0))
+    (false (ai::retry-stalled-turn workflow claude))
+    ;; The interrupted turn ends: the workflow doesn't hear of it, and the
+    ;; same prompt goes again.
+    (ai:agent-turn-finished claude "Interrupted." t)
+    (is eq :running (ai:workflow-state workflow))
+    (is eq :sent (ai::agent-retry claude))
+    (is = 2 (length (fake-prompts claude)))
+    (is string= (second (fake-prompts claude)) (first (fake-prompts claude)))
+    (true (car (ai::agent-turn-token claude)))
+    ;; Its reply carries the workflow on.
+    (ai:agent-turn-finished claude "Wrote it" nil)
+    (is eq :finished (ai:workflow-state workflow))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (true (search "Wrote it" (first (fake-prompts codex))))))
+
+(define-test stall-stop-when-turn-never-ends
+    :parent agent-duet
+  (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies '()))
+         (workflow (make-instance 'ai:workflow :mode :review :lead claude :partner codex :request "x")))
+    (ai:start-workflow workflow)
+    (true (ai::retry-stalled-turn workflow claude))
+    ;; The interrupt went unanswered: Stop ends it all the same.
+    (ai::stop-stalled-turn workflow claude)
+    (is eq :stopped (ai:workflow-state workflow))
+    (false (ai:agent-busy claude))
+    (is eq :dropped (ai::agent-retry claude))
+    (is = 1 (length (fake-prompts claude)))
+    (false (ai::agent-queue claude)))
+  ;; Outside a workflow, it ends the agent's turn alone.
+  (let ((agent (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+        (result nil))
+    (ai:agent-submit agent "work" (lambda (text error) (setf result (list text error))))
+    (ai::stop-stalled-turn nil agent)
+    (false (ai:agent-busy agent))
+    (true (second result))))
+
+(define-test stall-cleared-by-every-sign-of-life
+    :parent agent-duet
+  ;; Events that aren't shown count too, and clear a reported stall (so the
+  ;; card for it settles): a Claude subagent's, Codex's stderr and usage.
+  (let* ((claude (make-instance 'ai:claude-agent))
+         (cp (ai::make-claude-process)))
+    (setf (ai::claude-agent-process claude) cp
+          (ai::agent-busy claude) t
+          (ai::agent-turn-token claude) (list t))
+    (go-quiet claude 400)
+    (true (ai::agent-check-stall claude 300))
+    (ai::claude-agent-event claude cp (ai::make-claude-event :kind :text :text "inner" :subagent t))
+    (false (ai::agent-stall-noticed claude))
+    (false (ai::agent-check-stall claude 300))
+    (setf (ai::agent-busy claude) nil))
+  (let ((codex (make-instance 'ai:codex-agent))
+        (server (ai::make-codex-app-server)))
+    (setf (ai::codex-agent-server codex) server
+          (ai::agent-busy codex) t
+          (ai::agent-turn-token codex) (list t))
+    (dolist (event (list (ai::make-codex-event :kind :stderr :text "working…")
+                         (ai::make-codex-event :kind :rate-limits :data nil)))
+      (go-quiet codex 400)
+      (true (ai::agent-check-stall codex 300))
+      (ai::codex-agent-event codex server event)
+      (false (ai::agent-stall-noticed codex)))
+    (setf (ai::codex-agent-server codex) nil (ai::agent-busy codex) nil)))
+
+;;; What a task changed
+
+(defmacro with-fake-snapshots ((taken deleted &key fail) &body body)
+  "BODY with snapshots faked: each is (:snapshot label), pushed onto TAKEN;
+deleted ones onto DELETED. While FAIL (a place) is true, taking one fails."
+  `(let ((,taken '()) (,deleted '()))
+     (let ((ai::*task-snapshot* (lambda (directory label)
+                                  (declare (ignore directory))
+                                  (when ,fail (error "disk full"))
+                                  (let ((snapshot (list :snapshot label)))
+                                    (push snapshot ,taken)
+                                    snapshot)))
+           (ai::*task-snapshot-delete* (lambda (directory snapshot)
+                                         (declare (ignore directory))
+                                         (push snapshot ,deleted)))
+           (ai::*task-snapshot-prune* (lambda (directory) (declare (ignore directory)))))
+       ,@body)))
+
+(defun snapshot-label (snapshot)
+  (second snapshot))
+
+(define-test task-end-after-agents-stop
+    :parent agent-duet
+  (with-fake-snapshots (taken deleted)
+    ;; Stopped mid-turn: the end waits for the turn to be over.
+    (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+           (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies '()))
+           (workflow (make-instance 'ai:workflow :mode :review :lead claude :partner codex :request "x"))
+           (task (ai::begin-task-changes workflow #p"/repo/")))
+      (setf (ai::workflow-on-finish workflow)
+            (lambda (w) (declare (ignore w))
+              (ai::end-task-changes task)
+              ;; As the finish callback runs, the stopped agent is still busy.
+              (true (ai:agent-busy claude))
+              (false (ai::finish-task-changes task))))
+      (ai:start-workflow workflow)
+      (is eq :live (ai::task-changes-range task))
+      (ai:stop-workflow workflow)
+      ;; Interrupted, but not over: no end yet, and Changes is still live.
+      (true (ai:agent-busy claude))
+      (false (ai::finish-task-changes task))
+      (is = 1 (length taken))
+      (is eq :live (ai::task-changes-range task))
+      (ai:agent-turn-finished claude "Interrupted." t)
+      (is eq :taken (ai::finish-task-changes task))
+      (is = 2 (length taken))
+      (is eq :final (ai::task-changes-range task))
+      (false deleted))
+    ;; The stall card's Stop: the end comes once the turn is ended.
+    (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :replies '()))
+           (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies '()))
+           (workflow (make-instance 'ai:workflow :mode :review :lead claude :partner codex :request "x"))
+           (task (ai::begin-task-changes workflow #p"/repo/"))
+           (busy-at-finish :unset))
+      (setf (ai::workflow-on-finish workflow)
+            (lambda (w) (declare (ignore w))
+              (setf busy-at-finish (ai:agent-busy claude))
+              (ai::end-task-changes task)
+              (ai::finish-task-changes task)))
+      (ai:start-workflow workflow)
+      (ai::stop-stalled-turn workflow claude)
+      (true busy-at-finish)
+      (is eq :pending (ai::task-changes-final task))
+      (false (ai:agent-busy claude))
+      (is eq :taken (ai::finish-task-changes task))
+      (true (search "-end-" (snapshot-label (ai::task-changes-end task)))))))
+
+(define-test task-changes-continued-and-failed
+    :parent agent-duet
+  (let ((fail nil))
+    (with-fake-snapshots (taken deleted :fail fail)
+      (let ((no (says (format nil "Still wrong~%VERDICT: CHANGES REQUESTED"))))
+        (multiple-value-bind (workflow messages)
+            (run-fake :review (list (says "v1") (says "v2") (says "v3"))
+                      (list no (says "unused")) :rounds 1)
+          (declare (ignore messages))
+          ;; As the UI does it: the start before the workflow, the end after.
+          (let ((task (ai::begin-task-changes workflow #p"/repo/")))
+            (ai::end-task-changes task)
+            (is eq :taken (ai::finish-task-changes task))
+            (let ((first-end (ai::task-changes-end task)))
+              (is eq :final (ai::task-changes-range task))
+              ;; Continued: live again, not the earlier result.
+              (setf (fake-replies (ai::workflow-partner workflow)) (list no))
+              (true (ai:continue-workflow workflow 1))
+              (is eq :finished (ai:workflow-state workflow))
+              (setf (ai:workflow-state workflow) :running)
+              (is eq :live (ai::task-changes-range task))
+              (setf (ai:workflow-state workflow) :finished)
+              ;; Its new end fails: said so, the old end kept, nothing live.
+              (ai::end-task-changes task)
+              (setf fail t)
+              (multiple-value-bind (result why) (ai::finish-task-changes task)
+                (is eq :failed result)
+                (true (search "disk full" why)))
+              (is eq :failed (ai::task-changes-range task))
+              (is eq first-end (ai::task-changes-end task))
+              (false deleted)
+              ;; Ended again and taken: the earlier end goes only now.
+              (setf fail nil)
+              (ai::end-task-changes task)
+              (is eq :taken (ai::finish-task-changes task))
+              (isnt eq first-end (ai::task-changes-end task))
+              (is equal (list first-end) deleted)
+              (is eq :final (ai::task-changes-range task)))))))
+    ;; Outside a git repository: no start, nothing to show or end.
+    (let ((ai::*task-snapshot* (lambda (directory label) (declare (ignore directory label)) nil)))
+      (multiple-value-bind (task why) (ai::begin-task-changes nil #p"/not-git/")
+        (false why)
+        (is eq :unrecorded (ai::task-changes-range task))
+        (false (ai::end-task-changes task))))))
+
 ;;; Running out of usage
 
 (define-test usage-windows

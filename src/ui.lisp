@@ -706,6 +706,7 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
   (let ((pane (agent-pane-of agent)))
     (when pane
       (record-agent-event pane kind text id error)
+      (reconcile-stall-cards agent)
       (ecase kind
         (:busy (pane-set-busy pane busy) (update-controls))
         (:prompt (pane-prompt pane text))
@@ -1219,10 +1220,193 @@ usage after the turn) brings the Wait button."
                              buttons))))
     (update-controls)))
 
+;;; A turn gone quiet
+
+(defparameter *stall-grace-seconds* 20
+  "How long an interrupted quiet turn has to end before the card says it hasn't.")
+
+(defvar *stall-cards* '()
+  "(agent . function) for the stall cards still waiting on a choice; the
+function settles the card if its turn has ended or shown signs of life.")
+
+(defun stall-minutes ()
+  "Minutes a turn may go without an event before a card asks about it
+(the :stall-minutes setting); nil when that's off (0)."
+  (let ((minutes (setting :stall-minutes *stall-minutes*)))
+    (and (realp minutes) (plusp minutes) minutes)))
+
+(defun check-stalls ()
+  (reconcile-stall-cards)
+  (let ((minutes (stall-minutes)))
+    (when minutes
+      (dolist (agent (list *claude* *codex*))
+        (when (agent-check-stall agent (round (* 60 minutes)))
+          (show-stall-card agent minutes))))))
+
+(defun reconcile-stall-cards (&optional agent)
+  "Settle the stall cards (AGENT's, or all) whose turn has ended or come
+back to life: anything that counts as activity (AGENT-TOUCH, a subagent's
+event or Codex's stderr too) clears the stall, so a card can't outlive it."
+  (dolist (entry *stall-cards*)
+    (when (or (null agent) (eq (car entry) agent))
+      (funcall (cdr entry)))))
+
+(defun show-stall-card (agent minutes)
+  "A card for AGENT's turn gone MINUTES without an event: Keep waiting,
+Interrupt and retry, or Stop. In the conversation during a task, in the
+agent's pane otherwise."
+  (let* ((workflow (and (workflow-agent-p *workflow* agent) *workflow*))
+         (pane (if workflow *middle* (agent-pane-of agent)))
+         (token (agent-turn-token agent))
+         (name (agent-name agent))
+         (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+         (status (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("dim-label") :visible nil))
+         (retrying nil)
+         (entry nil))
+    (labels ((current-p ()
+               ;; Still the turn the card is about (being interrupted, if retrying).
+               (and (agent-busy agent) (eq token (agent-turn-token agent))))
+             (say (text)
+               (gtk:label-set-text status text)
+               (gtk:widget-set-visible status t))
+             (settled (text)
+               (setf *stall-cards* (remove entry *stall-cards*))
+               (clear-box buttons)
+               (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label")))
+               (update-controls))
+             (choice (label tooltip classes action)
+               (let ((b (make-instance 'gtk:button :label label :tooltip-text tooltip :css-classes classes)))
+                 (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (funcall action)))
+                 (gtk:box-append buttons b)))
+             (stop ()
+               (if (current-p)
+                   (progn (stop-stalled-turn workflow agent) (settled "Stopped"))
+                   (settled "The turn had already ended")))
+             (stop-button ()
+               (choice "Stop" (format nil "End ~a's turn and its process~:[~;, and stop the task~]" name workflow)
+                       '("destructive-action") #'stop))
+             (keep-waiting ()
+               (if (current-p)
+                   (progn (agent-keep-waiting agent) (settled "Kept waiting"))
+                   (settled "The turn had already ended")))
+             (watch-retry ()
+               (let ((started (clock-seconds)) (warned nil))
+                 (glib:timeout-add-seconds
+                  glib:+priority-default+ 1
+                  (lambda ()
+                    (cond ((not (member entry *stall-cards*)) nil)
+                          ((eq (agent-retry agent) :sent) (settled "Interrupted and sent again") nil)
+                          ((not (agent-retry-pending-p agent)) (settled "Stopped") nil)
+                          (t (when (and (not warned) (>= (- (clock-seconds) started) *stall-grace-seconds*))
+                               (setf warned t)
+                               (say (format nil "~a's turn still hasn't ended, ~d seconds after the interrupt, so ~
+the prompt hasn't been sent again. Stop ends the turn and ~a's process~:[~;, and the task~]."
+                                            name *stall-grace-seconds* name workflow))
+                               (stop-button))
+                             t))))))
+             (retry ()
+               (cond ((not (current-p)) (settled "The turn had already ended"))
+                     ((retry-stalled-turn workflow agent)
+                      (setf retrying t)
+                      (clear-box buttons)
+                      (say (format nil "Interrupting ~a. The same prompt is sent again once its turn has ended." name))
+                      (watch-retry))
+                     (t (settled "The turn is already stopping")))))
+      (setf entry (cons agent (lambda (&optional superseded)
+                                (unless retrying
+                                  (cond ((not (current-p)) (settled "The turn ended"))
+                                        ((not (agent-stall-noticed agent)) (settled "It's working again"))
+                                        (superseded (settled "Still quiet: see the newer card")))))))
+      ;; One open card for an agent: an older one is settled first.
+      (dolist (old (remove agent *stall-cards* :key #'car :test-not #'eq))
+        (funcall (cdr old) t))
+      (push entry *stall-cards*)
+      (choice "Stop" (format nil "End ~a's turn~:[~;, and stop the task~]" name workflow)
+              '("destructive-action") #'stop)
+      (choice "Interrupt and retry"
+              (format nil "Interrupt ~a's turn, and send it the same prompt again once that turn has ended" name)
+              '() #'retry)
+      (choice "Keep waiting" (format nil "Give ~a another ~d minute~:p" name minutes) '("suggested-action")
+              #'keep-waiting)
+      (pane-append pane
+                   (gtk:build
+                    (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                             (gtk:label :label (format nil "~a has been quiet for ~d minute~:p" name minutes)
+                                        :xalign 0.0 :css-classes '("heading"))
+                             (gtk:label :label (format nil "Nothing has come from ~a's turn~:[~; (~a pane)~] in that time. ~
+It may be stuck, or busy with something long, such as a command that prints nothing until it ends."
+                                                       name workflow
+                                                       (if (eq (agent-id agent) :claude) "left" "right"))
+                                        :xalign 0.0 :wrap t)
+                             status
+                             buttons)))
+      (attention (format nil "~a has gone quiet" name)
+                 (format nil "No events for ~d minute~:p." minutes)))))
+
+;;; What the latest task changed (TASK-CHANGES; changes.lisp)
+
+(defvar *task-changes* nil "The latest task's TASK-CHANGES, or nil.")
+
+(defun snapshot-failed (why)
+  (pane-note *middle* (format nil "Couldn't record the folder's state: ~a" why) "error"))
+
+(defun snapshot-task-start (workflow)
+  "Record the folder as WORKFLOW starts; first, the last task's end, if
+that's still waiting (its agents have stopped by now)."
+  (when *task-changes* (finish-task-end *task-changes*))
+  (multiple-value-bind (task why) (begin-task-changes workflow *directory*)
+    (setf *task-changes* task)
+    (when why (snapshot-failed why))))
+
+(defun finish-task-end (task)
+  "Record TASK's end if it's time; true while it's still waiting."
+  (multiple-value-bind (result why) (finish-task-changes task)
+    (when (eq result :failed)
+      (snapshot-failed (format nil "~a. The task's changes can't be shown." why))))
+  (eq (task-changes-final task) :pending))
+
+(defun snapshot-task-end (workflow)
+  "WORKFLOW has ended: record the folder once both agents have stopped
+(an agent stopped mid-turn may still be writing)."
+  (let ((task *task-changes*))
+    (when (and task (eq workflow (task-changes-workflow task)))
+      (end-task-changes task)
+      (when (finish-task-end task)
+        (glib:timeout-add-seconds glib:+priority-default+ 1 (lambda () (finish-task-end task)))))))
+
+(defun show-task-changes ()
+  "The Changes window for the latest task: from its start to its end, or
+to now while it runs (or is still stopping)."
+  (let ((task *task-changes*))
+    (if (null task)
+        (pane-note *middle* "No task has run yet. Changes shows what the latest task changed in the folder."
+                   "dim-label" "duet-note")
+        (let ((directory (task-changes-directory task)))
+          (multiple-value-bind (kind start end) (task-changes-range task)
+            (ecase kind
+              (:unrecorded
+               (pane-note *middle* "The latest task's changes weren't recorded: its folder isn't a git repository with a commit, or recording failed."
+                          "dim-label" "duet-note"))
+              (:failed
+               (pane-note *middle* "The latest task's final state couldn't be recorded, so its changes can't be shown."
+                          "dim-label" "duet-note"))
+              (:final
+               (show-changes-window directory start end :title (format nil "Changes · ~a" (folder-label directory))))
+              (:live
+               (multiple-value-bind (now why) (task-snapshot task (format nil "now-~a" (subseq (make-uuid) 0 8)))
+                 (if (null now)
+                     (snapshot-failed (or why "the folder is no longer a git repository with a commit"))
+                     (unwind-protect
+                          (show-changes-window directory start now
+                                               :title (format nil "Changes so far · ~a" (folder-label directory)))
+                       ;; The window has read what it shows.
+                       (ignore-errors (funcall *task-snapshot-delete* directory now))))))))))))
+
 ;;; A workflow stopped at its last round, unapproved
 
 (defun workflow-finished (workflow)
   (clear-pause-timers)
+  (snapshot-task-end workflow)
   (when (eq (workflow-state workflow) :finished)
     (attention "Both agents have finished"
                (format nil "~{~a~^; ~}"
@@ -1339,6 +1523,7 @@ usage after the turn) brings the Wait button."
                                                :worktrees (worktrees-wanted-p)
                                                :check-command (folder-check-command *directory*)
                                                :on-finish #'workflow-finished))
+               (snapshot-task-start *workflow*)
                (start-workflow *workflow*)
                (update-controls))))))))
 
@@ -1540,16 +1725,20 @@ usage after the turn) brings the Wait button."
     (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
                                    :tooltip-text "Show or hide the terminal panel (Ctrl+`)"))
           (documents (make-instance 'gtk:button :label "Documents"
-                                    :tooltip-text "Preview the folder's Markdown files")))
+                                    :tooltip-text "Preview the folder's Markdown files"))
+          (changes (make-instance 'gtk:button :label "Changes"
+                                  :tooltip-text "What the latest task changed in the folder, file by file (a git repository's)")))
       (gobject:connect terminal :toggled
                        (lambda (b)
                          (let ((active (gtk:toggle-button-get-active b)))
                            (unless (eq active (terminal-visible-p))
                              (set-terminal-visible active)))))
       (gobject:connect documents :clicked (lambda (b) (declare (ignore b)) (show-documents)))
+      (gobject:connect changes :clicked (lambda (b) (declare (ignore b)) (show-task-changes)))
       (setf *controls* (list* :terminal terminal *controls*))
       (gtk:header-bar-pack-start header terminal)
       (gtk:header-bar-pack-start header documents)
+      (gtk:header-bar-pack-start header changes)
       (gtk:header-bar-pack-start header (make-history-button)))
     (let ((checklist (make-instance 'gtk:toggle-button :label "Checklist"
                                     :active (setting :checklist-visible t)
@@ -1743,6 +1932,8 @@ usage after the turn) brings the Wait button."
                               (lambda ()
                                 (dolist (entry *panes*) (pane-update-status (cdr entry)))
                                 t))
+    ;; Turns gone quiet.
+    (glib:timeout-add-seconds glib:+priority-default+ 15 (lambda () (check-stalls) t))
     (gobject:connect window :close-request
                      (lambda (w) (declare (ignore w))
                        (dolist (agent (list *claude* *codex*))
