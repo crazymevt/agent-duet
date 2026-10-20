@@ -6,6 +6,8 @@
   with no file changes, before reviewing the merged result. Worktrees and
   task-scoped recovery refs are kept until approval; unfinished tasks report
   their recovery locations.
+- The conversation-only view has each agent's model and thinking-level
+  dropdowns under its status, kept in step with the ones in its pane.
 
 ## 1.0.0 - 2026-10-20
 

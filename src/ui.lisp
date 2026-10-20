@@ -265,7 +265,7 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   (approvals (make-hash-table :test 'equal))  ; approval id → its cards: (button row . widgets to disable)s
   (ready "Checking…")                         ; what the status says when the agent is idle
   (version nil)
-  model-dropdown effort-dropdown
+  (model-dropdowns '()) (effort-dropdowns '()) ; in its pane and in the conversation-only view
   (models '())                 ; the model dropdown's choices: names (Claude) or model/list entries (Codex)
   (efforts '(nil))             ; the effort dropdown's choices, nil being the default
   (refreshing nil))            ; true while the dropdowns are being refilled
@@ -285,8 +285,13 @@ drop before WIDGET's children, so a text view doesn't take it as text."
 (defun model-choice-id (agent model)
   (if (eq (agent-id agent) :claude) (claude-model-id model) (codex-model-id model)))
 
+;;; Each agent has a model and an effort dropdown in its pane, and another
+;;; pair in the conversation-only view's activity strip; all show the same.
+
 (defun pane-current-model-entry (pane)
-  (nth (gtk:drop-down-get-selected (agent-pane-model-dropdown pane)) (agent-pane-models pane)))
+  (let ((agent (agent-pane-agent pane)))
+    (find (agent-model agent) (agent-pane-models pane)
+          :key (lambda (m) (model-choice-id agent m)) :test #'equal)))
 
 (defun pane-effort-choices (pane)
   (let ((agent (agent-pane-agent pane)))
@@ -299,74 +304,100 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   (format nil "Thinking: ~a" (if effort (string-capitalize effort) "Default")))
 
 (defun refresh-effort-dropdown (pane)
-  "Fill the effort dropdown with the current model's levels, keeping the
+  "Fill the effort dropdowns with the current model's levels, keeping the
 agent's effort when the model has it."
   (let* ((agent (agent-pane-agent pane))
-         (choices (pane-effort-choices pane))
-         (dropdown (agent-pane-effort-dropdown pane)))
+         (choices (pane-effort-choices pane)))
     (unless (member (agent-effort agent) choices :test #'equal)
       (setf (agent-effort agent) nil))
     (setf (agent-pane-refreshing pane) t)
     (unwind-protect
         (progn
           (setf (agent-pane-efforts pane) choices)
-          (gtk:drop-down-set-model dropdown (gtk:string-list-new (mapcar #'effort-label choices)))
-          (gtk:drop-down-set-selected dropdown (or (position (agent-effort agent) choices :test #'equal) 0))
-          (gtk:widget-set-sensitive dropdown (> (length choices) 1)))
+          (dolist (dropdown (agent-pane-effort-dropdowns pane))
+            (gtk:drop-down-set-model dropdown (gtk:string-list-new (mapcar #'effort-label choices)))
+            (gtk:drop-down-set-selected dropdown (or (position (agent-effort agent) choices :test #'equal) 0))
+            (gtk:widget-set-sensitive dropdown (> (length choices) 1))))
+      (setf (agent-pane-refreshing pane) nil))))
+
+(defun show-model-choice (pane)
+  "Select the agent's model in each of PANE's model dropdowns."
+  (let ((i (or (position (pane-current-model-entry pane) (agent-pane-models pane)) 0)))
+    (setf (agent-pane-refreshing pane) t)
+    (unwind-protect
+        (dolist (dropdown (agent-pane-model-dropdowns pane))
+          (unless (= (gtk:drop-down-get-selected dropdown) i)
+            (gtk:drop-down-set-selected dropdown i)))
+      (setf (agent-pane-refreshing pane) nil))))
+
+(defun show-effort-choice (pane)
+  "Select the agent's effort in each of PANE's effort dropdowns."
+  (let ((i (or (position (agent-effort (agent-pane-agent pane)) (agent-pane-efforts pane) :test #'equal) 0)))
+    (setf (agent-pane-refreshing pane) t)
+    (unwind-protect
+        (dolist (dropdown (agent-pane-effort-dropdowns pane))
+          (unless (= (gtk:drop-down-get-selected dropdown) i)
+            (gtk:drop-down-set-selected dropdown i)))
       (setf (agent-pane-refreshing pane) nil))))
 
 (defun set-model-choices (pane models)
-  "Fill the model dropdown with MODELS, selecting the agent's model (or,
+  "Fill the model dropdowns with MODELS, selecting the agent's model (or,
 for Codex, the one marked as the default)."
-  (let* ((agent (agent-pane-agent pane))
-         (dropdown (agent-pane-model-dropdown pane)))
+  (let ((agent (agent-pane-agent pane)))
     (setf (agent-pane-refreshing pane) t)
     (unwind-protect
         (progn
           (setf (agent-pane-models pane) models)
-          (gtk:drop-down-set-model dropdown
-                                   (gtk:string-list-new
-                                    (or (mapcar (lambda (m) (model-choice-name agent m)) models)
-                                        '("Default model"))))
           (let ((i (or (position (agent-model agent) models
                                  :key (lambda (m) (model-choice-id agent m)) :test #'equal)
                        (and (eq (agent-id agent) :codex)
                             (position-if (lambda (m) (eq (jget m "isDefault") t)) models))
                        0)))
-            (gtk:drop-down-set-selected dropdown i)
             (when models
-              (setf (agent-model agent) (model-choice-id agent (nth i models)))))
-          (gtk:widget-set-sensitive dropdown (not (null models))))
+              (setf (agent-model agent) (model-choice-id agent (nth i models))))
+            (dolist (dropdown (agent-pane-model-dropdowns pane))
+              (gtk:drop-down-set-model dropdown
+                                       (gtk:string-list-new
+                                        (or (mapcar (lambda (m) (model-choice-name agent m)) models)
+                                            '("Default model"))))
+              (gtk:drop-down-set-selected dropdown i)
+              (gtk:widget-set-sensitive dropdown (not (null models))))))
       (setf (agent-pane-refreshing pane) nil))
     (refresh-effort-dropdown pane)))
 
 (defun make-model-dropdowns (pane)
-  (let ((agent (agent-pane-agent pane))
-        (models (gtk:drop-down-new-from-strings '("Default model")))
-        (efforts (gtk:drop-down-new-from-strings '("Thinking: Default"))))
-    (setf (agent-pane-model-dropdown pane) models
-          (agent-pane-effort-dropdown pane) efforts)
+  "A model and an effort dropdown for PANE's agent, kept in step with its others."
+  (let* ((agent (agent-pane-agent pane))
+         (first (null (agent-pane-model-dropdowns pane)))
+         (models (gtk:drop-down-new-from-strings '("Default model")))
+         (efforts (gtk:drop-down-new-from-strings '("Thinking: Default"))))
+    (setf (agent-pane-model-dropdowns pane) (append (agent-pane-model-dropdowns pane) (list models))
+          (agent-pane-effort-dropdowns pane) (append (agent-pane-effort-dropdowns pane) (list efforts)))
     (gtk:widget-set-tooltip-text models (format nil "~a's model, from its next message" (agent-name agent)))
     (gtk:widget-set-tooltip-text efforts (format nil "How hard ~a thinks, from its next message" (agent-name agent)))
     (gobject:connect models "notify::selected"
-                     (lambda (d pspec) (declare (ignore d pspec))
+                     (lambda (d pspec) (declare (ignore pspec))
                        (unless (agent-pane-refreshing pane)
-                         (let ((model (pane-current-model-entry pane)))
+                         (let ((model (nth (gtk:drop-down-get-selected d) (agent-pane-models pane))))
                            (when model
                              (setf (agent-model agent) (model-choice-id agent model)
                                    (setting (agent-setting-key agent "MODEL")) (agent-model agent))))
+                         (show-model-choice pane)
                          (refresh-effort-dropdown pane)
                          (setf (setting (agent-setting-key agent "EFFORT")) (agent-effort agent)))))
     (gobject:connect efforts "notify::selected"
                      (lambda (d pspec) (declare (ignore pspec))
                        (unless (agent-pane-refreshing pane)
                          (setf (agent-effort agent) (nth (gtk:drop-down-get-selected d) (agent-pane-efforts pane))
-                               (setting (agent-setting-key agent "EFFORT")) (agent-effort agent)))))
-    (when (eq (agent-id agent) :claude)
-      ;; The CLI catalog arrives asynchronously. Its IDs can include choices
-      ;; absent from the built-in aliases (for example "default" or a full
-      ;; versioned name). Keep the restored model until that catalog arrives.
-      (set-model-choices pane (claude-startup-models (agent-model agent))))
+                               (setting (agent-setting-key agent "EFFORT")) (agent-effort agent))
+                         (show-effort-choice pane))))
+    (if (and first (eq (agent-id agent) :claude))
+        ;; The CLI catalog arrives asynchronously. Its IDs can include choices
+        ;; absent from the built-in aliases (for example "default" or a full
+        ;; versioned name). Keep the restored model until that catalog arrives.
+        (set-model-choices pane (claude-startup-models (agent-model agent)))
+        ;; A later pair starts with what the others show.
+        (set-model-choices pane (agent-pane-models pane)))
     (values models efforts)))
 
 ;;; The pane
@@ -1257,20 +1288,30 @@ its part in the task (working, reviewing, waiting…), or its own status."
 
 (defun make-activity-strip ()
   "The line under the conversation's heading saying what each agent is
-doing, shown in the conversation-only view."
+doing, with its model and thinking level, shown in the conversation-only view."
   (let ((claude (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")))
         (codex (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label"))))
+    (flet ((agent-column (agent label)
+             (multiple-value-bind (models efforts) (make-model-dropdowns (agent-pane-of agent))
+               (gtk:build
+                (gtk:box :orientation :vertical :spacing 4
+                         (gtk:box :spacing 6
+                                  (gtk:label :label (agent-name agent) :css-classes (list "caption-heading" (agent-css-class agent)))
+                                  label)
+                         (let ((controls (wrapping-controls models efforts)))
+                           ;; Lined up with the agent's name, as the strip has its own margins.
+                           (gtk:widget-set-margin-start controls 0)
+                           (gtk:widget-set-margin-end controls 0)
+                           (gtk:widget-set-margin-top controls 0)
+                           (gtk:widget-set-margin-bottom controls 0)
+                           controls))))))
     (let ((strip (gtk:build
                   (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-bottom 6 :homogeneous t
-                           (gtk:box :spacing 6
-                                    (gtk:label :label (agent-name *claude*) :css-classes (list "caption-heading" (agent-css-class *claude*)))
-                                    claude)
-                           (gtk:box :spacing 6
-                                    (gtk:label :label (agent-name *codex*) :css-classes (list "caption-heading" (agent-css-class *codex*)))
-                                    codex)))))
+                           (agent-column *claude* claude)
+                           (agent-column *codex* codex)))))
       (gtk:widget-set-visible strip (eq *view* :conversation))
       (setf *controls* (list* :activity strip :claude-activity claude :codex-activity codex *controls*))
-      strip)))
+      strip))))
 
 ;;; A step paused because its agent ran out of usage
 
