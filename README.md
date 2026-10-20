@@ -4,6 +4,8 @@ Claude and ChatGPT working on the same code, side by side, through their
 command-line tools: Claude Code (`claude -p`, stream-json) and Codex
 (`codex app-server`, the CLI bundled with the ChatGPT app or on PATH).
 
+![Agent Duet: Claude writes, ChatGPT reviews, with the review checklist on the right](docs/screenshot.png)
+
 The window has three panes:
 
 - **Left: Claude.** Everything Claude does: the prompts it gets, its reply as it
