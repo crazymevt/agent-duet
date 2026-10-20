@@ -66,6 +66,31 @@
                (files (remove "" (uiop:split-string output :separator '(#\Null)) :test #'equal)))
           (if files (values :conflict files) (error condition)))))))
 
+(export 'merge-prerequisite-into-worktree)
+
+(defun merge-prerequisite-into-worktree (tree-path prerequisite-head &key (message "Merge prerequisite work"))
+  "Merge PREREQUISITE-HEAD without changing uncommitted work.
+Return :MERGED, :ALREADY, :DIRTY, or :CONFLICT and its filenames.
+A conflicting merge stays open for recovery; other Git failures signal errors.
+MESSAGE labels a merge commit when one is needed; fast-forwards create no commit."
+  (unless (zerop (length (worktree-git tree-path "status" "--porcelain=v1" "-z" "--untracked-files=all")))
+    (return-from merge-prerequisite-into-worktree (values :dirty nil)))
+  (multiple-value-bind (output errors status)
+      (uiop:run-program (list "git" "-C" (namestring (uiop:ensure-directory-pathname tree-path))
+                              "merge-base" "--is-ancestor" prerequisite-head "HEAD")
+                        :output :string :error-output :string :ignore-error-status t)
+    (declare (ignore output))
+    (cond ((zerop status) (return-from merge-prerequisite-into-worktree (values :already nil)))
+          ((/= status 1) (error "Cannot inspect prerequisite ancestry: ~a" errors))))
+  (handler-case
+      (progn (worktree-git tree-path "merge" "--no-edit" "-m" message prerequisite-head)
+             (values :merged nil))
+    (error (condition)
+      (let ((files (remove "" (uiop:split-string
+                                (worktree-git tree-path "diff" "--name-only" "--diff-filter=U" "-z")
+                                :separator '(#\Null)) :test #'equal)))
+        (if files (values :conflict files) (error condition))))))
+
 (defun remove-worktree (repo-directory worktree-directory &key delete-branch recovery-task recovery-part)
   "Remove a clean worktree and optionally its branch; return T. With RECOVERY-TASK,
 first keep its committed state with RETAIN-WORKTREE (RECOVERY-PART defaulting as there),

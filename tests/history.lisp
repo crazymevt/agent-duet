@@ -427,3 +427,77 @@
   (is equal "waiting for prerequisite work" (ai::step-reason-text :dependency))
   (is equal "prerequisite changed; needs revalidation" (ai::step-reason-text "prerequisite-changed"))
   (is equal "could not continue after the step finished" (ai::step-reason-text :continuation-failed)))
+
+(define-test dependency-recovery-summaries :parent agent-duet
+  (let* ((loops (vector (ai::jobj "label" "Prepare schema" "state" "working")
+                        (ai::jobj "label" "Use schema" "state" "paused" "dependencies" #(0)
+                                  "revision" 2 "prerequisite-revisions" #(1))))
+         (step (ai::jobj "id" "waiting" "agent" "codex" "role" "author"
+                        "loop" 1 "state" "paused" "reason" "dependency"))
+         (checkpoint (ai::jobj "state" "paused" "loops" loops "steps" (vector step)))
+         (summary (ai::checkpoint-summary checkpoint)))
+    (is equal "waiting for Prepare schema" (getf (getf summary :step) :waiting-for))
+    (is equal "waiting for Prepare schema" (getf (second (getf summary :loops)) :waiting-for))
+    (let ((inspection (ai::inspection-summary (ai::jobj "steps" (vector step)) checkpoint)))
+      (is equal "waiting for Prepare schema" (getf (first (getf inspection :steps)) :waiting-for)))
+    (setf (cdr (assoc "reason" (cdr step) :test #'equal)) "deadlock")
+    (let ((deadlock (ai::checkpoint-summary checkpoint)))
+      (is equal "waiting for Prepare schema" (getf (getf deadlock :step) :waiting-for))
+      (is equal "waiting for Prepare schema" (getf (second (getf deadlock :loops)) :waiting-for))
+      (is equal '(:review :revise-order :run-independently :stop :abandon) (ai::recovery-actions deadlock))
+      (is equal '("Revise the order" "Run independently")
+          (mapcar #'second (ai::recovery-choices '(:revise-order :run-independently)))))
+    ;; Missing dependency and revision keys remain readable.
+    (setf (cdr (assoc "loops" (cdr checkpoint) :test #'equal)) (vector (ai::jobj "label" "Old part")))
+    (false (getf (getf (ai::checkpoint-summary checkpoint) :step) :waiting-for))))
+
+(define-test dependency-check-failed-summary :parent agent-duet
+  (dolist (state '("approved" "unreviewed"))
+    (dolist (reason '("dependency" "deadlock"))
+      (let* ((checkpoint
+               (ai::jobj "loops" (vector (ai::jobj "label" "Prepare schema" "state" state "check-failed" t)
+                                        (ai::jobj "label" "Use schema" "state" "paused" "dependencies" #(0)))
+                         "steps" (vector (ai::jobj "loop" 1 "state" "paused" "reason" reason))))
+             (summary (ai::checkpoint-summary checkpoint)))
+        (is equal "waiting for Prepare schema" (getf (second (getf summary :loops)) :waiting-for))
+        (is equal "waiting for Prepare schema" (getf (getf summary :step) :waiting-for))))))
+
+(define-test ordered-plan-summary :parent agent-duet
+  (let ((checkpoint (ai::jobj "pending-plan" (ai::jobj "lead" "A" "partner" "B"))))
+    (false (getf (getf (ai::checkpoint-summary checkpoint) :pending-plan) :order))
+    (setf checkpoint (ai::jobj "pending-plan" (ai::jobj "lead" "A" "partner" "B"
+                                                                  "order" "lead-first" "error" "Circular prerequisites")))
+    (let ((plan (getf (ai::checkpoint-summary checkpoint) :pending-plan)))
+      (is equal "lead-first" (getf plan :order))
+      (is equal "Circular prerequisites" (getf plan :error))))
+  (is equal "each part is waiting on the other" (ai::step-reason-text :deadlock))
+  (is equal "each part is waiting on the other" (ai::step-reason-text "deadlock")))
+
+(define-test dependency-labels-only-while-waiting :parent agent-duet
+  (dolist (ready '("approved" "unreviewed"))
+    (dolist (state '("working" "reviewing" "checking" "paused"))
+      (let* ((checkpoint
+               (ai::jobj "loops" (vector (ai::jobj "label" "Prepare schema" "state" ready)
+                                        (ai::jobj "label" "Use schema" "state" state "dependencies" #(0)))
+                         "steps" (vector (ai::jobj "loop" 1 "state" "paused" "reason" "dependency"))))
+             (summary (ai::checkpoint-summary checkpoint)))
+        (false (getf (second (getf summary :loops)) :waiting-for))
+        (false (getf (getf summary :step) :waiting-for)))))
+  ;; An unmet edge alone doesn't mean the part is waiting on that edge.
+  (dolist (reason '("failed" "out-of-usage" "restart"))
+    (let* ((checkpoint
+             (ai::jobj "loops" (vector (ai::jobj "label" "Prepare schema" "state" "working")
+                                      (ai::jobj "label" "Use schema" "state" "paused" "dependencies" #(0)))
+                       "steps" (vector (ai::jobj "loop" 1 "state" "paused" "reason" reason))))
+           (summary (ai::checkpoint-summary checkpoint)))
+      (false (getf (second (getf summary :loops)) :waiting-for))
+      (false (getf (getf summary :step) :waiting-for))))
+  ;; Mixed prerequisites name only the unfinished part.
+  (let* ((checkpoint
+           (ai::jobj "loops" (vector (ai::jobj "label" "Ready" "state" "approved")
+                                    (ai::jobj "label" "Pending" "state" "working")
+                                    (ai::jobj "label" "Consumer" "state" "paused" "dependencies" #(0 1)))
+                     "steps" (vector (ai::jobj "loop" 2 "state" "paused" "reason" "deadlock"))))
+         (summary (ai::checkpoint-summary checkpoint)))
+    (is equal "waiting for Pending" (getf (third (getf summary :loops)) :waiting-for))
+    (is equal "waiting for Pending" (getf (getf summary :step) :waiting-for))))

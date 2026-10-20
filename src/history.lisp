@@ -133,6 +133,7 @@ offers recovery unprompted."
       (:failed "failed")
       (:disconnected "agent disconnected or exited")
       (:dependency "waiting for prerequisite work")
+      (:deadlock "each part is waiting on the other")
       (:prerequisite-changed "prerequisite changed; needs revalidation")
       (:continuation-failed "could not continue after the step finished")
       (:restart "interrupted when the app closed")
@@ -142,13 +143,38 @@ offers recovery unprompted."
 (defparameter *step-states* '("paused" "running" "interrupted" "failed")
   "Saved step states that mean it's where the task stopped, most telling first.")
 
+(defun checkpoint-prerequisite-text (checkpoint index)
+  "Describe unfinished prerequisites of a saved loop, tolerating older checkpoints."
+  (let* ((loops (jlist (jget checkpoint "loops")))
+         (part (and (typep index '(integer 0 *)) (nth index loops)))
+         (labels (loop for dependency in (jlist (jget part "dependencies"))
+                       for prerequisite = (and (typep dependency '(integer 0 *)) (nth dependency loops))
+                       for label = (checkpoint-string (jget prerequisite "label"))
+                       when (and label (or (not (member (jget prerequisite "state")
+                                                       '("approved" "unreviewed") :test #'equal))
+                                           (jtrue-p (jget prerequisite "check-failed"))))
+                         collect label)))
+    (when labels (format nil "waiting for ~{~a~^, ~}" labels))))
+
+(defun checkpoint-loop-waiting-p (checkpoint index)
+  "Whether this loop has a saved dependency-related pause."
+  (and (typep index '(integer 0 *))
+       (not (member (jget checkpoint "loops" index "state")
+                    '("approved" "unreviewed" "unresolved" "failed") :test #'equal))
+       (some (lambda (step)
+               (and (eql index (jget step "loop"))
+                    (equal "paused" (jget step "state"))
+                    (member (jget step "reason")
+                            '("dependency" "prerequisite-changed" "deadlock") :test #'equal)))
+             (jlist (jget checkpoint "steps")))))
+
 (defun checkpoint-summary (checkpoint &key (waiting nil waiting-p))
   "What CHECKPOINT (WORKFLOW-CHECKPOINT) says, for the recovery card: a
 plist of :version :state :mode :request :lead :partner :agents (:agent
 :unavailable-until) :step and :steps (:id :agent :role :description :state
-:reason :progress), :loops (:label :author :reviewer :state :round
+:reason :progress :waiting-for), :loops (:label :author :reviewer :state :round :waiting-for
 :unreviewed), :unreviewed (labels), :worktrees (:agent :path :branch) and
-:pending-plan (:lead :partner), the plan waiting for approval, and
+:pending-plan (:lead :partner :order :error), the plan waiting for approval, and
 :integration (:state :committed :merged). Anything missing or malformed reads as
 nil, so older or newer checkpoints still show what they can.
 WAITING, when given, is the ids of the steps the live workflow still has
@@ -160,12 +186,15 @@ paused: only they count as where it stopped."
                                          :agent (checkpoint-agent-name (jget a "id"))
                                          :unavailable-until (checkpoint-integer (jget a "unavailable")))))
            (loops (loop for l in (jlist (jget checkpoint "loops"))
+                        for index from 0
                         collect (and (jobject-p l)
                                      (list :label (checkpoint-string (jget l "label"))
                                            :author (checkpoint-agent-name (jget l "author"))
                                            :reviewer (checkpoint-agent-name (jget l "reviewer"))
                                            :state (checkpoint-string (jget l "state"))
                                            :round (checkpoint-integer (jget l "round"))
+                                           :waiting-for (and (checkpoint-loop-waiting-p checkpoint index)
+                                                             (checkpoint-prerequisite-text checkpoint index))
                                            ;; Taken over, or finished without its review.
                                            :unreviewed (or (eq t (jget l "skip-review"))
                                                            (equal "unreviewed" (jget l "state")))))))
@@ -173,13 +202,17 @@ paused: only they count as where it stopped."
                         when (jobject-p s)
                           collect (let ((agent (checkpoint-agent-name (jget s "agent")))
                                         (loop (let ((index (jget s "loop")))
-                                                (and (integerp index) (nth index loops)))))
+                                                (and (typep index '(integer 0 *)) (nth index loops)))))
                                     (list :id (checkpoint-string (jget s "id")) :agent agent
                                           :role (checkpoint-string (jget s "role"))
                                           :description (checkpoint-step-description
                                                         (jget s "role") agent (getf loop :label))
                                           :state (checkpoint-string (jget s "state"))
                                           :reason (checkpoint-string (jget s "reason"))
+                                          :waiting-for (and (member (jget s "reason")
+                                                                    '("dependency" "prerequisite-changed" "deadlock")
+                                                                    :test #'equal)
+                                                            (checkpoint-prerequisite-text checkpoint (jget s "loop")))
                                           :progress (checkpoint-string (jget s "progress"))))))
            (stopped (remove-if-not (lambda (s)
                                      (if waiting-p
@@ -215,8 +248,12 @@ paused: only they count as where it stopped."
                                              :path (jget tree "path")
                                              :branch (checkpoint-string (jget tree "branch"))))
             :pending-plan (and (jobject-p plan)
-                               (list :lead (checkpoint-string (jget plan "lead"))
-                                     :partner (checkpoint-string (jget plan "partner"))))
+                               (append (list :lead (checkpoint-string (jget plan "lead"))
+                                             :partner (checkpoint-string (jget plan "partner")))
+                                       (when (checkpoint-string (jget plan "order"))
+                                         (list :order (jget plan "order")))
+                                       (when (checkpoint-string (jget plan "error"))
+                                         (list :error (jget plan "error")))))
             :integration (let ((state (checkpoint-string integration)))
                            (and (or state committed merged)
                                 (list :state state :committed committed :merged merged)))))))
@@ -252,10 +289,15 @@ repository set against how CHECKPOINT saw it: a plist of :changed (true if
 anything changed since), :approximate (true if that snapshot may predate the
 agents' last edits), :repositories (:path :available :error :branch
 :head :files :operation :new-commits :branch-was :changed-since), :agents
-(:agent :busy :stopped :unavailable-until) and :recovery-refs (parts)."
+(:agent :busy :stopped :unavailable-until), :steps and :loops with prerequisite
+labels from CHECKPOINT, and :recovery-refs (parts)."
   (let ((before (loop for r in (jlist (jget checkpoint "repositories"))
-                      when (jobject-p r) collect (cons (jget r "path") r))))
-    (list :changed (eq t (jget inspection "repository-changed"))
+                      when (jobject-p r) collect (cons (jget r "path") r)))
+        (parts (checkpoint-summary
+                (jobj "loops" (jget checkpoint "loops") "steps" (jget inspection "steps")))))
+    (list :loops (getf parts :loops)
+          :steps (getf parts :steps)
+          :changed (eq t (jget inspection "repository-changed"))
           :approximate (eq t (jget inspection "repository-snapshot-pending"))
           :repositories
           (loop for r in (jlist (jget inspection "repositories"))
@@ -290,6 +332,8 @@ agents' last edits), :repositories (:path :available :error :branch
     (:restore-worktrees "Restore worktrees"
      "Recreate the missing worktrees from their committed recovery refs; uncommitted edits made in them can't be recovered")
     (:resume "Resume" "Carry on from where it stopped: the agent is shown what's already done before it continues")
+    (:revise-order "Revise the order" "Ask the lead to revise the plan using both parts’ progress")
+    (:run-independently "Run independently" "Remove prerequisites and carry on with both parts independently")
     (:retry "Redo the step" "Give the step that stopped to its agent again, as it was first given")
     (:hand-off "Hand off" "Have the other agent carry on from what's done so far; its work won't be reviewed")
     (:stop "Stop task" "Stop both agents; the task can still be recovered later")
@@ -329,7 +373,8 @@ stopped; reviewing and abandoning are always there."
          (integration (getf (getf summary :integration) :state)))
     (append '(:review)
             (and (missing-worktrees-p summary inspection) '(:restore-worktrees))
-            (cond ((equal role "check") '(:resume))
+            (cond ((equal (getf step :reason) "deadlock") '(:revise-order :run-independently))
+                  ((equal role "check") '(:resume))
                   (step '(:resume :retry :hand-off))
                   ((getf summary :pending-plan) '(:resume))
                   ((member integration (cons "merged" *unfinished-integration*) :test #'equal) '(:resume)))
