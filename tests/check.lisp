@@ -238,3 +238,35 @@
     (write-sequence #(255 128 254 97 98 99) out)
     (finish-output out)
     (is string= "?abc" (ai::read-check-output-tail path 4))))
+
+(define-test recovery-checkpoint-does-not-replay-check :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((l (first (ai:workflow-loops workflow)))
+           (token (list nil)))
+      (ai:agent-turn-finished lead "Written result" nil)
+      (setf (ai::workflow-paused workflow) nil
+            (ai::workflow-steps workflow) (remove :review (ai::workflow-steps workflow) :key #'ai::step-role)
+            (ai::loop-state l) :checking
+            (ai::loop-check-handle l) token)
+      (let* ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+             (restored (ai:restore-workflow checkpoint :lead lead :partner partner)))
+        (true (find :check (ai::workflow-paused restored) :key #'ai::step-role))
+        (false (ai::loop-check-handle (first (ai:workflow-loops restored))))
+        (is string= "Written result" (ai::loop-summary (first (ai:workflow-loops restored))))
+        (ai:stop-workflow workflow)
+        (ai::check-in workflow l token "dangerous command" 0 0 "Late passed check" nil)
+        (false (ai::loop-check-report l))
+        (is eq :stopped (ai:workflow-state workflow))))))
+
+(define-test recovery-pausing-author-stops-current-check :parent agent-duet
+  (with-check-workflow (workflow author reviewer directory "sleep 30" (list (says "Done")))
+    (ai:start-workflow workflow)
+    (let* ((l (first (ai:workflow-loops workflow)))
+           (token (ai::loop-check-handle l)))
+      (ai:pause-workflow-agent workflow author)
+      (is eq :running (ai:workflow-state workflow))
+      (is eq :paused (ai::loop-state l))
+      (is eq :check (ai::step-role (first (ai::workflow-paused workflow))))
+      (ai::check-in workflow l token "sleep 30" 0 0 "stale passed check" nil)
+      (false (fake-prompts reviewer))
+      (false (ai::loop-check-report l)))))

@@ -77,6 +77,13 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
                   :documentation "When the running turn last showed signs of life (CLOCK-SECONDS)")
    (stall-noticed :initform nil :accessor agent-stall-noticed
                   :documentation "True once AGENT-CHECK-STALL has reported this silence")
+   (partial-text :initform "" :accessor agent-partial-text)
+   (editing-processes :initform nil :accessor agent-editing-processes)
+   (process-record :initform nil :accessor agent-process-record)
+   (turn-process-baseline :initform :unknown :accessor agent-turn-process-baseline)
+   (retiring-records :initform nil :accessor agent-retiring-records)
+   (editing-pids :initform nil :accessor agent-editing-pids)
+   (stopping-processes :initform nil :accessor agent-stopping-processes)
    (retry :initform nil :accessor agent-retry
           :documentation "AGENT-RETRY-TURN's progress: (:pending entry) until the turn is given again,
 then :sent; :dropped if cancelled first")))
@@ -131,6 +138,9 @@ then :sent; :dropped if cancelled first")))
 (defmethod agent-conversation-handle ((agent agent)) nil)
 
 (defun agent-emit (agent kind &rest plist)
+  (when (and (member kind '(:delta :text)) (stringp (getf plist :text)))
+    (setf (agent-partial-text agent)
+          (concatenate 'string (agent-partial-text agent) (getf plist :text))))
   (agent-touch agent)
   (when (agent-listener agent)
     (apply (agent-listener agent) agent kind plist)))
@@ -169,7 +179,8 @@ Preserve the running callback."
         (setf (agent-retry agent) :sent))
       (destructuring-bind (prompt callback attachments) next
         (let ((text (prompt-with-attachments prompt attachments)))
-          (setf (agent-busy agent) t
+          (setf (agent-partial-text agent) ""
+                (agent-busy agent) t
                 (agent-turn agent) next
                 (agent-stall-noticed agent) nil
                 (agent-callback agent) callback
@@ -215,7 +226,7 @@ it would wait for ever."
       (setf (agent-callback agent) nil)
       (ignore-errors (agent-interrupt agent)))
     (dolist (callback (remove nil (cons running waiting)))
-      (handler-case (funcall callback *stopped-text* t)
+      (handler-case (funcall callback *stopped-text* :interrupted)
         (error (e) (agent-emit agent :note :text (format nil "Error after stopping ~a: ~a" (agent-name agent) e)))))))
 
 ;;; A turn gone quiet
@@ -672,8 +683,9 @@ unless that turn is over by then."
 (defmethod agent-begin-turn ((agent claude-agent) prompt)
   (let ((images (agent-turn-images agent)))
     (setf (claude-agent-prompts agent) (list (cons prompt images)))
-    (claude-agent-send agent (claude-agent-ensure-process agent) prompt images
-                       :on-error (turn-failure agent))))
+    (let ((cp (claude-agent-ensure-process agent)))
+      (capture-agent-process-baseline agent)
+      (claude-agent-send agent cp prompt images :on-error (turn-failure agent)))))
 
 (defmethod agent-steer ((agent claude-agent) prompt &optional images)
   ;; Use the current process: changing settings must not restart a busy CLI.
@@ -702,7 +714,7 @@ unless that turn is over by then."
   (let ((cp (claude-agent-process agent)))
     (setf (claude-agent-process agent) nil)
     (agent-deny-approvals agent)
-    (when cp (stop-claude cp))
+    (when cp (pushnew (cp-process cp) (agent-stopping-processes agent)) (stop-claude cp))
     (when (agent-busy agent) (agent-turn-finished agent "Stopped." t))))
 
 (defmethod agent-new-conversation ((agent claude-agent))
@@ -881,6 +893,7 @@ rather than using a server with no thread."
        (lambda ()
          (handler-case
              (let ((server (codex-agent-ensure-server agent :sandbox sandbox :policy policy)))
+               (when (eq token (agent-turn-token agent)) (capture-agent-process-baseline agent))
                (if (not (car token))
                    (stopped)
                    (let ((turn-id (jget (codex-start-turn server prompt :model model :effort effort
@@ -924,7 +937,7 @@ rather than using a server with no thread."
   (let ((server (codex-agent-server agent)))
     (setf (codex-agent-server agent) nil)
     (agent-deny-approvals agent)
-    (when server (stop-codex-app-server server))
+    (when server (pushnew (codex-process server) (agent-stopping-processes agent)) (stop-codex-app-server server))
     (when (agent-busy agent) (agent-turn-finished agent "Stopped." t))))
 
 (defmethod agent-new-conversation ((agent codex-agent))
@@ -962,3 +975,104 @@ call it off the GUI thread. Returns the models and the usage."
 
 (defun codex-model-id (model)
   (or (jget model "id") (jget model "model")))
+
+ ;;; Shutdown confirmation is separate from asking a process to terminate.
+(defgeneric agent-cli-process (agent)
+  (:method ((agent agent)) nil)
+  (:method ((agent claude-agent))
+    (let ((cp (claude-agent-process agent))) (and cp (cp-process cp))))
+  (:method ((agent codex-agent))
+    (let ((server (codex-agent-server agent))) (and server (codex-process server)))))
+
+(defun recovery-pid-alive-p (pid)
+  "Compatibility for in-memory callers only; checkpoints never trust raw PIDs."
+  (handler-case (progn (sb-posix:kill pid 0) t)
+    (sb-posix:syscall-error (e) (not (= (sb-posix:syscall-errno e) sb-posix:esrch)))))
+
+(defun normalize-process-identity (text)
+  (format nil "~{~a~^ ~}" (remove "" (uiop:split-string text :separator '(#\Space #\Tab)) :test #'equal)))
+
+(defun recovery-process-record (pid)
+  "Bind a PID to its launch time; exec may change the command without changing identity."
+  (let ((identity (string-trim '(#\Space #\Tab #\Newline #\Return)
+                               (uiop:run-program (list "ps" "-p" (write-to-string pid) "-o" "lstart=")
+                                                 :output :string :error-output :string :ignore-error-status t))))
+    (unless (string= identity "")
+      (jobj "pid" pid "identity" (normalize-process-identity identity)))))
+
+(defun recovery-process-alive-p (record)
+  "Only the same process counts as outstanding; a recycled PID does not."
+  (and (jobject-p record) (integerp (jget record "pid")) (stringp (jget record "identity"))
+       (handler-case
+           (let ((now (recovery-process-record (jget record "pid"))))
+             (and now (equal (jget now "identity") (jget record "identity"))))
+         (error () t))))
+
+(defun agent-process-tree (agent)
+  "One ps snapshot, with process identities, limited to this CLI's descendants."
+  (let ((process (agent-cli-process agent)))
+    (when process
+      (let* ((output (uiop:run-program '("ps" "-axo" "pid=,ppid=,lstart=") :output :string))
+             (rows (loop for line in (uiop:split-string output :separator '(#\Newline))
+                         for row = (with-input-from-string (in line)
+                                     (let* ((*read-eval* nil) (pid (read in nil nil)) (ppid (read in nil nil))
+                                            (identity (read-line in nil "")))
+                                       (when (and (integerp pid) (integerp ppid))
+                                         (list pid ppid (jobj "pid" pid "identity" (normalize-process-identity identity))))))
+                         when row collect row))
+             (root (sb-ext:process-pid process))
+             (parents (list root)))
+        (loop for children = (loop for (pid ppid) in rows
+                                  when (and (member ppid parents) (not (member pid parents))) collect pid)
+              while children do (setf parents (append children parents)))
+        (values (loop for (pid nil record) in rows when (and (member pid parents) (/= pid root)) collect record)
+                (third (assoc root rows)))))))
+
+(defun capture-agent-process-baseline (agent)
+  "Existing service processes belong to the CLI, not to the new turn."
+  (multiple-value-bind (children root) (agent-process-tree agent)
+    (setf (agent-turn-process-baseline agent) children
+          (agent-process-record agent) root)))
+
+(defun remember-agent-editors (agent)
+  "Track only descendants created since this turn began, never persistent services.
+An attached transport with no baseline must be shut down to confirm ownership."
+  (multiple-value-bind (children root) (agent-process-tree agent)
+    (when root (setf (agent-process-record agent) root))
+    (setf (agent-editing-processes agent)
+          (remove-duplicates
+           (append (and (listp (agent-turn-process-baseline agent))
+                        (set-difference children (agent-turn-process-baseline agent) :test #'equalp))
+                   (agent-editing-processes agent)) :test #'equalp))))
+
+(defgeneric agent-quiescent-p (agent)
+  (:documentation "No active turn, queued work, retiring CLI, or surviving turn-owned editor."))
+(defmethod agent-quiescent-p ((agent agent))
+  (setf (agent-stopping-processes agent) (remove-if-not #'sb-ext:process-alive-p (agent-stopping-processes agent))
+        (agent-editing-pids agent) (remove-if-not #'recovery-pid-alive-p (agent-editing-pids agent))
+        (agent-editing-processes agent) (remove-if-not #'recovery-process-alive-p (agent-editing-processes agent))
+        (agent-retiring-records agent) (remove-if-not #'recovery-process-alive-p (agent-retiring-records agent)))
+  (and (not (agent-busy agent)) (null (agent-queue agent))
+       (or (listp (agent-turn-process-baseline agent))
+           (null (agent-cli-process agent))
+           (not (sb-ext:process-alive-p (agent-cli-process agent))))
+       (null (agent-stopping-processes agent)) (null (agent-editing-pids agent))
+       (null (agent-editing-processes agent)) (null (agent-retiring-records agent))))
+
+(defmethod agent-interrupt :before ((agent agent)) (remember-agent-editors agent))
+(defmethod agent-shutdown :before ((agent agent))
+  (remember-agent-editors agent)
+  (when (agent-process-record agent) (pushnew (agent-process-record agent) (agent-retiring-records agent) :test #'equalp)))
+
+(defmethod agent-interrupt :after ((agent agent))
+  ;; A new descendant whose ownership is uncertain is stopped, never simply
+  ;; forgotten. Restarting the CLI retains its conversation but rebuilds services.
+  (when (and (agent-cli-process agent) (agent-editing-processes agent))
+    (agent-shutdown agent)
+    (dolist (record (agent-editing-processes agent))
+      (when (recovery-process-alive-p record)
+        (ignore-errors (sb-posix:kill (jget record "pid") 15))))))
+
+(defmethod agent-resume-conversation ((agent agent) handle)
+  (declare (ignore handle))
+  nil)

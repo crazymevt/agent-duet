@@ -98,8 +98,18 @@
    (merged-loop :initform nil :accessor workflow-merged-loop)
    (worktrees-cleaned :initform nil :accessor workflow-worktrees-cleaned)
    (recovery-recorded :initform nil :accessor workflow-recovery-recorded)
-   (retention-id :initform (make-uuid) :reader workflow-retention-id)
+   (retention-id :initform (make-uuid) :accessor workflow-retention-id)
    (integrated :initform nil :accessor workflow-integrated :documentation "True once merging has begun")
+   (stopping-checks :initform nil :accessor workflow-stopping-checks)
+   (saved-agent-context :initform nil :accessor workflow-saved-agent-context)
+   (merged-refs :initform nil :accessor workflow-merged-refs)
+   (integration-journal :initform nil :accessor workflow-integration-journal)
+   (shutdown-processes :initform nil :accessor workflow-shutdown-processes)
+   (shutdown-pids :initform nil :accessor workflow-shutdown-pids)
+   (steps :initform nil :accessor workflow-steps)
+   (recovery-baseline :initform nil :accessor workflow-recovery-baseline)
+   (integration-state :initform nil :accessor workflow-integration-state)
+   (on-checkpoint :initarg :on-checkpoint :initform nil :accessor workflow-on-checkpoint)
    (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
    (loops :initform '() :accessor workflow-loops)
    (context :initform nil :accessor workflow-context
@@ -118,7 +128,10 @@
   (tree nil)                            ; the worktree it's done in, or nil for the folder
   (check-handle nil)                    ; active asynchronous check
   (check-report nil)                    ; most recent result for the reviewer
+  (check-fixes 0)
   (check-failed nil)                    ; true while the check fails after the fix attempts
+  (dependencies nil)
+  (revision 0)
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
   (state :assigned))                    ; :assigned :working :checking :reviewing :paused :stopped or final outcome
@@ -126,7 +139,9 @@
 (defstruct (workflow-step (:conc-name step-) (:constructor make-step))
   "A prompt given to an agent for the workflow, kept so it can be given
 again, or to the other agent, after the first ran out of usage."
-  agent prompt then
+  (id (make-uuid))
+  (generation 0) (state :new) reason progress
+  agent prompt original-prompt then target confirming (check-fixes 0) repositories peer-progress
   role                                  ; :propose, :plan, :work, :review or :resolve
   loop)                                 ; the review loop it belongs to (not for :plan)
 
@@ -140,19 +155,53 @@ again, or to the other agent, after the first ran out of usage."
 (defun workflow-live-p (workflow)
   (eq (workflow-state workflow) :running))
 
-(defun submit (workflow agent prompt then &key role loop)
+(defun submit (workflow agent prompt then &key role loop target confirming (check-fixes 0))
   "Give AGENT PROMPT; call THEN with its reply, unless the workflow has
-been stopped meanwhile. A turn that failed for want of usage pauses
-instead (PAUSE-STEP); another failed turn ends the workflow's part in it."
-  (submit-step workflow (make-step :agent agent :prompt prompt :then then :role role :loop loop)))
+been stopped meanwhile. Usage exhaustion, interruption and agent failure
+preserve the step for explicit recovery (PAUSE-STEP)."
+  (submit-step workflow (make-step :agent agent :prompt prompt :then then :role role :loop loop
+                                   :target target :confirming confirming :check-fixes check-fixes)))
+
+(defun checkpoint-changed (workflow)
+  (when (workflow-on-checkpoint workflow)
+    (funcall (workflow-on-checkpoint workflow) workflow)))
 
 (defun submit-step (workflow step)
-  (agent-submit (step-agent step) (step-prompt step)
-                (lambda (text error)
-                  (when (workflow-live-p workflow)
-                    (if (eq error :out-of-usage)
-                        (pause-step workflow step)
-                        (funcall (step-then step) text error))))))
+  ;; A per-submission generation also rejects callbacks captured before cancellation.
+  (unless (step-original-prompt step) (setf (step-original-prompt step) (step-prompt step)))
+  (pushnew step (workflow-steps workflow))
+  (let ((generation (incf (step-generation step))))
+    (when (and (step-loop step) (not (loop-prerequisites-ready-p (step-loop step))))
+      (setf (step-reason step) :dependency)
+      (pause-step workflow step)
+      (return-from submit-step nil))
+    (setf (step-state step) :running)
+    (checkpoint-changed workflow)
+    (unless (and (workflow-live-p workflow) (eq (step-state step) :running)
+                 (= generation (step-generation step)))
+      (return-from submit-step nil))
+    (agent-submit (step-agent step) (step-prompt step)
+                  (lambda (text error)
+                    (when (and (workflow-live-p workflow)
+                               (= generation (step-generation step))
+                               (eq (step-state step) :running))
+                      (if error
+                          (progn
+                            (setf (step-reason step)
+                                  (case error (:out-of-usage :out-of-usage)
+                                    (:interrupted :interrupted) (t :failed))
+                                  (step-progress step)
+                                  (if (plusp (length (agent-partial-text (step-agent step))))
+                                      (format nil "~a~%~%Partial reply:~%~a" text (agent-partial-text (step-agent step))) text))
+                            (pause-step workflow step))
+                          (progn
+                            (setf (step-state step) :completed (step-progress step) text)
+                            (handler-case (funcall (step-then step) text nil)
+                              (error (e)
+                                (setf (step-reason step) :continuation-failed
+                                      (step-progress step) (format nil "~a~%~%Continuation stopped: ~a" text e))
+                                (pause-step workflow step)))
+                            (checkpoint-changed workflow))))))))
 
 ;;; Carrying on past the last round
 
@@ -163,7 +212,8 @@ instead (PAUSE-STEP); another failed turn ends the workflow's part in it."
 
 (defun continuable-loop-p (loop)
   "Stopped unapproved after a review, and not in a worktree (gone by then)."
-  (and (eq (loop-state loop) :unresolved) (loop-last-review loop) (null (loop-tree loop))))
+  (and (eq (loop-state loop) :unresolved) (loop-last-review loop)
+       (or (null (loop-tree loop)) (probe-file (loop-tree loop)))))
 
 (defun workflow-continuable-p (workflow)
   "Whether WORKFLOW finished with a loop stopped at its last round, unapproved,
@@ -176,7 +226,8 @@ and the agents are still where it finished."
 (defun continue-workflow (workflow rounds)
   "Carry WORKFLOW on for up to ROUNDS more review rounds: each loop stopped
 unapproved has its author address the last review. True if it carried on."
-  (when (workflow-continuable-p workflow)
+  (when (and (workflow-continuable-p workflow)
+             (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow))))
     (let ((loops (remove-if-not #'continuable-loop-p (workflow-loops workflow))))
       (setf (workflow-state workflow) :running
             (workflow-completion-data workflow) nil
@@ -185,6 +236,8 @@ unapproved has its author address the last review. True if it carried on."
       (note workflow "Carrying on for up to ~d more round~:p." rounds)
       ;; All are set working before any starts, so the first to finish
       ;; doesn't find every loop done.
+      (when (and (workflow-trees workflow) (not (workflow-integrated workflow)))
+        (dolist (entry (workflow-trees workflow)) (move-agent (car entry) (cdr entry))))
       (dolist (l loops) (setf (loop-state l) :working))
       (dolist (l loops)
         (note workflow "Round ~d~@[ (~a)~]: ~a addresses the review."
@@ -202,6 +255,7 @@ unapproved has its author address the last review. True if it carried on."
   (let ((name (agent-name (step-agent step)))
         (loop (step-loop step)))
     (ecase (step-role step)
+      (:check (format nil "~a’s check" name))
       (:propose (format nil "~a's proposal" name))
       (:resolve (format nil "~a's resolving of the merge conflicts" name))
       (:plan (format nil "~a's plan for splitting the work" name))
@@ -211,10 +265,29 @@ unapproved has its author address the last review. True if it carried on."
                            (format nil "~a's work" (agent-name (loop-author loop)))))))))
 
 (defun pause-step (workflow step)
-  (setf (workflow-paused workflow) (append (workflow-paused workflow) (list step)))
+  (when (and (null (step-progress step))
+             (plusp (length (agent-partial-text (step-agent step)))))
+    (setf (step-progress step) (agent-partial-text (step-agent step))))
+  (setf (step-state step) :paused)
+  (pushnew step (workflow-paused workflow) :test #'eq)
+  (unless (step-reason step) (setf (step-reason step) :out-of-usage))
+  (setf (step-repositories step) (workflow-repositories workflow)
+        (step-peer-progress step) (workflow-peer-progress workflow (step-agent step))
+        (workflow-recovery-baseline workflow) (step-repositories step))
   (when (step-loop step)
     (update-loop-state workflow (step-loop step) :paused))
-  (note workflow "~a ~a paused." (agent-out-message (step-agent step)) (step-description step))
+  (note workflow "~a paused (~a). Available progress: ~a"
+        (step-description step) (step-reason step) (or (step-progress step) "No final reply yet."))
+  (let ((other (other-agent workflow (step-agent step)))
+        (message (format nil "~a paused (~a). Its incomplete result is unavailable; continue only independent work."
+                         (step-description step) (step-reason step))))
+    (post workflow :system other message :note))
+  (dolist (dependent (workflow-loops workflow))
+    (when (member (step-loop step) (loop-dependencies dependent))
+      (note workflow "~a is blocked until ~a is complete."
+            (or (loop-label dependent) "Dependent work") (or (loop-label (step-loop step)) "its prerequisite"))))
+  (note-retained-worktrees workflow)
+  (checkpoint-changed workflow)
   (when (workflow-on-pause workflow)
     (funcall (workflow-on-pause workflow) workflow step)))
 
@@ -224,9 +297,10 @@ unapproved has its author address the last review. True if it carried on."
     (setf (workflow-paused workflow) (remove step (workflow-paused workflow)))
     t))
 
-(defun resume-step (workflow step)
+(defun %resume-step (workflow step)
   "Give STEP's prompt to its agent again (its usage has reset, or the user wants to try)."
-  (when (and (workflow-live-p workflow) (unpause workflow step))
+  (when (and (workflow-live-p workflow) (agent-quiescent-p (step-agent step))
+             (not (agent-out-of-usage-p (step-agent step))) (unpause workflow step))
     (note workflow "Trying ~a again." (step-description step))
     (when (step-loop step)
       (update-loop-state workflow (step-loop step)
@@ -235,36 +309,40 @@ unapproved has its author address the last review. True if it carried on."
 
 (defun can-hand-off-p (workflow step)
   "Whether the other agent could take STEP over (it isn't out of usage too)."
-  (not (agent-out-of-usage-p (other-agent workflow (step-agent step)))))
+  (and (agent-quiescent-p (step-agent step))
+       (agent-quiescent-p (other-agent workflow (step-agent step)))
+       (not (agent-out-of-usage-p (other-agent workflow (step-agent step))))))
 
-(defun hand-off-step (workflow step)
+(defun %hand-off-step (workflow step)
   "Have the other agent take STEP over. A review isn't handed off: the work
 finishes unreviewed. Nor is a proposal: the other's goes on alone. Work or a plan goes to the other agent, and what it
 does then goes unreviewed, since the one that would review it is out."
-  (when (and (workflow-live-p workflow) (unpause workflow step))
+  (when (and (workflow-live-p workflow) (can-hand-off-p workflow step) (unpause workflow step))
+    (incf (step-generation step))
+    (setf (step-state step) :superseded)
     (let* ((out (step-agent step))
            (other (other-agent workflow out))
            (loop (step-loop step)))
       (ecase (step-role step)
         (:propose
-         (proposal-in workflow out nil (format nil "~a ran out of usage" (agent-name out))))
+         (proposal-in workflow out nil (format nil "~a is unavailable" (agent-name out))))
         (:resolve
          (note workflow "~a resolves the conflicts instead." (agent-name other))
          (submit-step workflow (make-step :agent other :prompt (step-prompt step) :then (step-then step)
-                                          :role :resolve)))
+                                          :role :resolve :target (step-target step))))
         (:review
          (update-loop-state workflow loop :unreviewed)
-         (note workflow "~@[~a ~]finished without a review: ~a ran out of usage."
+         (note workflow "~@[~a ~]finished without a review: ~a is unavailable."
                (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)) (agent-name out))
          (check-finished workflow))
         (:work
-         (note workflow "~a takes over ~a. It won't be reviewed: ~a is out of usage."
+         (note workflow "~a takes over ~a. It won't be reviewed: ~a is unavailable."
                (agent-name other) (step-description step) (agent-name out))
          (setf (loop-author loop) other
                (loop-skip-review loop) t)
          (loop-work workflow loop (takeover-prompt out (step-prompt step) (loop-tree loop))))
         (:plan
-         (note workflow "~a does the whole task. It won't be reviewed: ~a is out of usage."
+         (note workflow "~a does the whole task. It won't be reviewed: ~a is unavailable."
                (agent-name other) (agent-name out))
          (run-loop workflow (make-review-loop :author other :reviewer out :task (workflow-request workflow)
                                               :skip-review t)
@@ -581,7 +659,8 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
 
 (defun update-loop-state (workflow loop state)
   (setf (loop-state loop) state)
-  (publish-checklist workflow loop))
+  (publish-checklist workflow loop)
+  (checkpoint-changed workflow))
 
 (defun take-findings (workflow loop review)
   "Bring LOOP's findings up to date from REVIEW; progress snapshots include them."
@@ -598,6 +677,7 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
         (workflow-commit-hash workflow) nil
         (workflow-repository-start workflow)
         (ignore-errors (repository-start-state (agent-directory (workflow-lead workflow)))))
+  (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
   (let ((lead (workflow-lead workflow))
         (partner (workflow-partner workflow))
         (request (workflow-request workflow)))
@@ -755,6 +835,7 @@ lead, who made it, is told its part again."
   (loop-work workflow loop prompt))
 
 (defun loop-work (workflow loop prompt)
+  (when (plusp (loop-revision loop)) (invalidate-dependent-loops workflow loop))
   (setf (loop-check-report loop) nil
         (loop-check-failed loop) nil)
   (update-loop-state workflow loop :working)
@@ -763,6 +844,7 @@ lead, who made it, is told its part again."
             (cond (error
                    (loop-failed workflow loop (format nil "~a's turn failed: ~a" (agent-name (loop-author loop)) text)))
                   (t
+                   (incf (loop-revision loop))
                    (setf (loop-summary loop) text)
                    (post workflow (loop-author loop) (loop-reviewer loop) text :work)
                    (loop-check workflow loop))))
@@ -813,10 +895,11 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
                               (setf (loop-summary loop) text)
                               (post workflow (loop-author loop) (loop-reviewer loop) text :work)
                               (loop-check workflow loop (1+ fixes)))))
-                      :role :work :loop loop)))))))
+                      :role :work :loop loop :check-fixes (1+ fixes))))))))
 
 (defun loop-check (workflow loop &optional (fixes 0))
   "Check the current work before review; FIXES does not count review rounds."
+  (setf (loop-check-fixes loop) fixes)
   (let ((command (blank-to-nil (workflow-check-command workflow))))
     (if (null command)
         (loop-checked workflow loop)
@@ -835,13 +918,16 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
                                (check-in workflow loop token command fixes code output timed-out))))
             ;; Also cover cancellation between launching and storing the handle.
             (unless (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
+              (when (car token) (pushnew (car token) (workflow-stopping-checks workflow)))
               (kill-check (car token))))))))
 
 (defun cancel-workflow-checks (workflow)
   (dolist (loop (workflow-loops workflow))
     (let ((token (loop-check-handle loop)))
       (setf (loop-check-handle loop) nil)
-      (when token (kill-check (car token))))))
+      (when token
+        (when (car token) (pushnew (car token) (workflow-stopping-checks workflow)))
+        (kill-check (car token))))))
 
 (defun loop-review (workflow loop &optional confirming)
   "Have LOOP's reviewer review the work; CONFIRMING: it approved with findings
@@ -852,7 +938,7 @@ still open, and is asked once to settle them (that's no new round)."
             (if error
                 (loop-failed workflow loop (format nil "~a's review failed: ~a" (agent-name (loop-reviewer loop)) text))
                 (review-in workflow loop text confirming)))
-          :role :review :loop loop))
+          :role :review :loop loop :confirming confirming))
 
 (defun review-in (workflow loop text confirming)
   (unless confirming (incf (loop-round loop)))
@@ -909,6 +995,10 @@ still open, and is asked once to settle them (that's no new round)."
   (member (loop-state loop) '(:approved :unresolved :unreviewed :failed)))
 
 (defun check-finished (workflow)
+  (dolist (step (copy-list (workflow-paused workflow)))
+    (when (and (eq (step-reason step) :dependency) (step-loop step)
+               (loop-prerequisites-ready-p (step-loop step)))
+      (%resume-step workflow step)))
   (when (and (workflow-live-p workflow) (null (workflow-paused workflow))
              (every #'loop-done-p (workflow-loops workflow)))
     (let ((failed (find :failed (workflow-loops workflow) :key #'loop-state)))
@@ -917,6 +1007,10 @@ still open, and is asked once to settle them (that's no new round)."
             ;; Its work may be half done: keep it out of the folder.
             (failed
              (fail workflow "~a failed, so the parts aren't merged." (string-capitalize (loop-label failed) :end 1)))
+            ((or (some #'loop-check-failed (workflow-loops workflow))
+                 (some (lambda (l) (eq (loop-state l) :unresolved)) (workflow-loops workflow)))
+             (note workflow "The parts are not approved; their worktrees are kept and nothing is merged. Continue for more review rounds.")
+             (finish-workflow workflow))
             (t (integrate workflow))))))
 
 (defun finish-workflow (workflow)
@@ -925,8 +1019,11 @@ still open, and is asked once to settle them (that's no new round)."
   (let ((merged (workflow-merged-loop workflow)))
     (when (and merged (eq (loop-state merged) :approved))
       (cleanup-workflow-worktrees workflow)))
+  (when (and (workflow-trees workflow) (not (workflow-integrated workflow)))
+    (leave-worktrees workflow))
   (setf (workflow-state workflow) :finished
         (workflow-context workflow) (working-context workflow))
+  (checkpoint-changed workflow)
   (note workflow "Done: ~{~a~^; ~}."
         (loop for l in (workflow-loops workflow)
               collect (format nil "~@[~a ~]~a~[~:;, ~:*~d finding~:p open~]" (loop-label l)
@@ -943,28 +1040,58 @@ still open, and is asked once to settle them (that's no new round)."
   (apply #'note workflow fmt args)
   (leave-worktrees workflow)
   (setf (workflow-state workflow) :finished)
+  (checkpoint-changed workflow)
   (note-retained-worktrees workflow)
   (capture-workflow-completion workflow)
   (when (workflow-on-finish workflow)
     (funcall (workflow-on-finish workflow) workflow)))
 
+(defun pause-workflow-agent (workflow agent)
+  "Interrupt one agent, preserving its steps; independent work can continue."
+  (unless (and (workflow-live-p workflow)
+               (member agent (list (workflow-lead workflow) (workflow-partner workflow))))
+    (return-from pause-workflow-agent nil))
+  (dolist (step (workflow-steps workflow))
+    (when (and (eq agent (step-agent step)) (eq (step-state step) :running))
+      (incf (step-generation step))
+      (setf (step-reason step) :interrupted)
+      (pause-step workflow step)))
+  (dolist (l (workflow-loops workflow))
+    (when (and (eq agent (loop-author l)) (eq (loop-state l) :checking))
+      (let ((token (loop-check-handle l))
+            (s (make-step :agent agent :role :check :loop l :reason :interrupted
+                          :prompt (workflow-check-command workflow))))
+        (setf (loop-check-handle l) nil)
+        (when token
+          (when (car token) (pushnew (car token) (workflow-stopping-checks workflow)))
+          (kill-check (car token)))
+        (push s (workflow-steps workflow))
+        (pause-step workflow s))))
+  (agent-cancel agent)
+  (checkpoint-changed workflow)
+  t)
+
 (defun stop-workflow (workflow)
-  "Stop WORKFLOW and both agents' work on it."
-  (when (workflow-live-p workflow)
-    (setf (workflow-state workflow) :stopped
-          (workflow-paused workflow) '()
-          (workflow-pending-plan workflow) nil)
+  "Stop both agents but keep all progress and pending steps recoverable."
+  (when (member (workflow-state workflow) '(:running :paused))
+    (pause-workflow-agent workflow (workflow-lead workflow))
+    (pause-workflow-agent workflow (workflow-partner workflow))
+    (dolist (l (workflow-loops workflow))
+      (when (eq (loop-state l) :checking)
+        (let ((step (make-step :agent (loop-author l) :role :check :loop l :state :paused
+                               :reason :interrupted :prompt (workflow-check-command workflow))))
+          (push step (workflow-steps workflow)) (push step (workflow-paused workflow)))))
     (cancel-workflow-checks workflow)
-    (agent-cancel (workflow-lead workflow))
-    (agent-cancel (workflow-partner workflow))
-    (restore-review-access workflow)
+    (setf (workflow-state workflow) :stopped)
     (dolist (loop (workflow-loops workflow))
-      (unless (loop-done-p loop)
-        (update-loop-state workflow loop :stopped)))
-    (note workflow "Stopped.")
+      (when (eq (loop-state loop) :checking) (setf (loop-state loop) :paused)))
+    (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
+    (restore-review-access workflow)
     (leave-worktrees workflow)
-    (note-retained-worktrees workflow)
     (capture-workflow-completion workflow)
+    (note-retained-worktrees workflow)
+    (note workflow "Stopped; partial work and recovery state are preserved.")
+    (checkpoint-changed workflow)
     (when (workflow-on-finish workflow)
       (funcall (workflow-on-finish workflow) workflow))))
 
@@ -1099,6 +1226,7 @@ made; otherwise the workflow fails."
               (move-agent agent tree)
               (note workflow "~a works in its own worktree, ~a (branch ~a), in a new conversation."
                     (agent-name agent) (namestring tree) (worktree-branch tree))))
+          (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
           t)
       (error (e)
         (fail workflow "Couldn't make the worktrees: ~a" e)
@@ -1107,17 +1235,27 @@ made; otherwise the workflow fails."
 (defun leave-worktrees (workflow)
   "Ending before the parts are merged: the agents go back to the folder,
 and the worktrees are kept, with the work done in them."
-  (when (and (workflow-trees workflow) (not (workflow-integrated workflow)))
-    (setf (workflow-integrated workflow) t)
+  (when (and (workflow-trees workflow) (workflow-home workflow)
+             (some (lambda (entry) (not (equal (agent-directory (car entry)) (workflow-home workflow))))
+                   (workflow-trees workflow)))
     (dolist (entry (workflow-trees workflow))
-      (move-agent (car entry) (workflow-home workflow)))
+      (unless (equal (agent-directory (car entry)) (workflow-home workflow))
+        (move-agent (car entry) (workflow-home workflow))))
     (note workflow "The worktrees are kept, with their work: ~{~a~^, ~}."
           (mapcar (lambda (e) (namestring (cdr e))) (reverse (workflow-trees workflow))))))
 
 (defun integrate (workflow)
   "Both parts are done: commit each on its branch, bring the agents back
 to the folder, and merge the branches into it."
-  (setf (workflow-integrated workflow) t)
+  (unless (and (null (workflow-paused workflow))
+               (every (lambda (l) (and (member (loop-state l) '(:approved :unreviewed))
+                                       (not (loop-check-failed l))))
+                      (workflow-loops workflow))
+               (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow))))
+    (return-from integrate nil))
+  (setf (workflow-integrated workflow) t
+        (workflow-integration-state workflow) :committing)
+  (checkpoint-changed workflow)
   (let ((home (workflow-home workflow))
         (trees (mapcar #'cdr (reverse (workflow-trees workflow)))))
     (dolist (entry (workflow-trees workflow))
@@ -1130,9 +1268,17 @@ to the folder, and merge the branches into it."
               (commit-worktree (loop-tree l) (format nil "~a~%~%~a" (string-capitalize (loop-label l) :end 1)
                                                      (loop-task l)))
               (retain-worktree home (loop-tree l) (workflow-retention-id workflow))
-              (setf (workflow-recovery-recorded workflow) t)))
+              (setf (workflow-recovery-recorded workflow) t)
+              (let ((entry (cons (namestring (loop-tree l))
+                                 (worktree-git-line (loop-tree l) "rev-parse" "HEAD"))))
+                (setf (workflow-integration-journal workflow)
+                      (acons (car entry) (cdr entry)
+                             (remove (car entry) (workflow-integration-journal workflow) :key #'car :test #'equal))))
+              (checkpoint-changed workflow)))
           (note workflow "Both parts are committed on their branches; recovery refs are kept for task ~a. Merging them into the folder."
                 (workflow-retention-id workflow))
+          (setf (workflow-integration-state workflow) :merging)
+          (checkpoint-changed workflow)
           (merge-parts workflow trees))
       (error (e) (integration-failed workflow (princ-to-string e) trees)))))
 
@@ -1148,15 +1294,23 @@ to the folder, and merge the branches into it."
   "Merge TREES' branches into the folder one by one, the lead resolving any
 conflicts; then the merged result is reviewed."
   (let ((home (workflow-home workflow)))
+    (checkpoint-changed workflow)
     (if (null trees)
-        (merged workflow)
-        (let ((branch (worktree-branch (first trees))))
+        (progn (setf (workflow-integration-state workflow) :merged)
+               (checkpoint-changed workflow)
+               (merged workflow))
+        (let ((branch (or (cdr (assoc (namestring (first trees)) (workflow-integration-journal workflow) :test #'equal))
+                          (cdr (assoc (first trees) (workflow-tree-branches workflow) :test #'equal))
+                          (worktree-branch (first trees)))))
           (multiple-value-bind (status files)
-              (handler-case (merge-worktree home (first trees))
+              (handler-case (if (branch-merged-p home branch) :merged
+                                  (merge-recovery-ref home branch))
                 (error (e) (values :error (princ-to-string e))))
             (case status
               (:merged
-               (note workflow "Merged ~a." branch)
+               (pushnew branch (workflow-merged-refs workflow) :test #'equal)
+               (checkpoint-changed workflow)
+               (note workflow "Merged ~a." (or (cdr (assoc (first trees) (workflow-tree-branches workflow) :test #'equal)) branch))
                (merge-parts workflow (rest trees)))
               (:conflict
                (note workflow "Merging ~a conflicts in ~{~a~^, ~}; ~a resolves them."
@@ -1170,8 +1324,10 @@ conflicts; then the merged result is reviewed."
                                ((not (branch-merged-p home branch))
                                 (integration-failed workflow (format nil "~a wasn't merged" branch) trees))
                                (t
+                                (pushnew branch (workflow-merged-refs workflow) :test #'equal)
+                                (checkpoint-changed workflow)
                                 (post workflow (workflow-lead workflow) :user text :work)
-                                (note workflow "Merged ~a." branch)
+                                (note workflow "Merged ~a." (or (cdr (assoc (first trees) (workflow-tree-branches workflow) :test #'equal)) branch))
                                 (merge-parts workflow (rest trees)))))
                        :role :resolve))
               (t (integration-failed workflow files trees))))))))
@@ -1261,6 +1417,8 @@ changes where relevant. The partner will review this combined answer and the mer
 (defun integration-failed (workflow why trees)
   "Merging stopped at TREES (the first not merged): say so, and end. The
 worktrees are kept, with their branches."
+  (setf (workflow-integration-state workflow) :interrupted)
+  (checkpoint-changed workflow)
   (fail workflow "Merging the parts stopped: ~a. The folder is as the merge left it~@[, with ~a not merged yet~]; ~
 the worktrees are kept: ~{~a~^, ~}."
         why (and trees (ignore-errors (worktree-branch (first trees))))
@@ -1479,3 +1637,531 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
       (when sections
         (format nil "Fix these review findings. Inspect the current repository and address the findings you agree with; explain any you dismiss. The reviewed target was:~%~a~%~%Original focus: ~a~%~%~{~a~^~%~%~}"
                 (workflow-review-description workflow) (workflow-request workflow) sections)))))
+
+;;; Durable recovery. Checkpoints are data, never serialized executable closures.
+(export '(workflow-checkpoint restore-workflow inspect-workflow-recovery recover-workflow
+          pause-workflow-agent workflow-on-checkpoint inspect-recovery-repository
+          workflow-paused step-id step-role step-reason step-progress step-prompt step-agent step-loop
+          agent-quiescent-p))
+
+(defun recovery-null (value) (unless (member value '(nil :null :false)) value))
+(defun recovery-keyword (value &optional default)
+  (if (stringp value) (intern (string-upcase value) :keyword) default))
+(defun recovery-path (value)
+  (let ((value (recovery-null value)))
+    (when value (uiop:ensure-directory-pathname (uiop:parse-native-namestring value)))))
+(defun workflow-repositories (workflow)
+  (coerce (mapcar #'inspect-recovery-repository
+                 (remove-duplicates
+                  (remove nil (append (list (or (workflow-home workflow)
+                                               (agent-directory (workflow-lead workflow))))
+                                      (mapcar #'cdr (workflow-trees workflow))))
+                  :test #'equal)) 'vector))
+
+(defun checkpoint-step (workflow step)
+  (jobj "id" (step-id step) "agent" (agent-id (step-agent step))
+        "prompt" (step-prompt step) "original-prompt" (step-original-prompt step)
+        "repositories" (step-repositories step)
+        "target" (step-target step) "confirming" (step-confirming step) "check-fixes" (step-check-fixes step)
+        "role" (step-role step)
+        "loop" (position (step-loop step) (workflow-loops workflow))
+        "state" (step-state step) "reason" (step-reason step)
+        "progress" (or (step-progress step)
+                       (and (eq (step-state step) :running) (agent-partial-text (step-agent step))))))
+
+(defun workflow-checkpoint (workflow)
+  "JSON-compatible restart state. Taking a checkpoint does not run or stage work."
+  (flet ((agent-data (agent)
+           (jobj "id" (agent-id agent) "directory" (and (agent-directory agent)
+                                                        (namestring (agent-directory agent)))
+                 "conversation" (agent-conversation-handle agent)
+                 "unavailable" (agent-out-until agent))))
+    (jobj "version" 1 "mode" (workflow-mode workflow) "state" (workflow-state workflow)
+          "request" (workflow-request workflow) "max-rounds" (workflow-max-rounds workflow)
+          "check-command" (workflow-check-command workflow)
+          "review-target" (workflow-review-target workflow) "review-base" (workflow-review-base workflow)
+          "review-branch" (workflow-review-branch workflow) "review-count" (workflow-review-count workflow)
+          "review-agents" (workflow-review-agents workflow)
+          "approve-plan" (workflow-approve-plan-p workflow)
+          "pending-plan" (let ((plan (workflow-pending-plan workflow)))
+                           (when plan (jobj "lead" (getf plan :lead) "partner" (getf plan :partner)
+                                            "takeover" (and (getf plan :takeover)
+                                                            (agent-id (getf plan :takeover))))))
+          "proposals" (coerce (mapcar (lambda (entry) (jobj "agent" (agent-id (car entry)) "text" (cdr entry)))
+                                       (workflow-proposals workflow)) 'vector)
+          "agents" (vector (agent-data (workflow-lead workflow)) (agent-data (workflow-partner workflow)))
+          "home" (and (workflow-home workflow) (namestring (workflow-home workflow)))
+          "base" (workflow-base workflow) "worktrees" (workflow-worktrees-p workflow)
+          "retention-id" (workflow-retention-id workflow)
+          "merged-refs" (coerce (workflow-merged-refs workflow) 'vector)
+          "integration-journal" (coerce (mapcar (lambda (entry) (jobj "path" (car entry) "head" (cdr entry)))
+                                                (workflow-integration-journal workflow)) 'vector)
+          "integrated" (workflow-integrated workflow) "integration" (workflow-integration-state workflow)
+          "worktrees-cleaned" (workflow-worktrees-cleaned workflow)
+          "recovery-recorded" (workflow-recovery-recorded workflow)
+          "trees" (coerce (mapcar (lambda (entry)
+                                    (jobj "agent" (agent-id (car entry)) "path" (namestring (cdr entry))
+                                          "branch" (cdr (assoc (cdr entry) (workflow-tree-branches workflow) :test #'equal))))
+                                  (workflow-trees workflow)) 'vector)
+          "shutdown-pids" #()
+          "shutdown-processes" (coerce (workflow-process-records workflow) 'vector)
+          "repositories" (or (workflow-recovery-baseline workflow) #())
+          "error" (workflow-completion-error workflow)
+          "merged-loop" (position (workflow-merged-loop workflow) (workflow-loops workflow))
+          "loops" (coerce
+                   (mapcar (lambda (l)
+                             (jobj "author" (agent-id (loop-author l)) "reviewer" (agent-id (loop-reviewer l))
+                                   "dependencies" (coerce (mapcar (lambda (dep) (position dep (workflow-loops workflow)))
+                                                                            (loop-dependencies l)) 'vector)
+                                   "revision" (loop-revision l)
+                                   "task" (loop-task l) "label" (loop-label l) "summary" (loop-summary l)
+                                   "last-review" (loop-last-review l) "state" (loop-state l) "round" (loop-round l)
+                                   "tree" (and (loop-tree l) (namestring (loop-tree l)))
+                                   "combined-result" (loop-combined-result l) "file-changes" (loop-file-changes l)
+                                   "check-fixes" (loop-check-fixes l)
+                                   "skip-review" (loop-skip-review l) "check-report" (loop-check-report l)
+                                   "check-failed" (loop-check-failed l)
+                                   "findings" (coerce
+                                               (mapcar (lambda (f) (jobj "id" (finding-id f) "status" (finding-status f)
+                                                                        "location" (finding-location f) "text" (finding-text f)
+                                                                        "round" (finding-round f))) (loop-findings l)) 'vector)))
+                           (workflow-loops workflow)) 'vector)
+          "steps" (coerce (mapcar (lambda (s) (checkpoint-step workflow s))
+                                  (workflow-steps workflow)) 'vector))))
+
+(defun restored-step-continuation (workflow step)
+  "Rebuild only known continuations; the saved data supplies no executable code."
+  (lambda (text error)
+    (declare (ignore error))
+    (let ((l (step-loop step)))
+      (case (step-role step)
+        (:work (incf (loop-revision l)) (setf (loop-summary l) text)
+               (post workflow (step-agent step) (loop-reviewer l) text :work)
+               (loop-check workflow l (step-check-fixes step)))
+        (:review (if (eq (workflow-mode workflow) :review-only)
+                     (progn (incf (loop-round l))
+                            (setf (loop-summary l) text (loop-last-review l) text)
+                            (take-findings workflow l text)
+                            (update-loop-state workflow l
+                                               (if (and (eq (review-verdict text) :approved)
+                                                        (zerop (count-findings (loop-findings l) :open)))
+                                                   :approved :unresolved))
+                            (check-finished workflow))
+                     (review-in workflow l text (step-confirming step))))
+        (:plan (plan-ready workflow text))
+        (:propose (proposal-in workflow (step-agent step) text))
+        (:resolve
+         ;; Recovery never repeats a merge from an arbitrary old prompt.
+         (if (or (repository-operation-p (workflow-home workflow))
+                 (and (step-target step) (not (branch-merged-p (workflow-home workflow) (step-target step)))))
+             (progn (setf (step-reason step) :integration-unresolved) (pause-step workflow step))
+             (recover-integration workflow)))
+        (t (error "Unknown recovery step role ~a" (step-role step)))))))
+
+(defun restore-workflow (checkpoint &key lead partner on-message on-finish on-pause on-plan on-checkpoint)
+  "Restore data with caller-supplied agents and callbacks. Never execute a saved step."
+  (unless (and (= (or (jget checkpoint "version") 0) 1) lead partner (not (eq lead partner)))
+    (error "Recovery requires a version 1 checkpoint and two explicitly supplied agents."))
+  (let ((workflow (make-instance 'workflow :mode (recovery-keyword (jget checkpoint "mode") :review)
+                                 :lead lead :partner partner :request (jget checkpoint "request")
+                                 :max-rounds (or (jget checkpoint "max-rounds") 3)
+                                 :check-command (recovery-null (jget checkpoint "check-command"))
+                                 :worktrees (jtrue-p (jget checkpoint "worktrees"))
+                                 :approve-plan (jtrue-p (jget checkpoint "approve-plan"))
+                                 :review-target (recovery-keyword (jget checkpoint "review-target") :uncommitted)
+                                 :review-base (or (recovery-null (jget checkpoint "review-base")) "HEAD")
+                                 :review-branch (recovery-null (jget checkpoint "review-branch"))
+                                 :review-count (or (jget checkpoint "review-count") 1)
+                                 :review-agents (recovery-keyword (jget checkpoint "review-agents") :both)
+                                 :on-message on-message :on-finish on-finish :on-pause on-pause :on-plan on-plan
+                                 :on-checkpoint on-checkpoint)))
+    (labels ((agent-for (id)
+               (or (find (recovery-keyword id) (list lead partner) :key #'agent-id)
+                   (error "Unknown checkpoint agent ~a" id)))
+             (loop-for (index) (when (integerp index) (nth index (workflow-loops workflow)))))
+      (setf (workflow-state workflow) :paused
+            (workflow-home workflow) (or (recovery-path (jget checkpoint "home"))
+                                          (recovery-path (jget checkpoint "agents" 0 "directory")))
+            ;; Raw PIDs from older checkpoints have no identity and cannot
+            ;; establish whether a process still belongs to this task.
+            (workflow-shutdown-processes workflow) (jlist (jget checkpoint "shutdown-processes"))
+            (workflow-saved-agent-context workflow) (jlist (jget checkpoint "agents"))
+            (workflow-base workflow) (recovery-null (jget checkpoint "base"))
+            (workflow-retention-id workflow) (jget checkpoint "retention-id")
+            (workflow-integrated workflow) (jtrue-p (jget checkpoint "integrated"))
+            (workflow-integration-state workflow) (recovery-keyword (jget checkpoint "integration"))
+            (workflow-merged-refs workflow) (jlist (jget checkpoint "merged-refs"))
+            (workflow-integration-journal workflow)
+            (mapcar (lambda (entry) (cons (jget entry "path") (jget entry "head")))
+                    (jlist (jget checkpoint "integration-journal")))
+            (workflow-worktrees-cleaned workflow) (jtrue-p (jget checkpoint "worktrees-cleaned"))
+            (workflow-recovery-recorded workflow) (jtrue-p (jget checkpoint "recovery-recorded"))
+            (workflow-recovery-baseline workflow) (jget checkpoint "repositories")
+            (workflow-completion-error workflow) (recovery-null (jget checkpoint "error")))
+      ;; Agent directory/conversation are deliberately not changed here: supplied agents
+      ;; may be active elsewhere. An explicit recovery action acquires them first.
+      (dolist (tree (jlist (jget checkpoint "trees")))
+        (let ((path (recovery-path (jget tree "path"))))
+          (push (cons (agent-for (jget tree "agent")) path) (workflow-trees workflow))
+          (push (cons path (recovery-null (jget tree "branch"))) (workflow-tree-branches workflow))))
+      (setf (workflow-trees workflow) (nreverse (workflow-trees workflow)))
+      (setf (workflow-proposals workflow)
+            (mapcar (lambda (p) (cons (agent-for (jget p "agent")) (recovery-null (jget p "text"))))
+                    (jlist (jget checkpoint "proposals"))))
+      (let ((plan (jget checkpoint "pending-plan")))
+        (when (jobject-p plan)
+          (setf (workflow-pending-plan workflow)
+                (list :lead (recovery-null (jget plan "lead")) :partner (recovery-null (jget plan "partner"))
+                      :takeover (and (recovery-null (jget plan "takeover")) (agent-for (jget plan "takeover")))))))
+      (setf (workflow-loops workflow)
+            (mapcar (lambda (data)
+                      (make-review-loop
+                       :author (agent-for (jget data "author")) :reviewer (agent-for (jget data "reviewer"))
+                       :task (jget data "task") :label (recovery-null (jget data "label"))
+                       :summary (or (recovery-null (jget data "summary")) "")
+                       :last-review (recovery-null (jget data "last-review"))
+                       :state (recovery-keyword (jget data "state") :paused) :round (or (jget data "round") 0)
+                       :tree (recovery-path (jget data "tree"))
+                       :combined-result (jtrue-p (jget data "combined-result"))
+                       :file-changes (jtrue-p (jget data "file-changes"))
+                       :skip-review (jtrue-p (jget data "skip-review"))
+                       :check-fixes (or (jget data "check-fixes") 0)
+                       :check-failed (jtrue-p (jget data "check-failed"))
+                       :check-report (recovery-null (jget data "check-report"))
+                       :findings (mapcar (lambda (f) (make-finding :id (jget f "id") :text (jget f "text")
+                                                                  :status (recovery-keyword (jget f "status") :open)
+                                                                  :location (recovery-null (jget f "location"))
+                                                                  :round (jget f "round"))) (jlist (jget data "findings")))))
+                    (jlist (jget checkpoint "loops"))))
+      (loop for l in (workflow-loops workflow)
+            for data in (jlist (jget checkpoint "loops"))
+            do (setf (loop-dependencies l) (mapcar #'loop-for (jlist (jget data "dependencies")))
+                     (loop-revision l) (or (jget data "revision") 0)))
+      (setf (workflow-merged-loop workflow) (loop-for (jget checkpoint "merged-loop")))
+      (dolist (data (jlist (jget checkpoint "steps")))
+        (let* ((state (recovery-keyword (jget data "state")))
+               (step (make-step :id (jget data "id") :agent (agent-for (jget data "agent"))
+                                :repositories (recovery-null (jget data "repositories"))
+                                :original-prompt (recovery-null (jget data "original-prompt"))
+                                :target (recovery-null (jget data "target"))
+                                :confirming (jtrue-p (jget data "confirming"))
+                                :check-fixes (or (jget data "check-fixes") 0)
+                                :prompt (jget data "prompt") :role (recovery-keyword (jget data "role"))
+                                :loop (loop-for (jget data "loop"))
+                                :state (if (member state '(:running :new :paused)) :paused state)
+                                :reason (or (recovery-keyword (jget data "reason")) :restart)
+                                :progress (recovery-null (jget data "progress")))))
+          (setf (step-then step) (restored-step-continuation workflow step))
+          (push step (workflow-steps workflow))
+          (when (eq (step-state step) :paused) (push step (workflow-paused workflow)))))
+      ;; A restart during a check must not replay the shell command automatically.
+      (dolist (l (workflow-loops workflow))
+        (when (and (eq (loop-state l) :checking)
+                   (not (find l (workflow-paused workflow) :key #'step-loop)))
+          (let ((s (make-step :agent (loop-author l) :role :check :loop l :state :paused
+                              :reason :restart :prompt (workflow-check-command workflow))))
+            (push s (workflow-steps workflow)) (push s (workflow-paused workflow)))))
+      (dolist (l (workflow-loops workflow))
+        (when (and (member (loop-state l) '(:working :reviewing :assigned :paused))
+                   (not (find l (workflow-paused workflow) :key #'step-loop)))
+          (let* ((reviewing (eq (loop-state l) :reviewing))
+                 (s (make-step :agent (if reviewing (loop-reviewer l) (loop-author l))
+                               :role (if reviewing :review :work) :loop l :state :paused :reason :restart
+                               :prompt (cond (reviewing (review-prompt l))
+                                             ((loop-last-review l) (fix-prompt l (loop-last-review l)))
+                                             (t (loop-task l))))))
+            (setf (step-then s) (restored-step-continuation workflow s))
+            (push s (workflow-steps workflow)) (push s (workflow-paused workflow)))))
+      (when (and (workflow-home workflow)
+                 (member (workflow-integration-state workflow) '(:merging :interrupted))
+                 (ignore-errors (merge-in-progress-p (workflow-home workflow)))
+                 (not (find :resolve (workflow-paused workflow) :key #'step-role)))
+        (let* ((home (workflow-home workflow))
+               (target (ignore-errors (worktree-git-line home "rev-parse" "MERGE_HEAD")))
+               (files (uiop:split-string (worktree-git home "diff" "--name-only" "--diff-filter=U")
+                                         :separator '(#\Newline)))
+               (s (make-step :agent lead :role :resolve :target target :state :paused :reason :restart
+                             :prompt (resolve-prompt (workflow-request workflow) (or target "the interrupted merge") files))))
+          (setf (step-then s) (restored-step-continuation workflow s))
+          (push s (workflow-steps workflow)) (push s (workflow-paused workflow))))
+      workflow)))
+
+(defun inspect-workflow-recovery (workflow)
+  "Inspection is read-only and safe even when both agents are unavailable."
+  (let ((now (workflow-repositories workflow)))
+    (jobj "pending-plan" (and (workflow-pending-plan workflow)
+                                   (jobj "lead" (getf (workflow-pending-plan workflow) :lead)
+                                         "partner" (getf (workflow-pending-plan workflow) :partner)))
+          "state" (workflow-state workflow) "integration" (workflow-integration-state workflow)
+          "merged-refs" (coerce (workflow-merged-refs workflow) 'vector)
+          "repositories" now
+          "repository-changed" (if (and (workflow-recovery-baseline workflow)
+                                         (not (equalp now (workflow-recovery-baseline workflow)))) t :false)
+          "recovery-refs" (coerce (mapcar (lambda (entry)
+                                            (jobj "part" (getf entry :part) "head" (getf entry :head)
+                                                  "base" (getf entry :base)))
+                                          (ignore-errors
+                                            (worktree-recovery-refs
+                                             (or (workflow-home workflow) (agent-directory (workflow-lead workflow)))
+                                             (workflow-retention-id workflow)))) 'vector)
+          "steps" (coerce (mapcar (lambda (s) (checkpoint-step workflow s)) (workflow-paused workflow)) 'vector)
+          "agents" (coerce
+                    (mapcar (lambda (a) (jobj "id" (agent-id a) "busy" (agent-busy a)
+                                              "available" (if (and (agent-quiescent-p a) (not (agent-out-of-usage-p a))) t :false)
+                                              "shutdown-confirmed" (if (and (agent-quiescent-p a)
+                                                                            (workflow-old-processes-stopped-p workflow)) t :false)
+                                              "unavailable" (agent-out-until a)))
+                            (list (workflow-lead workflow) (workflow-partner workflow))) 'vector))))
+
+(defun recover-integration (workflow)
+  "Explicitly continue integration, skipping branches already in HEAD."
+  (let ((home (workflow-home workflow)))
+    (when (or (not home) (not (probe-file home)) (repository-operation-p home))
+      (return-from recover-integration :blocked))
+    (unless (every (lambda (l) (or (eq l (workflow-merged-loop workflow))
+                                   (and (member (loop-state l) '(:approved :unreviewed))
+                                        (not (loop-check-failed l)))))
+                   (workflow-loops workflow))
+      (return-from recover-integration :blocked))
+    (setf (workflow-state workflow) :running)
+    (if (eq (workflow-integration-state workflow) :committing)
+        (integrate workflow)
+        (if (and (eq (workflow-integration-state workflow) :merged) (null (workflow-merged-loop workflow)))
+            (merged workflow)
+            (merge-parts workflow (mapcar #'cdr (reverse (workflow-trees workflow))))))
+    :started))
+
+(defun recovery-progress-prompt (workflow step &optional inspection)
+  (format nil "Explicit recovery of an interrupted ~a step. Inspect existing files and partial work before editing; preserve useful work.~%~%Original assignment:~%~a~%~%Reason: ~a~%Available turn progress:~%~a~%~%Written result:~%~a~%Last review:~%~a~%~%Current repository inspection:~%~a"
+          (step-role step) (or (step-original-prompt step) (step-prompt step)) (step-reason step) (or (step-progress step) "No final reply.")
+          (if (step-loop step) (loop-summary (step-loop step)) "")
+          (if (step-loop step) (or (loop-last-review (step-loop step)) "") "")
+          (json-string (or inspection (inspect-workflow-recovery workflow)))))
+
+(defun recover-workflow (workflow action &key step acknowledge-changes)
+  "Only explicit actions may start recovered work. A pending handoff stays paused."
+  (when (eq action :restore-worktrees)
+    (return-from recover-workflow (restore-workflow-worktrees workflow)))
+  (when (eq action :review) (return-from recover-workflow (inspect-workflow-recovery workflow)))
+  (when (eq action :stop) (stop-workflow workflow) (return-from recover-workflow :stopped))
+  (when (eq action :abandon)
+    (stop-workflow workflow)
+    (setf (workflow-state workflow) :abandoned)
+    (checkpoint-changed workflow)
+    (return-from recover-workflow :abandoned))
+  (when (eq (workflow-state workflow) :abandoned) (return-from recover-workflow :blocked))
+  (when (and (stringp step) (not (find step (workflow-paused workflow) :key #'step-id :test #'equal)))
+    (return-from recover-workflow :blocked))
+  (unless (member action '(:resume :retry :hand-off)) (error "Unknown recovery action ~a" action))
+  (let* ((step (if (stringp step) (find step (workflow-paused workflow) :key #'step-id :test #'equal)
+                   (or step (first (workflow-paused workflow)))))
+         (inspection (inspect-workflow-recovery workflow)))
+    (when (and (recovery-step-repository-changed-p workflow step inspection) (not acknowledge-changes))
+      (return-from recover-workflow :repository-changed))
+    (when (some (lambda (r) (or (and (not (jtrue-p (jget r "available")))
+                                           (not (and (null step)
+                                                     (assoc (jget r "path") (workflow-integration-journal workflow) :test #'equal))))
+                                      (and (jtrue-p (jget r "operation"))
+                                           (not (and step (eq (step-role step) :resolve)
+                                                     (workflow-home workflow)
+                                                     (equal (jget r "path") (namestring (workflow-home workflow))))))))
+                (jlist (jget inspection "repositories")))
+      (return-from recover-workflow :blocked))
+    (when (not (workflow-old-processes-stopped-p workflow))
+      (return-from recover-workflow :pending-shutdown))
+    (unless (workflow-checks-quiescent-p workflow) (return-from recover-workflow :pending-shutdown))
+    (unless step
+      (unless (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow)))
+        (return-from recover-workflow :pending-shutdown))
+      (return-from recover-workflow
+        (cond ((workflow-pending-plan workflow)
+               (setf (workflow-state workflow) :running)
+               (when (workflow-on-plan workflow)
+                 (funcall (workflow-on-plan workflow) workflow
+                          (getf (workflow-pending-plan workflow) :lead)
+                          (getf (workflow-pending-plan workflow) :partner)))
+               (checkpoint-changed workflow) :awaiting-plan)
+              ((member (workflow-integration-state workflow) '(:committing :merging :interrupted :merged))
+               (recover-integration workflow))
+              (t :blocked))))
+    (when (and (step-loop step) (not (loop-prerequisites-ready-p (step-loop step))))
+      (return-from recover-workflow :blocked))
+    (unless (member step (workflow-paused workflow)) (return-from recover-workflow :blocked))
+    (unless (agent-quiescent-p (step-agent step))
+      (return-from recover-workflow :pending-shutdown))
+    (let ((agent (if (eq action :hand-off) (other-agent workflow (step-agent step)) (step-agent step))))
+      (when (agent-out-of-usage-p agent) (return-from recover-workflow :unavailable))
+      (unless (agent-quiescent-p agent) (return-from recover-workflow :pending-shutdown))
+      (let ((directory (or (and (step-loop step) (loop-tree (step-loop step))) (workflow-home workflow)
+                           (agent-directory agent))))
+        (when (and directory (not (equal directory (agent-directory agent)))) (move-agent agent directory)))
+      (let ((saved (find (agent-id agent) (workflow-saved-agent-context workflow)
+                         :key (lambda (entry) (recovery-keyword (jget entry "id"))))))
+        (when (and saved (not (eq action :hand-off)))
+          (agent-resume-conversation agent (recovery-null (jget saved "conversation")))
+          (setf (workflow-saved-agent-context workflow)
+                (remove saved (workflow-saved-agent-context workflow)))))
+      (when (eq (workflow-mode workflow) :review-only)
+        (unless (assoc agent (workflow-review-access workflow))
+          (push (cons agent (agent-read-only-p agent)) (workflow-review-access workflow)))
+        (setf (agent-read-only-p agent) t))
+      (setf (workflow-state workflow) :running
+            (workflow-recovery-baseline workflow) (jget inspection "repositories"))
+      (cond ((eq (step-role step) :check)
+             (unpause workflow step) (setf (step-state step) :completed)
+             (loop-check workflow (step-loop step) (loop-check-fixes (step-loop step))))
+            ((eq action :hand-off)
+             (setf (step-prompt step) (recovery-progress-prompt workflow step inspection))
+             (%hand-off-step workflow step))
+            (t
+             (setf (step-prompt step)
+                   (if (eq action :retry) (or (step-original-prompt step) (step-prompt step))
+                       (recovery-progress-prompt workflow step inspection)))
+             (%resume-step workflow step)))
+      (checkpoint-changed workflow)
+      :started)))
+
+(defun resume-step (workflow step)
+  (recover-workflow workflow :resume :step step))
+(defun hand-off-step (workflow step)
+  (recover-workflow workflow :hand-off :step step))
+
+(defun loop-prerequisites-ready-p (l)
+  (every (lambda (dep) (and (member (loop-state dep) '(:approved :unreviewed))
+                             (not (loop-check-failed dep)))) (loop-dependencies l)))
+
+(defun set-workflow-dependencies (workflow assignments)
+  "Set (LOOP . PREREQUISITES) edges atomically, rejecting mutual waiting/cycles."
+  (let ((old (mapcar (lambda (l) (cons l (loop-dependencies l))) (workflow-loops workflow))))
+    (handler-case
+        (progn
+          (dolist (entry assignments)
+            (unless (and (member (car entry) (workflow-loops workflow))
+                         (every (lambda (l) (member l (workflow-loops workflow))) (cdr entry)))
+              (error "Dependencies must name loops in this workflow."))
+            (setf (loop-dependencies (car entry)) (cdr entry)))
+          (labels ((visit (l path)
+                     (when (member l path) (error "Circular dependencies: revise the plan or dependency order."))
+                     (dolist (dep (loop-dependencies l)) (visit dep (cons l path)))))
+            (dolist (l (workflow-loops workflow)) (visit l nil)))
+          (checkpoint-changed workflow) t)
+      (error (e)
+        (dolist (entry old) (setf (loop-dependencies (car entry)) (cdr entry)))
+        (error e)))))
+(export '(set-workflow-dependencies loop-dependencies))
+
+(defun invalidate-dependent-loops (workflow prerequisite &optional (seen (make-hash-table :test #'eq)))
+  "A changed prerequisite invalidates dependent checks, reviews and completion."
+  (when (gethash prerequisite seen) (return-from invalidate-dependent-loops nil))
+  (setf (gethash prerequisite seen) t)
+  (dolist (dependent (workflow-loops workflow))
+    (when (and (member prerequisite (loop-dependencies dependent)) (not (gethash dependent seen)))
+      (note workflow "~a changed; ~a must be revalidated before completion."
+            (or (loop-label prerequisite) "Prerequisite") (or (loop-label dependent) "dependent work"))
+      (let ((token (loop-check-handle dependent)))
+        (setf (loop-check-handle dependent) nil)
+        (when token (kill-check (car token))))
+      (let ((steps (remove-if-not (lambda (s) (and (eq dependent (step-loop s))
+                                                  (member (step-state s) '(:running :paused)))) (workflow-steps workflow))))
+        (if steps
+            (dolist (step steps)
+              (let ((running (eq (step-state step) :running)))
+                (incf (step-generation step))
+                (setf (step-reason step) :prerequisite-changed)
+                (pause-step workflow step)
+                (when running (agent-cancel (step-agent step)))))
+            (let ((step (make-step :agent (loop-author dependent) :role :work :loop dependent
+                                   :prompt (format nil "Revalidate your work against the changed prerequisite.~%~a" (loop-task dependent))
+                                   :reason :prerequisite-changed)))
+              (setf (step-then step) (restored-step-continuation workflow step))
+              (push step (workflow-steps workflow))
+              (pause-step workflow step))))
+      (invalidate-dependent-loops workflow dependent seen))))
+
+(defun restore-workflow-worktrees (workflow)
+  "An explicit action recovers missing worktrees from committed recovery refs."
+  (unless (and (workflow-old-processes-stopped-p workflow)
+               (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow))))
+    (return-from restore-workflow-worktrees :pending-shutdown))
+  (dolist (entry (workflow-trees workflow))
+    (let* ((old (cdr entry))
+           (branch (cdr (assoc old (workflow-tree-branches workflow) :test #'equal))))
+      (unless (probe-file old)
+        (unless branch (return-from restore-workflow-worktrees :blocked))
+        (let* ((part (if (uiop:string-prefix-p "agent-duet/" branch) (subseq branch 11) branch))
+               (path (handler-case
+                         (restore-recovery-worktree (workflow-home workflow) (workflow-retention-id workflow) part)
+                       (error (e)
+                         (note workflow "Couldn't restore committed progress: ~a" e)
+                         (return-from restore-workflow-worktrees :blocked)))))
+          (dolist (l (workflow-loops workflow))
+            (when (equal old (loop-tree l)) (setf (loop-tree l) path)))
+          (setf (cdr entry) path)
+          (push (cons path (worktree-branch path)) (workflow-tree-branches workflow))
+          (note workflow "Restored committed progress in ~a. Uncommitted edits from the missing worktree cannot be reconstructed." path)
+          (checkpoint-changed workflow)))))
+  (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
+  :restored)
+
+(defun workflow-checks-quiescent-p (workflow)
+  (setf (workflow-stopping-checks workflow)
+        (remove-if (lambda (handle)
+                     (and (check-handle-thread handle)
+                          (not (sb-thread:thread-alive-p (check-handle-thread handle)))
+                          (or (null (check-handle-process handle))
+                              (not (sb-ext:process-alive-p (check-handle-process handle))))))
+                   (workflow-stopping-checks workflow)))
+  (null (workflow-stopping-checks workflow)))
+
+(defun workflow-old-processes-stopped-p (workflow)
+  "Require identity-matched old processes to exit; never trust a recycled PID."
+  (every (lambda (record)
+           (or (not (recovery-process-alive-p record))
+               (some (lambda (a)
+                       (let ((process (agent-cli-process a)))
+                         (and process (= (jget record "pid") (sb-ext:process-pid process))
+                              (agent-quiescent-p a))))
+                     (list (workflow-lead workflow) (workflow-partner workflow)))))
+         (workflow-shutdown-processes workflow)))
+
+(defun workflow-process-records (workflow)
+  "Use cached process identities. Serializing a checkpoint never runs ps."
+  (remove-duplicates
+   (append (workflow-shutdown-processes workflow)
+           (loop for a in (list (workflow-lead workflow) (workflow-partner workflow))
+                 append (append (agent-editing-processes a)
+                                (agent-retiring-records a)
+                                (and (agent-busy a) (agent-process-record a)
+                                     (list (agent-process-record a)))))) :test #'equalp))
+
+(defun workflow-peer-progress (workflow agent)
+  (loop for s in (workflow-steps workflow) unless (eq agent (step-agent s))
+        collect (list (step-id s) (step-generation s) (step-state s))))
+
+(defun recovery-step-repository-changed-p (workflow step inspection)
+  "Ignore another part's worktree, and expected peer progress in a live shared folder.
+Restart/whole-task recovery still requires acknowledging changes."
+  (if (null step) (jtrue-p (jget inspection "repository-changed"))
+      (let* ((tree (and (step-loop step) (loop-tree (step-loop step))))
+             (baseline (or (step-repositories step) (workflow-recovery-baseline workflow)))
+             (peer (other-agent workflow (step-agent step))))
+        (cond
+          ((and (null tree) (workflow-live-p workflow)
+                (or (agent-busy peer)
+                    (and (step-peer-progress step)
+                         (not (equal (step-peer-progress step)
+                                     (workflow-peer-progress workflow (step-agent step))))))) nil)
+          ((and tree baseline)
+           (some (lambda (path)
+                   (let ((before (find path (jlist baseline) :key (lambda (r) (jget r "path")) :test #'equal))
+                         (now (find path (jlist (jget inspection "repositories")) :key (lambda (r) (jget r "path")) :test #'equal)))
+                     (not (recovery-repositories-equal-p before now))))
+                 (remove-duplicates (remove nil (list (namestring tree)
+                                                      (and (workflow-home workflow) (namestring (workflow-home workflow)))))
+                                    :test #'equal)))
+          (t (jtrue-p (jget inspection "repository-changed")))))))
+
+(defun recovery-repositories-equal-p (before now)
+  "Registered peer worktrees may advance without changing this repository."
+  (every (lambda (key) (equalp (jget before key) (jget now key)))
+         '("path" "available" "head" "branch" "status" "index" "working" "untracked" "operation" "error" "git")))

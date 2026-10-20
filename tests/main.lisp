@@ -711,7 +711,7 @@ VERDICT: CHANGES REQUESTED"))))
 
 (define-test compare-without-one-proposal
     :parent agent-duet
-  ;; ChatGPT's proposal fails: Claude plans from its own.
+  ;; A failed proposal is preserved for explicit recovery.
   (multiple-value-bind (workflow messages claude)
       (run-fake :compare
                 (responder "propose your approach" "Mine"
@@ -719,11 +719,11 @@ VERDICT: CHANGES REQUESTED"))))
                            "Did it")
                 (list nil (says (format nil "VERDICT: APPROVED"))))
     (declare (ignore messages))
-    (is eq :finished (ai:workflow-state workflow))
-    (true (find "go with yours" (fake-prompts claude) :test #'search)))
-  ;; Neither: the workflow ends.
+    (is eq :running (ai:workflow-state workflow))
+    (is eq :failed (ai::step-reason (first (ai::workflow-paused workflow)))))
+  ;; Neither is available: both proposals stay recoverable.
   (let ((workflow (run-fake :compare '() '())))
-    (is eq :finished (ai:workflow-state workflow))
+    (is eq :running (ai:workflow-state workflow))
     (false (ai:workflow-loops workflow))))
 
 (define-test lead-proposal-out-then-handed-off
@@ -776,10 +776,10 @@ VERDICT: CHANGES REQUESTED"))))
 
 (define-test failed-turn
     :parent agent-duet
-  ;; Claude has no replies: its turn fails, and so does the workflow.
+  ;; A failed turn pauses with its assignment intact.
   (let ((workflow (run-fake :review '() '())))
-    (is eq :finished (ai:workflow-state workflow))
-    (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))))
+    (is eq :running (ai:workflow-state workflow))
+    (is eq :paused (ai::loop-state (first (ai:workflow-loops workflow))))))
 
 (defclass hanging-agent (fake-agent) ()
   (:documentation "Starts turns and never finishes them, until cancelled."))
@@ -797,8 +797,8 @@ VERDICT: CHANGES REQUESTED"))))
     (ai:start-workflow workflow)
     (is eq :running (ai:workflow-state workflow))
     (ai:agent-cancel claude)
-    (is eq :finished (ai:workflow-state workflow))
-    (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))))
+    (is eq :running (ai:workflow-state workflow))
+    (is eq :paused (ai::loop-state (first (ai:workflow-loops workflow))))))
 
 (define-test cancel-ends-queued-steps
     :parent agent-duet
@@ -1211,10 +1211,9 @@ deleted ones onto DELETED. While FAIL (a place) is true, taking one fails."
       (run-pausing :review (list (says "Wrote it")) (list (says :out-of-usage)))
     (ai:stop-workflow workflow)
     (is eq :stopped (ai:workflow-state workflow))
-    (false (ai::workflow-paused workflow))
-    ;; Choices on the old card do nothing now.
-    (ai::resume-step workflow (first paused))
-    (is eq :stopped (ai:workflow-state workflow))))
+    (true (ai::workflow-paused workflow))
+    ;; Stop preserves the step; recovering it is an explicit user action.
+    (true (member (first paused) (ai::workflow-paused workflow)))))
 
 (define-test out-agent-turns-prompts-away
     :parent agent-duet
@@ -1646,7 +1645,7 @@ tests/fake-claude, its notes pushed onto NOTES."
 
 (define-test worktree-stopped-keeps-work
     :parent agent-duet
-  ;; Stopped while ChatGPT works: both go back to the folder; the worktrees stay.
+  ;; Stop returns agents home but retains worktrees and resumable assignments.
   (with-git-folder (repo)
     (multiple-value-bind (claude codex)
         (worktree-agents repo
@@ -1718,12 +1717,12 @@ tests/fake-claude, its notes pushed onto NOTES."
                                     (if (eq failing :review) '(:error "Review broke") *approve*))
                                    (t (write-file-text (ai:agent-directory agent) "b.txt" "done") "Wrote b.txt"))))
         (multiple-value-bind (workflow messages) (run-worktrees claude codex)
-          (is = 1 (count "The worktrees are kept" messages :key #'third :test #'search))
+          (true (ai::workflow-paused workflow))
           (false (find "recovery refs" messages :key #'third :test #'search))
           (false (ai::workflow-recovery-recorded workflow))
-          (is eq :finished (ai:workflow-state workflow))
-          (is eq :failed (ai::loop-state (first (ai:workflow-loops workflow))))
-          (true (find "so the parts aren't merged" messages :key #'third :test #'search))
+          (is eq :running (ai:workflow-state workflow))
+          (is eq :paused (ai::loop-state (first (ai:workflow-loops workflow))))
+          (true (ai::workflow-paused workflow))
           (is = 2 (length (ai:workflow-loops workflow)))
           (false (probe-file (merge-pathnames "a.txt" repo)))
           (false (probe-file (merge-pathnames "b.txt" repo)))
@@ -1734,8 +1733,8 @@ tests/fake-claude, its notes pushed onto NOTES."
           ;; Nothing was committed in them either.
           (true (every (lambda (e) (plusp (length (ai::worktree-git (cdr e) "status" "--porcelain"))))
                        (ai::workflow-trees workflow)))
-          (is equal repo (ai:agent-directory claude))
-          (is equal repo (ai:agent-directory codex)))))))
+          (true (member (ai:agent-directory claude) (mapcar #'cdr (ai::workflow-trees workflow)) :test #'equal))
+          (true (member (ai:agent-directory codex) (mapcar #'cdr (ai::workflow-trees workflow)) :test #'equal)))))))
 
 (define-test worktree-written-results
     :parent agent-duet
@@ -1854,8 +1853,8 @@ tests/fake-claude, its notes pushed onto NOTES."
         (let ((merged (third (ai:workflow-loops workflow))))
           (true (find "worktrees and branches are kept" messages :key #'third :test #'search))
           (true (find (ai::workflow-retention-id workflow) messages :key #'third :test #'search))
-          (is eq :finished (ai:workflow-state workflow))
-          (is eq :failed (ai::loop-state merged))
+          (is eq :running (ai:workflow-state workflow))
+          (is eq :paused (ai::loop-state merged))
           (true (search "Lead answer preserved" (ai::loop-summary merged)))
           (true (search "Partner answer preserved" (ai::loop-summary merged)))
           (true (every (lambda (entry) (probe-file (cdr entry))) (ai::workflow-trees workflow)))
@@ -1969,9 +1968,9 @@ tests/fake-claude, its notes pushed onto NOTES."
         (is = 1 (length (ai::workflow-loops workflow)))
         (is = (if (eq choice :lead) 1 0) (length (fake-prompts claude)))
         (is = (if (eq choice :partner) 1 0) (length (fake-prompts codex)))
-        (false (ai::agent-read-only-p claude))
-        (false (ai::agent-read-only-p codex))
-        (is eq :failed (ai::loop-state (first (ai::workflow-loops workflow))))))))
+        (is eq (eq choice :lead) (ai::agent-read-only-p claude))
+        (is eq (eq choice :partner) (ai::agent-read-only-p codex))
+        (is eq :paused (ai::loop-state (first (ai::workflow-loops workflow))))))))
 
 (define-test review-only-pause-stop-restores-access
     :parent agent-duet
@@ -2039,3 +2038,286 @@ VERDICT: APPROVED" nil)
       (is eq :unresolved (ai::loop-state (second (ai::workflow-loops workflow))))
       (false (ai::agent-read-only-p claude))
       (false (ai::agent-read-only-p codex)))))
+
+;;; Recovery must retain progress and require a deliberate user action.
+(defun recovery-fixture ()
+  (let* ((lead (make-instance 'hanging-agent :id :claude :name "Claude" :replies nil))
+         (partner (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies nil))
+         (workflow (make-instance 'ai:workflow :lead lead :partner partner :request "Recover me")))
+    (ai:start-workflow workflow)
+    (values workflow lead partner)))
+
+(define-test recovery-checkpoint-roundtrip :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((step (first (ai::workflow-steps workflow)))
+           (l (first (ai:workflow-loops workflow))))
+      (setf (ai::loop-summary l) "Written progress must survive"
+            (ai::loop-round l) 2
+            (ai::loop-findings l) (list (ai::make-finding :id 7 :status :open :text "Pending" :location "a:1")))
+      (let* ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+             (restored (ai:restore-workflow checkpoint :lead lead :partner partner)))
+        (is eq :paused (ai:workflow-state restored))
+        (is = 1 (length (fake-prompts lead)))
+        (is = 1 (length (ai::workflow-paused restored)))
+        (is string= (ai::step-id step) (ai::step-id (first (ai::workflow-paused restored))))
+        (is string= "Written progress must survive" (ai::loop-summary (first (ai:workflow-loops restored))))
+        (is = 2 (ai::loop-round (first (ai:workflow-loops restored))))
+        (is = 7 (ai::finding-id (first (ai::loop-findings (first (ai:workflow-loops restored))))))
+        (fail (ai:restore-workflow checkpoint) error)))))
+
+(define-test recovery-pause-stale-result-and-handoff :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let ((old-callback (ai::agent-callback lead)))
+      (ai:pause-workflow-agent workflow lead)
+      (is eq :interrupted (ai::step-reason (first (ai::workflow-paused workflow))))
+      (funcall old-callback "Late completed work" nil)
+      (is string= "" (ai::loop-summary (first (ai:workflow-loops workflow))))
+      (is eq :pending-shutdown (ai:recover-workflow workflow :hand-off))
+      (false (fake-prompts partner))
+      (ai:agent-turn-finished lead "Stopped" :interrupted)
+      (setf (fake-replies partner) (list (says "Recovered implementation")))
+      (is eq :started (ai:recover-workflow workflow :hand-off))
+      (let ((l (first (ai:workflow-loops workflow))))
+        (is eq :unreviewed (ai::loop-state l))
+        (is string= "Recovered implementation" (ai::loop-summary l)))
+      (true (search "Original assignment" (first (fake-prompts partner))))
+      (funcall old-callback "Stale overwrite" nil)
+      (is string= "Recovered implementation" (ai::loop-summary (first (ai:workflow-loops workflow)))))))
+
+(define-test recovery-stop-roundtrip-does-not-execute :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (ai:stop-workflow workflow)
+    (is eq :stopped (ai:workflow-state workflow))
+    (true (ai::workflow-paused workflow))
+    (let* ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (restored (ai:restore-workflow checkpoint :lead lead :partner partner)))
+      (ai:recover-workflow restored :review)
+      (is = 1 (length (fake-prompts lead)))
+      (is eq :pending-shutdown (ai:recover-workflow restored :resume))
+      (ai:agent-turn-finished lead "Stopped" :interrupted)
+      (is eq :started (ai:recover-workflow restored :resume))
+      (is = 2 (length (fake-prompts lead)))
+      (true (search "Inspect existing files" (first (fake-prompts lead)))))))
+
+(define-test recovery-review-failure-retains-implementation :parent agent-duet
+  (multiple-value-bind (workflow messages lead partner)
+      (run-fake :review (list (says "Completed implementation")) (list (says '(:error "Disconnected"))))
+    (declare (ignore messages))
+    (is eq :review (ai::step-role (first (ai::workflow-paused workflow))))
+    (is eq :failed (ai::step-reason (first (ai::workflow-paused workflow))))
+    (setf (fake-replies partner) (list (says "VERDICT: APPROVED")))
+    (is eq :started (ai:recover-workflow workflow :resume))
+    (is = 1 (length (fake-prompts lead)))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))))
+
+(define-test recovery-both-unavailable :parent agent-duet
+  (multiple-value-bind (workflow messages lead partner)
+      (run-fake :review (list (says :out-of-usage)) nil)
+    (declare (ignore messages))
+    (ai::agent-ran-out lead (+ (get-universal-time) 1000))
+    (ai::agent-ran-out partner (+ (get-universal-time) 1000))
+    (is eq :unavailable (ai:recover-workflow workflow :resume))
+    (is eq :unavailable (ai:recover-workflow workflow :hand-off))
+    (true (ai::workflow-paused workflow))
+    (is = 2 (length (ai:jget (ai:inspect-workflow-recovery workflow) "agents")))))
+
+(define-test recovery-dependencies-and-cycles :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((prerequisite (first (ai:workflow-loops workflow)))
+           (dependent (ai::make-review-loop :author partner :reviewer lead :task "Dependent")))
+      (setf (ai:workflow-loops workflow) (list prerequisite dependent))
+      (true (ai:set-workflow-dependencies workflow (list (cons dependent (list prerequisite)))))
+      (ai::loop-work workflow dependent "Do dependent work")
+      (false (fake-prompts partner))
+      (is eq :blocked (ai:recover-workflow workflow :resume))
+      (fail (ai:set-workflow-dependencies workflow (list (cons prerequisite (list dependent)))) error)
+      (false (ai::loop-dependencies prerequisite))
+      (is equal (list prerequisite) (ai::loop-dependencies dependent))
+      (setf (ai::loop-state prerequisite) :approved
+            (fake-replies partner) (list (says :out-of-usage)))
+      (ai::check-finished workflow)
+      (is = 1 (length (fake-prompts partner)))
+      (is eq :out-of-usage (ai::step-reason (first (ai::workflow-paused workflow)))))))
+
+(define-test recovery-preserves-streamed-progress :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (ai::agent-emit lead :delta :text "Partial reasoning and edits")
+    (ai:pause-workflow-agent workflow lead)
+    (is string= "Partial reasoning and edits" (ai::step-progress (first (ai::workflow-paused workflow))))
+    (let ((restored (ai:restore-workflow (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))
+                                        :lead lead :partner partner)))
+      (is string= "Partial reasoning and edits" (ai::step-progress (first (ai::workflow-paused restored)))))))
+
+(define-test recovery-waits-for-editing-child :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let ((child (sb-ext:run-program "/bin/sleep" '("10") :wait nil)))
+      (unwind-protect
+           (progn
+             (ai:pause-workflow-agent workflow lead)
+             (ai:agent-turn-finished lead "Stopped" :interrupted)
+             (setf (ai::agent-editing-pids lead) (list (sb-ext:process-pid child)))
+             (is eq :pending-shutdown (ai:recover-workflow workflow :hand-off))
+             (false (fake-prompts partner))
+             (sb-ext:process-kill child 15)
+             (sb-ext:process-wait child)
+             (true (ai:agent-quiescent-p lead)))
+        (when (sb-ext:process-alive-p child) (sb-ext:process-kill child 15))))))
+
+(define-test recovery-changed-prerequisite-invalidates-dependent :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((prerequisite (first (ai:workflow-loops workflow)))
+           (dependent (ai::make-review-loop :author partner :reviewer lead :task "Dependent"
+                                            :state :approved :summary "Previously approved")))
+      (setf (ai:workflow-loops workflow) (list prerequisite dependent)
+            (ai::loop-dependencies dependent) (list prerequisite)
+            (ai::loop-revision prerequisite) 1)
+      (ai::invalidate-dependent-loops workflow prerequisite)
+      (is eq :paused (ai::loop-state dependent))
+      (is eq :prerequisite-changed (ai::step-reason (first (ai::workflow-paused workflow))))
+      (is eq :blocked (ai:recover-workflow workflow :resume))
+      (is string= "Previously approved" (ai::loop-summary dependent)))))
+
+(define-test recovery-old-stop-cannot-cancel-new-work :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (declare (ignore partner))
+    (ai:stop-workflow workflow)
+    (ai:agent-turn-finished lead "Stopped" :interrupted)
+    (ai:agent-submit lead "Unrelated later work")
+    (ai:stop-workflow workflow)
+    (true (ai:agent-busy lead))
+    (true (car (ai::agent-turn-token lead)))))
+
+(define-test recovery-dependency-diamond-invalidates-once :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((a (first (ai:workflow-loops workflow)))
+           (b (ai::make-review-loop :author lead :reviewer partner :task "B" :state :approved :dependencies (list a)))
+           (c (ai::make-review-loop :author partner :reviewer lead :task "C" :state :approved :dependencies (list a)))
+           (d (ai::make-review-loop :author partner :reviewer lead :task "D" :state :approved :dependencies (list b c))))
+      (setf (ai:workflow-loops workflow) (list a b c d))
+      (ai::invalidate-dependent-loops workflow a)
+      (is = 1 (count d (ai::workflow-paused workflow) :key #'ai::step-loop))
+      (is eq :paused (ai::loop-state d))
+      ;; Further prerequisite changes update the same paused assignment.
+      (ai::invalidate-dependent-loops workflow a)
+      (is = 1 (count d (ai::workflow-paused workflow) :key #'ai::step-loop)))))
+
+;;; Review regressions: real process lifetimes, checkpoints and explicit recovery.
+(define-test recovery-handoff-resolve-preserves-target :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (ai:pause-workflow-agent workflow lead)
+    (ai:agent-turn-finished lead "Stopped" :interrupted)
+    (let* ((step (first (ai::workflow-paused workflow)))
+           (calls nil))
+      (setf (ai::step-role step) :resolve
+            (ai::step-target step) "saved-merge-object"
+            (ai::step-then step) (lambda (text error) (push (list text error) calls))
+            (fake-replies partner) (list (says "Resolved")))
+      (is eq :started (ai:recover-workflow workflow :hand-off :step step))
+      (is string= "saved-merge-object" (ai::step-target (first (ai::workflow-steps workflow))))
+      (is equal '(("Resolved" nil)) calls))))
+
+(define-test recovery-checkpoints-do-not-inspect-repositories :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (declare (ignore lead partner))
+    (let ((old (symbol-function 'ai::workflow-repositories))
+          (old-ps (symbol-function 'ai::remember-agent-editors))
+          (calls 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ai::workflow-repositories)
+                   (lambda (w) (declare (ignore w)) (incf calls) (error "Checkpoint ran Git"))
+                   (symbol-function 'ai::remember-agent-editors)
+                   (lambda (a) (declare (ignore a)) (incf calls) (error "Checkpoint ran ps")))
+             (dotimes (i 5) (ai:json-string (ai:workflow-checkpoint workflow)))
+             (is = 0 calls))
+        (setf (symbol-function 'ai::workflow-repositories) old
+              (symbol-function 'ai::remember-agent-editors) old-ps)))))
+
+(define-test recovery-restores-fix-assignment :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((l (first (ai:workflow-loops workflow)))
+           (checkpoint nil))
+      (setf (ai::loop-last-review l) "Fix the boundary condition"
+            (ai::loop-round l) 1
+            (ai::workflow-steps workflow) nil)
+      (setf checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+      (let ((restored (ai:restore-workflow checkpoint :lead lead :partner partner)))
+        (true (search "Fix the boundary condition" (ai::step-prompt (first (ai::workflow-paused restored)))))
+        (true (search "Address the points" (ai::step-prompt (first (ai::workflow-paused restored)))))))))
+
+(defclass steering-observer (hanging-agent)
+  ((steers :initform nil :accessor observer-steers)))
+(defmethod ai::agent-steer ((agent steering-observer) prompt &optional images)
+  (declare (ignore images))
+  (push prompt (observer-steers agent)))
+
+(define-test recovery-pause-does-not-steer-peer :parent agent-duet
+  (let* ((lead (make-instance 'hanging-agent :id :claude :name "Claude" :replies nil))
+         (peer (make-instance 'steering-observer :id :codex :name "ChatGPT" :replies nil))
+         (w (make-instance 'ai:workflow :lead lead :partner peer :request "Work")))
+    (ai:start-workflow w)
+    (ai:agent-submit peer "Independent work")
+    (ai:pause-workflow-agent w lead)
+    (false (observer-steers peer))
+    (ai:stop-workflow w)
+    (false (observer-steers peer))))
+
+(defclass process-owning-agent (hanging-agent)
+  ((process :initarg :process :accessor owned-process)))
+(defmethod ai::agent-cli-process ((agent process-owning-agent)) (owned-process agent))
+
+(define-test recovery-persistent-cli-child-is-not-a-turn-editor :parent agent-duet
+  (let* ((root (sb-ext:run-program "/bin/sh" '("-c" "sleep 30 & echo ready; wait") :wait nil :output :stream))
+         (agent (make-instance 'process-owning-agent :id :claude :name "Claude" :replies nil :process root)))
+    (unwind-protect
+         (progn
+           (is string= "ready" (read-line (sb-ext:process-output root)))
+           (ai::capture-agent-process-baseline agent)
+           (true (ai::agent-turn-process-baseline agent))
+           (ai:agent-submit agent "Work")
+           (ai:agent-cancel agent)
+           (ai:agent-turn-finished agent "Stopped" :interrupted)
+           (false (ai::agent-editing-processes agent))
+           (true (ai:agent-quiescent-p agent)))
+      (dolist (record (ai::agent-turn-process-baseline agent))
+        (when (ai::recovery-process-alive-p record) (ignore-errors (sb-posix:kill (ai:jget record "pid") 15))))
+      (when (sb-ext:process-alive-p root) (sb-ext:process-kill root 15))
+      (sb-ext:process-wait root))))
+
+(define-test recovery-process-identity-rejects-reused-pid :parent agent-duet
+  (let ((record (ai::recovery-process-record (sb-posix:getpid))))
+    (true (ai::recovery-process-alive-p record))
+    (setf (cdr (assoc "identity" (cdr record) :test #'equal)) "an earlier process with this PID")
+    (false (ai::recovery-process-alive-p record))
+    (multiple-value-bind (workflow lead partner) (recovery-fixture)
+      (declare (ignore lead partner))
+      (setf (ai::workflow-shutdown-processes workflow) (list record))
+      (true (ai::workflow-old-processes-stopped-p workflow))
+      (let ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))))
+        (is = 0 (length (ai:jget checkpoint "shutdown-pids")))
+        (is = 1 (length (ai:jget checkpoint "shutdown-processes")))))))
+
+(define-test recovery-turn-owned-child-is-stopped-and-cleared :parent agent-duet
+  (let* ((root (sb-ext:run-program "/bin/sh" '("-c" "echo ready; read command; sleep 30 & echo editing; wait")
+                                   :wait nil :input :stream :output :stream))
+         (agent (make-instance 'process-owning-agent :id :claude :name "Claude" :replies nil :process root)))
+    (unwind-protect
+         (progn
+           (is string= "ready" (read-line (sb-ext:process-output root)))
+           (ai::capture-agent-process-baseline agent)
+           (false (ai::agent-turn-process-baseline agent))
+           (ai:agent-submit agent "Work")
+           (write-line "go" (sb-ext:process-input root))
+           (finish-output (sb-ext:process-input root))
+           (is string= "editing" (read-line (sb-ext:process-output root)))
+           (ai:agent-cancel agent)
+           (true (ai::agent-editing-processes agent))
+           (true (wait-until (lambda () (not (sb-ext:process-alive-p root)))))
+           (sb-ext:process-wait root)
+           (ai:agent-turn-finished agent "Stopped" :interrupted)
+           (true (ai:agent-quiescent-p agent))
+           (false (ai::agent-editing-processes agent)))
+      (dolist (record (ai::agent-editing-processes agent))
+        (when (ai::recovery-process-alive-p record) (ignore-errors (sb-posix:kill (ai:jget record "pid") 15))))
+      (when (sb-ext:process-alive-p root) (sb-ext:process-kill root 15))
+      (sb-ext:process-wait root))))

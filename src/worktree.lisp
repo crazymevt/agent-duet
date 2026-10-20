@@ -213,3 +213,52 @@ Each ref is deleted only if unchanged since read. Return the number deleted."
                            (worktree-git-line directory "rev-parse" "--git-path" name)
                            (uiop:ensure-directory-pathname directory))))
             '("MERGE_HEAD" "CHERRY_PICK_HEAD" "REVERT_HEAD" "rebase-merge" "rebase-apply" "BISECT_LOG"))))
+
+(defun inspect-recovery-repository (directory)
+  "Read-only JSON state, including content hashes so same-size edits are detected.
+An unavailable repository is data, rather than an exception during restoration."
+  (let ((path (and directory (namestring (uiop:ensure-directory-pathname directory)))))
+    (handler-case
+        (if (and directory (probe-file directory) (git-repository-p directory))
+            (let ((state (repository-state directory)))
+              (jobj "path" path "available" t
+                    "head" (getf state :head) "branch" (getf state :branch)
+                    "status" (getf state :status) "index" (recovery-content-hash directory (getf state :index))
+                    "working" (recovery-content-hash directory (getf state :working))
+                    "untracked" (coerce (mapcar (lambda (entry) (coerce entry 'vector))
+                                               (getf state :untracked)) 'vector)
+                    "operation" (if (repository-operation-p directory) t :false)
+                    "worktrees" (worktree-git directory "worktree" "list" "--porcelain")))
+            (if (and directory (probe-file directory))
+                (jobj "path" path "available" t "git" :false)
+                (jobj "path" path "available" :false "error" "Repository or worktree unavailable")))
+      (error (e) (jobj "path" path "available" :false "error" (princ-to-string e))))))
+
+(defun restore-recovery-worktree (directory task part)
+  "Explicitly recreate committed progress from retained refs on a fresh branch.
+No existing directory, branch or ref is removed. Return the new worktree path."
+  (let* ((record (find part (worktree-recovery-refs directory task) :key (lambda (e) (getf e :part)) :test #'equal))
+         (name (format nil "recovered-~a" (make-uuid)))
+         (branch (concatenate 'string "agent-duet/" name))
+         (path (merge-pathnames (format nil "agent-duet-~a/" (make-uuid)) (uiop:temporary-directory))))
+    (unless record (error "No retained committed progress for part ~a." part))
+    (worktree-git directory "worktree" "add" "-b" branch (namestring path) (getf record :head))
+    (worktree-git directory "config" (worktree-base-key branch) (getf record :base))
+    path))
+
+(defun merge-recovery-ref (directory ref)
+  "Merge the checkpointed object, reporting conflicts without aborting them."
+  (handler-case (progn (worktree-git directory "merge" "--no-edit" ref) :merged)
+    (error (e)
+      (let ((files (remove "" (uiop:split-string
+                               (worktree-git directory "diff" "--name-only" "--diff-filter=U" "-z")
+                               :separator '(#\Null)) :test #'equal)))
+        (if files (values :conflict files) (error e))))))
+
+(defun recovery-content-hash (directory text)
+  "A stable Git object digest without storing file contents or writing an object."
+  (multiple-value-bind (output errors status)
+      (uiop:run-program (list "git" "-C" (namestring directory) "hash-object" "--stdin")
+                        :input (make-string-input-stream text) :output :string :error-output :string :ignore-error-status t)
+    (unless (zerop status) (error "Cannot fingerprint recovery state: ~a" errors))
+    (string-right-trim '(#\Newline #\Return) output)))
