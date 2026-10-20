@@ -467,6 +467,24 @@ contains; the last of PAIRS (unpaired) otherwise."
 (defun checklist-heading (text)
   (subseq text 0 (position #\Newline text)))
 
+(define-test task-checklist-isolates-task-markdown
+    :parent agent-duet
+  (let* ((author (make-instance 'fake-agent :name "Claude"))
+         (part (ai::make-review-loop :author author
+                                    :task (format nil "# Task~%```lisp~%(unfinished")
+                                    :findings (list (ai::make-finding :id 1 :text "Keep this visible"))))
+         (text (ai::checklist-text part))
+         (blocks (ai::markdown-blocks text)))
+    (is equal '(:paragraph :quote :paragraph :paragraph :list) (mapcar #'first blocks))
+    (true (search "Assigned to: **Claude**" text))
+    (true (search "**F1**" text))
+    (setf (ai::loop-combined-result part) t)
+    (let ((merged (ai::checklist-text part)))
+      (true (search "Combine both parts and review the merged result." merged))
+      (false (search "unfinished" merged)))
+    (setf (ai::loop-state part) :unknown)
+    (fail (ai::checklist-text part) type-error)))
+
 (define-test task-checklist-from-assignment
     :parent agent-duet
   (multiple-value-bind (workflow messages)

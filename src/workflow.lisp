@@ -535,8 +535,17 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
   "LOOP's checklist, in Markdown, for the conversation."
   (let ((findings (loop-findings loop)))
     (format nil "**Task checklist~@[, ~a~]**~%~%~a~%~%Assigned to: **~a** · Progress: **~a** · Review rounds: ~d~%~%~d open, ~d fixed, ~d dismissed~%~%~{~a~^~%~}"
-            (loop-label loop) (loop-task loop) (agent-name (loop-author loop))
-            (case (loop-state loop)
+            (loop-label loop)
+            ;; Keep the full merged prompt for work and review, but not in the panel.
+            ;; Quote every task line so its Markdown cannot consume progress/findings.
+            (with-output-to-string (out)
+              (with-input-from-string (in (if (loop-combined-result loop)
+                                             "Combine both parts and review the merged result."
+                                             (loop-task loop)))
+                (loop for line = (read-line in nil) while line
+                      do (format out "> ~a~%" line))))
+            (agent-name (loop-author loop))
+            (ecase (loop-state loop)
               (:assigned "Assigned") (:working (if (plusp (loop-round loop)) "Addressing review" "Working"))
               (:checking "Checking") (:reviewing "In review") (:approved "Approved")
               (:unresolved "Not approved") (:unreviewed "Done without review")

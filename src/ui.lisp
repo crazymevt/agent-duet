@@ -857,7 +857,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                 ((string= header "Check") (middle-check body))
                 ;; Earlier conversations saved checklists as "Review checklist".
                 ((member header '("Task checklist" "Review checklist") :test #'string=)
-                 (show-checklist body))
+                 (show-checklist body :notify nil))
                 (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
                                         ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
                                         (t :user))
@@ -963,7 +963,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (clear-box (pane-messages *checklist*))
     (pane-note *checklist* "Each task will appear here once it's assigned, with its progress and review findings." "dim-label")))
 
-(defun show-checklist (text)
+(defun show-checklist (text &key (notify t))
   "Replace this loop's checklist snapshot in place, including when replaying history."
   (when *checklist*
     ;; Only the bold heading identifies the loop. Progress and counts after
@@ -980,10 +980,11 @@ comes without one (a turn stopped as the folder changes) isn't kept."
             (unless *checklist-boxes* (clear-box (pane-messages *checklist*)))
             (setf box (markdown-box text "duet-checklist"))
             (push (cons heading box) *checklist-boxes*)
-            (pane-append *checklist* box))))
-    (unless (gtk:widget-get-visible (control :checklist-panel))
-      (pane-note *middle* "Checklist updated. Open Checklist to see the tasks' progress and findings."
-                 "dim-label" "duet-note"))))
+            (pane-append *checklist* box)
+            ;; One live notice per loop; replacements and replay stay quiet.
+            (when (and notify (not (gtk:widget-get-visible (control :checklist-panel))))
+              (pane-note *middle* "Checklist updated. Open Checklist to see the tasks' progress and findings."
+                         "dim-label" "duet-note")))))))
 
 (defun set-checklist-visible (visible)
   "Show the checklist temporarily, restoring the conversation dividers on close."
