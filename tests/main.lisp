@@ -456,7 +456,82 @@ contains; the last of PAIRS (unpaired) otherwise."
                                     (says "Did it all"))
                               (list ok))))
       (is eq :finished (ai:workflow-state workflow))
-      (is = 1 (length (ai:workflow-loops workflow))))))
+      (is = 1 (length (ai:workflow-loops workflow)))
+      (is equal (ai::workflow-request workflow)
+          (ai::loop-task (first (ai:workflow-loops workflow)))))))
+
+
+(defun checklist-snapshots (messages)
+  (mapcar #'third (remove :findings messages :key #'second :test-not #'eq)))
+
+(defun checklist-heading (text)
+  (subseq text 0 (position #\Newline text)))
+
+(define-test task-checklist-from-assignment
+    :parent agent-duet
+  (multiple-value-bind (workflow messages)
+      (run-fake :review (list (says "Implemented"))
+                (list (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    (declare (ignore workflow))
+    (let ((snapshots (checklist-snapshots messages)))
+      (is = 4 (length snapshots))
+      (is equal '("**Task checklist**")
+          (remove-duplicates (mapcar #'checklist-heading snapshots) :test #'equal))
+      (true (every (lambda (text)
+                     (and (search "Add a frobnicate function" text)
+                          (search "Assigned to: **Claude**" text)))
+                   snapshots))
+      (loop for status in '("Assigned" "Working" "In review" "Approved")
+            for text in snapshots
+            do (true (search (format nil "Progress: **~a**" status) text)))
+      ;; Assignment is published before any work reply.
+      (true (< (position :findings messages :key #'second)
+               (position :work messages :key #'second))))))
+
+(define-test split-task-checklist-from-assignment
+    :parent agent-duet
+  (let ((ok (format nil "FINDINGS: NONE~%VERDICT: APPROVED")))
+    (multiple-value-bind (workflow messages)
+        (run-fake :divide
+                  (responder "Split the work"
+                             (format nil "LEAD TASK:~%The function~%PARTNER TASK:~%The tests")
+                             "Review the work" ok "Implemented")
+                  (responder "Review the work" ok "Tested"))
+      (declare (ignore workflow))
+      (let* ((snapshots (checklist-snapshots messages))
+             (headings (remove-duplicates (mapcar #'checklist-heading snapshots) :test #'equal)))
+        (is = 2 (length headings))
+        ;; Both assignments exist before either synchronous fake agent works.
+        (true (search "The function" (first snapshots)))
+        (true (search "Assigned to: **Claude**" (first snapshots)))
+        (true (search "The tests" (second snapshots)))
+        (true (search "Assigned to: **ChatGPT**" (second snapshots)))
+        (true (every (lambda (text) (search "Progress: **Assigned**" text))
+                     (subseq snapshots 0 2)))
+        (dolist (heading headings)
+          (let ((part (remove-if-not (lambda (text) (equal heading (checklist-heading text))) snapshots)))
+            (is = 4 (length part))
+            (true (search "Progress: **Approved**" (car (last part))))))))))
+
+(define-test split-task-checklist-preserves-findings
+    :parent agent-duet
+  (multiple-value-bind (workflow messages)
+      (run-fake :divide
+                (list (says (format nil "LEAD TASK:~%The function~%PARTNER TASK:~%The tests"))
+                      (says "v1") (says "v2")
+                      (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED")))
+                (list (says (format nil "FINDINGS:~%- F1 [open] Missing case~%VERDICT: CHANGES REQUESTED"))
+                      (says (format nil "FINDINGS:~%- F1 [fixed] Missing case~%VERDICT: APPROVED"))
+                      (says "Tests")))
+    (declare (ignore workflow))
+    (let* ((snapshots (checklist-snapshots messages))
+           (mine (remove-if-not (lambda (text) (search "**Task checklist, Claude's part**" text)) snapshots))
+           (theirs (remove-if-not (lambda (text) (search "**Task checklist, ChatGPT's part**" text)) snapshots)))
+      (true (find-if (lambda (text) (and (search "Addressing review" text)
+                                       (search "**F1** open" text))) mine))
+      (true (search "**F1** fixed" (car (last mine))))
+      (true (search "Approved" (car (last mine))))
+      (false (some (lambda (text) (search "**F1**" text)) theirs)))))
 
 (define-test review-checklist
     :parent agent-duet
@@ -472,10 +547,14 @@ VERDICT: CHANGES REQUESTED"))))
     (declare (ignore claude))
     (let ((loop (first (ai:workflow-loops workflow))))
       (is equal '(:fixed :dismissed :open) (mapcar #'ai::finding-status (ai::loop-findings loop))))
-    ;; A checklist after each review; the open one still shows in the last.
+    ;; Every progress snapshot retains the accumulated findings.
     (let ((lists (remove :findings messages :key #'second :test-not #'eq)))
-      (is = 3 (length lists))
-      (true (search "1 open, 1 fixed, 1 dismissed" (third (third lists)))))
+      (true (> (length lists) 3))
+      (let ((fixing (find "Progress: **Addressing review**" lists :key #'third :test #'search)))
+        (true fixing)
+        (true (search "**F1** open" (third fixing)))
+        (true (search "**F2** open" (third fixing))))
+      (true (search "1 open, 1 fixed, 1 dismissed" (third (car (last lists))))))
     ;; The reviewer was shown its earlier findings, and where to number from.
     (let ((third-review (third (reverse (fake-prompts codex)))))
       (false (search "Your earlier findings" (first (last (fake-prompts codex)))))

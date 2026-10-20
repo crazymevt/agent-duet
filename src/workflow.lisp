@@ -106,7 +106,7 @@
   (check-failed nil)                    ; true while the check fails after the fix attempts
   (round 0)                             ; reviews done
   (skip-review nil)                     ; true once taken over: its reviewer ran out
-  (state :working))                     ; :working :checking :reviewing :approved :unresolved :unreviewed :failed
+  (state :assigned))                    ; :assigned :working :checking :reviewing :paused :stopped or final outcome
 
 (defstruct (workflow-step (:conc-name step-) (:constructor make-step))
   "A prompt given to an agent for the workflow, kept so it can be given
@@ -194,6 +194,8 @@ unapproved has its author address the last review. True if it carried on."
 
 (defun pause-step (workflow step)
   (setf (workflow-paused workflow) (append (workflow-paused workflow) (list step)))
+  (when (step-loop step)
+    (update-loop-state workflow (step-loop step) :paused))
   (note workflow "~a ~a paused." (agent-out-message (step-agent step)) (step-description step))
   (when (workflow-on-pause workflow)
     (funcall (workflow-on-pause workflow) workflow step)))
@@ -208,6 +210,9 @@ unapproved has its author address the last review. True if it carried on."
   "Give STEP's prompt to its agent again (its usage has reset, or the user wants to try)."
   (when (and (workflow-live-p workflow) (unpause workflow step))
     (note workflow "Trying ~a again." (step-description step))
+    (when (step-loop step)
+      (update-loop-state workflow (step-loop step)
+                         (if (eq (step-role step) :review) :reviewing :working)))
     (submit-step workflow step)))
 
 (defun can-hand-off-p (workflow step)
@@ -230,7 +235,7 @@ does then goes unreviewed, since the one that would review it is out."
          (submit-step workflow (make-step :agent other :prompt (step-prompt step) :then (step-then step)
                                           :role :resolve)))
         (:review
-         (setf (loop-state loop) :unreviewed)
+         (update-loop-state workflow loop :unreviewed)
          (note workflow "~@[~a ~]finished without a review: ~a ran out of usage."
                (and (loop-label loop) (string-capitalize (loop-label loop) :end 1)) (agent-name out))
          (check-finished workflow))
@@ -529,21 +534,33 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
 (defun checklist-text (loop)
   "LOOP's checklist, in Markdown, for the conversation."
   (let ((findings (loop-findings loop)))
-    (format nil "**Review checklist~@[, ~a~]** · ~d open, ~d fixed, ~d dismissed~%~%~{~a~^~%~}"
-            (loop-label loop)
+    (format nil "**Task checklist~@[, ~a~]**~%~%~a~%~%Assigned to: **~a** · Progress: **~a** · Review rounds: ~d~%~%~d open, ~d fixed, ~d dismissed~%~%~{~a~^~%~}"
+            (loop-label loop) (loop-task loop) (agent-name (loop-author loop))
+            (case (loop-state loop)
+              (:assigned "Assigned") (:working (if (plusp (loop-round loop)) "Addressing review" "Working"))
+              (:checking "Checking") (:reviewing "In review") (:approved "Approved")
+              (:unresolved "Not approved") (:unreviewed "Done without review")
+              (:failed "Failed") (:paused "Paused") (:stopped "Stopped"))
+            (loop-round loop)
             (count-findings findings :open) (count-findings findings :fixed) (count-findings findings :dismissed)
             (loop for f in findings
                   collect (format nil "- ~a **F~d** ~(~a~)~@[ · `~a`~] — ~a"
                                   (ecase (finding-status f) (:open "○") (:fixed "✓") (:dismissed "✕"))
                                   (finding-id f) (finding-status f) (finding-location f) (finding-text f))))))
 
+(defun publish-checklist (workflow loop)
+  "Publish a complete snapshot, retaining the same heading throughout LOOP."
+  (post workflow :system (loop-author loop) (checklist-text loop) :findings))
+
+(defun update-loop-state (workflow loop state)
+  (setf (loop-state loop) state)
+  (publish-checklist workflow loop))
+
 (defun take-findings (workflow loop review)
-  "Bring LOOP's checklist up to date from REVIEW, and show it when there is one."
+  "Bring LOOP's findings up to date from REVIEW; progress snapshots include them."
   (multiple-value-bind (parsed found) (parse-findings review)
     (when found
-      (setf (loop-findings loop) (merge-findings (loop-findings loop) parsed (loop-round loop))))
-    (when (loop-findings loop)
-      (post workflow :system (loop-author loop) (checklist-text loop) :findings))))
+      (setf (loop-findings loop) (merge-findings (loop-findings loop) parsed (loop-round loop))))))
 
 ;;; Running
 
@@ -684,6 +701,8 @@ lead, who made it, is told its part again."
              ;; Both are registered before either starts, so the first to
              ;; finish doesn't find every loop done.
              (setf (workflow-loops workflow) (list mine theirs))
+             (publish-checklist workflow mine)
+             (publish-checklist workflow theirs)
              (cond ((not (workflow-worktrees-p workflow))
                     (loop-work workflow mine (lead-go-prompt partner lead-task partner-task edited))
                     (loop-work workflow theirs (partner-task-prompt lead request lead-task partner-task)))
@@ -698,12 +717,13 @@ lead, who made it, is told its part again."
 (defun run-loop (workflow loop prompt)
   "Start LOOP: its author works on PROMPT, and then the reviewing begins."
   (setf (workflow-loops workflow) (append (workflow-loops workflow) (list loop)))
+  (publish-checklist workflow loop)
   (loop-work workflow loop prompt))
 
 (defun loop-work (workflow loop prompt)
   (setf (loop-check-report loop) nil
         (loop-check-failed loop) nil)
-  (setf (loop-state loop) :working)
+  (update-loop-state workflow loop :working)
   (submit workflow (loop-author loop) prompt
           (lambda (text error)
             (cond (error
@@ -717,7 +737,7 @@ lead, who made it, is told its part again."
 (defun loop-checked (workflow loop)
   "The checks are done with: review the work, or, taken over, finish it unreviewed."
   (if (loop-skip-review loop)
-      (progn (setf (loop-state loop) :unreviewed)
+      (progn (update-loop-state workflow loop :unreviewed)
         (note workflow "~@[~a ~]done, not reviewed~:[~;; its check still fails~]."
               (and (loop-label loop) (string-capitalize (loop-label loop) :end 1))
               (loop-check-failed loop))
@@ -749,7 +769,7 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
         (if (or passed (>= fixes *check-fix-attempts*))
             (loop-checked workflow loop)
             (progn
-              (setf (loop-state loop) :working)
+              (update-loop-state workflow loop :working)
               (submit workflow (loop-author loop)
                       (format nil "~a~%~%Fix the failing check. ~a" report (work-reply-instruction loop))
                       (lambda (text error)
@@ -767,8 +787,8 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
     (if (null command)
         (loop-checked workflow loop)
         (let ((token (list nil)))
-          (setf (loop-state loop) :checking
-                (loop-check-handle loop) token)
+          (setf (loop-check-handle loop) token)
+          (update-loop-state workflow loop :checking)
           (post workflow :system (loop-author loop)
                 (format nil "Running check~@[ (~a)~]: `~a`" (loop-label loop) command) :check)
           ;; Install a token before launching: immediate delivery must not
@@ -792,7 +812,7 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
 (defun loop-review (workflow loop &optional confirming)
   "Have LOOP's reviewer review the work; CONFIRMING: it approved with findings
 still open, and is asked once to settle them (that's no new round)."
-  (setf (loop-state loop) :reviewing)
+  (update-loop-state workflow loop :reviewing)
   (submit workflow (loop-reviewer loop) (if confirming (confirm-prompt loop) (review-prompt loop))
           (lambda (text error)
             (if error
@@ -808,7 +828,7 @@ still open, and is asked once to settle them (that's no new round)."
   (let ((open (count-findings (loop-findings loop) :open)))
     (cond ((and (eq (review-verdict text) :approved) (loop-check-failed loop))
            ;; Approval means the check passes too; the user can continue it.
-           (setf (loop-state loop) :unresolved)
+           (update-loop-state workflow loop :unresolved)
            (note workflow "~a approved ~a, but its check still fails, so it isn't approved."
                  (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work"))
            (check-finished workflow))
@@ -819,16 +839,16 @@ still open, and is asked once to settle them (that's no new round)."
           ((and (eq (review-verdict text) :approved) (plusp open))
            ;; Asked once already: not approved, but no more asking either.
            ;; The user can continue it (CONTINUE-WORKFLOW).
-           (setf (loop-state loop) :unresolved)
+           (update-loop-state workflow loop :unresolved)
            (note workflow "~a approved ~a but left ~d finding~:p open, so it isn't approved."
                  (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work") open)
            (check-finished workflow))
           ((eq (review-verdict text) :approved)
-           (setf (loop-state loop) :approved)
+           (update-loop-state workflow loop :approved)
            (note workflow "~a approved ~a." (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work"))
            (check-finished workflow))
           ((>= (loop-round loop) (workflow-max-rounds workflow))
-           (setf (loop-state loop) :unresolved)
+           (update-loop-state workflow loop :unresolved)
            (note workflow "Stopping ~a after ~d review round~:p without approval."
                  (or (loop-label loop) "the review") (loop-round loop))
            (check-finished workflow))
@@ -838,7 +858,7 @@ still open, and is asked once to settle them (that's no new round)."
            (loop-work workflow loop (fix-prompt loop text))))))
 
 (defun loop-failed (workflow loop why)
-  (setf (loop-state loop) :failed)
+  (update-loop-state workflow loop :failed)
   (note workflow "~a" why)
   (check-finished workflow))
 
@@ -897,6 +917,9 @@ still open, and is asked once to settle them (that's no new round)."
     (cancel-workflow-checks workflow)
     (agent-cancel (workflow-lead workflow))
     (agent-cancel (workflow-partner workflow))
+    (dolist (loop (workflow-loops workflow))
+      (unless (loop-done-p loop)
+        (update-loop-state workflow loop :stopped)))
     (note workflow "Stopped.")
     (leave-worktrees workflow)
     (note-retained-worktrees workflow)
@@ -1183,6 +1206,7 @@ Both branches are merged. `git diff ~a` shows any file changes."
                               :label "the merged result" :combined-result t :task task :summary results)))
     (setf (workflow-loops workflow) (append (workflow-loops workflow) (list l))
           (workflow-merged-loop workflow) l)
+    (publish-checklist workflow l)
     (note workflow "~a combines both parts' written results before the merged-result review."
           (agent-name lead))
     (loop-work workflow l
