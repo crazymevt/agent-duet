@@ -286,7 +286,7 @@ and your tools are found as in a terminal, and it starts in the last folder you
 used (your home folder the first time). Its output goes to
 `~/.local/state/agent-duet/agent-duet.log`. It's signed ad hoc, or with
 `CODESIGN_IDENTITY` if that's set. Locally built apps declare the build
-host's macOS version as their minimum, matching the Homebrew runtime and
+host's major macOS version (with minor version 0) as their minimum, matching the Homebrew runtime and
 libraries used to build them.
 
 ## Layout of the code

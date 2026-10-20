@@ -15,9 +15,9 @@ cd "$(dirname "$0")/.."
 
 sbcl=${SBCL:-sbcl}
 identity=${CODESIGN_IDENTITY:--}
-# Homebrew's runtime and libraries target the build host's macOS release.
-# Use that conservative minimum for both the launcher and bundle metadata.
-minimum_macos=$(sw_vers -productVersion | cut -d. -f1,2)
+# Homebrew bottles target the build host's major macOS release.
+# Use its .0 minimum for both the launcher and bundle metadata.
+minimum_macos=$(sw_vers -productVersion | cut -d. -f1).0
 core=build/app/agent-duet.core
 app="build/Agent Duet.app"
 version=$(sed -n 's/.*:version "\([^"]*\)".*/\1/p' agent-duet.asd | head -1)
