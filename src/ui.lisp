@@ -1639,13 +1639,18 @@ SUMMARY and, once it's read, INSPECTION's of the repository now."
         (when (getf summary :request)
           (line '("dim-label") "The request: ~a" (truncated (getf summary :request) 200)))
         (cond (step
-               (line '() "Stopped at ~a: ~a." (getf step :description) (step-reason-text (getf step :reason)))
+               (line '() "Stopped at ~a: ~a." (getf step :description) (format nil "~a~@[ (~a)~]" (step-reason-text (getf step :reason))
+                               (or (getf (find (getf step :id) (getf inspection :steps)
+                                              :key (lambda (s) (getf s :id)) :test #'equal) :waiting-for)
+                                   (getf step :waiting-for))))
                (when (getf step :progress)
                  (line '("dim-label") "What ~a had written by then: ~a" (or (getf step :agent) "it")
                        (truncated (getf step :progress) 300)))
                (let ((others (remove step (getf summary :steps))))
                  (when others
-                   (line '() "Also waiting: ~{~a~^; ~}." (mapcar (lambda (s) (getf s :description)) others)))))
+                   (line '() "Also waiting: ~{~a~^; ~}." (mapcar (lambda (s)
+                                      (format nil "~a~@[: ~a~]" (getf s :description) (getf s :waiting-for)))
+                                    others)))))
               ((getf summary :pending-plan)
                (line '() "Stopped while the plan was waiting for your approval."))
               ((getf integration :state)
@@ -1655,11 +1660,13 @@ SUMMARY and, once it's read, INSPECTION's of the repository now."
           (line '("dim-label") "Committed on their branches: ~{~a~^; ~}." (getf integration :committed)))
         (when (getf integration :merged)
           (line '("dim-label") "Already merged, not to be repeated: ~{~a~^; ~}." (getf integration :merged)))
-        (dolist (l (getf summary :loops))
+        (dolist (l (or (getf inspection :loops) (getf summary :loops)))
           (line (if (getf l :unreviewed) '("warning") '("dim-label"))
                 "~a: ~a~@[, ~d review~:p done~]~:[~;, not reviewed~]"
                 (or (getf l :label) (format nil "~@[~a's ~]work" (getf l :author)))
-                (or (getf l :state) "unknown") (getf l :round) (getf l :unreviewed)))
+                (or (and (not (member (getf l :state) '("approved" "unreviewed" "finished" "done") :test #'equal))
+                         (getf l :waiting-for))
+                    (getf l :state) "unknown") (getf l :round) (getf l :unreviewed)))
         (when (getf summary :unreviewed)
           (line '("warning") "Work no one has reviewed: ~{~a~^, ~}. It stays marked unreviewed."
                 (getf summary :unreviewed)))
@@ -1773,7 +1780,12 @@ or abandoned. Nothing is done until a choice is made."
                   (lambda (result)
                     (case result
                       (:started
-                       (let ((what (case action (:resume "Resumed") (:retry "Redoing the step") (t "Handed off"))))
+                       (let ((what (case action
+                                     (:resume "Resumed")
+                                     (:retry "Redoing the step")
+                                     (:revise-order "Revising the order")
+                                     (:run-independently "Running independently")
+                                     (t "Handed off"))))
                          ;; Other steps still waiting keep the card, to choose for them too.
                          (if (and workflow (workflow-paused workflow))
                              (progn (setf chosen nil inspection nil)
@@ -1885,7 +1897,7 @@ or abandoned. Nothing is done until a choice is made."
                                              (:stop (lambda () (choose :stop)))
                                              (t (lambda () (choose action))))))
                          ;; Carrying on waits until it's known what the folder looks like now.
-                         do (when (and (member action '(:resume :retry :hand-off :restore-worktrees)) (null inspection))
+                         do (when (and (member action '(:resume :retry :hand-off :restore-worktrees :revise-order :run-independently)) (null inspection))
                               (gtk:widget-set-sensitive b nil)
                               (gtk:widget-set-tooltip-text b "Looking at the folder and worktrees first…")))
                    (when anyway
@@ -2307,25 +2319,72 @@ and summary, with Changes and, when the work can be committed, Commit changes."
            (heading (text)
              (make-instance 'gtk:label :label text :xalign 0.0 :css-classes '("caption-heading"))))
       (let ((lead-view (part lead-task))
-            (partner-view (part partner-task)))
-        (labels ((settled (text)
+            (partner-view (part partner-task))
+            (order (gtk:drop-down-new-from-strings
+                    (list "Independently" (format nil "~a's part first" (agent-name lead))
+                          (format nil "~a's part first" (agent-name partner)))))
+            (plan-error (and (fboundp 'pending-plan-error) (ignore-errors (pending-plan-error workflow))))
+            (error-label (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("error")))
+            (start-button nil))
+        (gtk:drop-down-set-selected order
+                                    (or (position (and (fboundp 'pending-plan-order)
+                                                       (ignore-errors (pending-plan-order workflow)))
+                                                  '(:parallel :lead-first :partner-first)) 0))
+        (gtk:label-set-text error-label (or plan-error ""))
+        (gtk:widget-set-visible error-label (not (null plan-error)))
+        (labels ((edited ()
+                   (setf plan-error nil)
+                   (gtk:widget-set-visible error-label nil)
+                   (when start-button (gtk:widget-set-sensitive start-button t)))
+                 (settled (text)
                    (clear-box buttons)
                    (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label")))
                    (gtk:widget-set-sensitive lead-view nil)
                    (gtk:widget-set-sensitive partner-view nil)
+                   (gtk:widget-set-sensitive order nil)
                    (update-controls))
                  (start ()
-                   (cond ((not (workflow-live-p workflow)) (settled "Stopped"))
-                         ((approve-plan workflow (text-view-text lead-view) (text-view-text partner-view))
+                   (let ((previous-error (and (fboundp 'pending-plan-error)
+                                              (ignore-errors (pending-plan-error workflow)))))
+                     (cond ((not (workflow-live-p workflow)) (settled "Stopped"))
+                         ((and (every (lambda (view)
+                                          (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                                                      (text-view-text view)))))
+                                      (list lead-view partner-view)))
+                          (setf plan-error "Give at least one of them a part.")
+                          (gtk:label-set-text error-label plan-error)
+                          (gtk:widget-set-visible error-label t)
+                          (gtk:widget-set-sensitive start-button nil))
+                         ((approve-plan workflow (text-view-text lead-view) (text-view-text partner-view)
+                                        :order (nth (gtk:drop-down-get-selected order)
+                                                    '(:parallel :lead-first :partner-first)))
                           (settled "Started"))
-                         (t (pane-note *middle* "Give at least one of them a part." "error"))))
+                         (t (setf plan-error
+                                  (let ((current-error (and (fboundp 'pending-plan-error)
+                                                            (ignore-errors (pending-plan-error workflow)))))
+                                    (if (and current-error (not (equal current-error previous-error)))
+                                        current-error
+                                        "The plan could not be started. Edit a part or choose another order.")))
+                            (gtk:label-set-text error-label plan-error)
+                            (gtk:widget-set-visible error-label t)
+                            (gtk:widget-set-sensitive start-button nil)))))
                  (button (label classes tooltip action)
                    (let ((b (make-instance 'gtk:button :label label :css-classes classes :tooltip-text tooltip)))
                      (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (funcall action)))
-                     (gtk:box-append buttons b))))
+                     (gtk:box-append buttons b)
+                     b)))
+          (gobject:connect order "notify::selected"
+                           (lambda (d pspec) (declare (ignore d pspec)) (edited)))
+          (dolist (view (list lead-view partner-view))
+            (gobject:connect (gtk:text-view-get-buffer view) :changed
+                             (lambda (buffer) (declare (ignore buffer)) (edited))))
           (button "Stop" '("destructive-action") "Stop the whole task here"
                   (lambda () (stop-workflow workflow) (settled "Stopped")))
-          (button "Start" '("suggested-action") "Start the work on the plan, as it is here" #'start)
+          (setf start-button
+                (button "Start" '("suggested-action") "Start the work on the plan, as it is here" #'start))
+          ;; Every choice in this menu is acyclic, including the preset
+          ;; Independently choice used for a rejected circular plan.
+          (gtk:widget-set-sensitive start-button t)
           (pane-append *middle*
                        (gtk:build
                         (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
@@ -2336,6 +2395,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                  (gtk:frame lead-view)
                                  (heading (format nil "~a's part" (agent-name partner)))
                                  (gtk:frame partner-view)
+                                 order
+                                 error-label
                                  buttons)))
           (attention "The plan is ready" "It's waiting for your approval before the work starts.")
           (update-controls))))))
