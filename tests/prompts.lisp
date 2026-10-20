@@ -141,11 +141,13 @@
 
 (defmacro with-slow-claude ((agent cp out dir) &body body)
   "AGENT, busy with a turn, its CLI CP a process that doesn't read its input
-for a second, then copies it to the file OUT."
+until RECEIVED-LINES releases it, then copies it to the file OUT."
   (let ((process (gensym)))
     `(with-temp-folder (,dir)
        (let* ((,out (merge-pathnames "received" ,dir))
-              (,process (sb-ext:run-program "/bin/sh" (list "-c" (format nil "sleep 1; cat > '~a'" (namestring ,out)))
+              (,process (sb-ext:run-program "/bin/sh" (list "-c" (format nil "while [ ! -f ~a ]; do sleep 0.02; done; cat > ~a"
+                                                                                (ai::shell-quote (concatenate 'string (namestring ,out) ".ready"))
+                                                                                (ai::shell-quote (namestring ,out))))
                                             :wait nil :input :stream :output nil :error nil))
               (,cp (ai::make-claude-process :process ,process))
               (,agent (make-instance 'ai:claude-agent :directory ,dir)))
@@ -157,10 +159,19 @@ for a second, then copies it to the file OUT."
 
 (defun received-lines (agent cp out)
   "What the slow CLI got, once everything sent has been written."
+  (with-open-file (ready (concatenate 'string (namestring out) ".ready")
+                         :direction :output :if-exists :supersede)
+    (write-line "ready" ready))
   (let ((sender (ai::claude-agent-sender agent)))
     (when sender (sb-thread:join-thread sender :default nil)))
-  ;; An interrupt written on its own thread.
-  (sleep 0.2)
+  ;; The interrupt has its own writer thread. Wait for the reader to receive
+  ;; both complete lines before closing the pipe, rather than guessing a delay.
+  (unless (wait-until (lambda ()
+                        (let ((lines (ignore-errors (uiop:read-file-lines out))))
+                          (and (= 2 (length lines))
+                               (plusp (length (second lines)))
+                               (char= #\} (char (second lines) (1- (length (second lines)))))))))
+    (error "The fake Claude CLI did not receive both messages"))
   (close (sb-ext:process-input (ai::cp-process cp)))
   (sb-ext:process-wait (ai::cp-process cp))
   (uiop:read-file-lines out))
@@ -193,7 +204,9 @@ for a second, then copies it to the file OUT."
       ;; Queued behind it.
       (ai::claude-agent-send agent cp "second" (list image))
       (ai::claude-agent-send agent cp "third" '())
-      (sleep 0.1)
+      ;; Wait until the first message owns stdin and is blocked in the
+      ;; gated reader's pipe. Encoding the image can take longer on CI.
+      (true (wait-until (lambda () (sb-thread:mutex-owner (ai::cp-lock cp)))))
       ;; Stop doesn't wait for the pipe.
       (let ((start (get-internal-real-time)))
         (ai:agent-cancel agent)
