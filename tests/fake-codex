@@ -5,7 +5,10 @@ Controlled by files in its working folder:
   hold              initialize waits while this exists
   fail-thread-once  thread/start fails once (the file is removed)
   fail-resume       thread/resume fails
-Every method received is appended to the file `log`, one per line.
+  request-approval  turn/start asks approval for a command before the turn
+                    completes; the decision is written to `approval-decision`
+Every method received is appended to the file `log`, one per line, and
+with its params, as a JSON object, to the file `requests`.
 """
 import json, os, sys, time
 
@@ -22,6 +25,15 @@ for line in sys.stdin:
     if method:
         with open("log", "a") as log:
             log.write(method + "\n")
+        with open("requests", "a") as log:
+            log.write(json.dumps({"method": method, "params": msg.get("params")}) + "\n")
+    elif rid == "approval-1":
+        with open("approval-decision", "w") as out:
+            out.write(msg["result"]["decision"])
+        send({"method": "item/completed",
+              "params": {"item": {"type": "agentMessage", "id": "m1", "text": "hi"}}})
+        send({"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+        continue
     if rid is None:
         continue
     if method == "initialize":
@@ -43,6 +55,10 @@ for line in sys.stdin:
         send({"id": rid, "result": {"turn": {"id": "turn-1"}}})
         send({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
         if os.path.exists("await-steer"):
+            continue
+        if os.path.exists("request-approval"):
+            send({"id": "approval-1", "method": "item/commandExecution/requestApproval",
+                  "params": {"command": "rm -rf build", "threadId": "thread-1", "turnId": "turn-1"}})
             continue
         send({"method": "item/completed",
               "params": {"item": {"type": "agentMessage", "id": "m1", "text": "hi"}}})

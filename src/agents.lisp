@@ -37,7 +37,17 @@
   ":ask — edit files in the directory; ask before running commands.
 :edits — edit files in the directory; Claude runs no commands (but git's
 read-only ones), Codex runs them in its sandbox without asking.
-:full — no restrictions.")
+:full — no restrictions.
+
+AGENT-READ-ONLY-P overrides all three while it is set (see below).")
+
+;;; Read-only (review-only) turns: with AGENT-READ-ONLY-P set, whatever the
+;;; permission, Claude runs without its edit tools and may only run
+;;; read-only commands (READ-ONLY-COMMAND-P); Codex runs in its read-only
+;;; sandbox, never asking to do more. Like the other settings it applies
+;;; from the next turn on: that turn restarts the CLI (resuming the
+;;; conversation) if it was started otherwise. Sending to a running turn
+;;; whose CLI was started otherwise is refused.
 
 (defclass agent ()
   ((id :initarg :id :reader agent-id :documentation ":claude or :codex")
@@ -45,6 +55,8 @@ read-only ones), Codex runs them in its sandbox without asking.
    (partner-name :initarg :partner-name :accessor agent-partner-name)
    (directory :initarg :directory :initform nil :accessor agent-directory)
    (permission :initarg :permission :initform :ask :accessor agent-permission)
+   (read-only :initarg :read-only :initform nil :accessor agent-read-only-p
+              :documentation "True: no changing files, whatever the permission (a review)")
    (model :initarg :model :initform nil :accessor agent-model :documentation "Nil: the CLI's default")
    (effort :initarg :effort :initform nil :accessor agent-effort :documentation "Nil: the model's default")
    (deliver :initarg :deliver :initform #'funcall :accessor agent-deliver)
@@ -394,6 +406,141 @@ Running a command may need the user's approval; if one is denied, carry on witho
   '("Bash(git diff:*)" "Bash(git status:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(ls:*)")
   "Commands Claude may run without asking: enough to review.")
 
+(defparameter *claude-edit-tools* '("Edit" "MultiEdit" "Write" "NotebookEdit")
+  "The tools Claude changes files with, taken away when read-only.")
+
+(defparameter *claude-read-only-tools* '("Read" "Glob" "Grep" "LS")
+  "Claude's tools that only read, allowed anywhere when read-only.")
+
+(defparameter *read-only-commands* '("ls" "pwd" "cat" "head" "tail" "wc" "grep")
+  "Commands that only read, given safe arguments (see READ-ONLY-COMMAND-P).")
+
+(defparameter *read-only-git-commands*
+  '("diff" "status" "log" "show" "merge-base" "rev-parse" "rev-list" "blame" "ls-files"
+    "cat-file" "shortlog" "describe" "name-rev")
+  "Git subcommands that only read (but see READ-ONLY-COMMAND-P for --output).")
+
+(defparameter *read-only-blocked-options*
+  '("--output" "--ext-diff" "--textconv" "--filters" "--show-signature" "--submodule"))
+
+(defun read-only-command-words (command)
+  "A small, deliberately restricted shell grammar. Quotes group literal text;
+expansion, escaping, globbing, redirection and command composition are refused."
+  (when (and (stringp command)
+             (not (find-if (lambda (c)
+                             (or (and (< (char-code c) 32) (not (char= c #\Tab)))
+                                 (find c ";&|<>`$(){}\\*?[]!"))) command)))
+    (let ((words nil) (word nil) (started nil) (quote nil))
+      (labels ((flush-word ()
+                 (when started
+                   (push (coerce (nreverse word) 'string) words)
+                   (setf word nil started nil))))
+        (loop for c across command do
+          (cond (quote (if (char= c quote) (setf quote nil) (push c word)))
+                ((find c "'\"") (setf quote c started t))
+                ((find c '(#\Space #\Tab)) (flush-word))
+                (t (setf started t) (push c word))))
+        (unless quote
+          (flush-word)
+          (nreverse words))))))
+
+(defun read-only-option-p (word)
+  ;; Git accepts abbreviated long options. Check normalized arguments, not
+  ;; raw shell text, including prefixes such as --out and --textc.
+  (let ((option (subseq word 0 (position #\= word))))
+    (not (and (> (length option) 2) (uiop:string-prefix-p "--" option)
+              (some (lambda (blocked) (uiop:string-prefix-p option blocked))
+                    *read-only-blocked-options*)))))
+
+(defun read-only-command-p (command)
+  "Whether COMMAND is admissible to the read-only hook. Git still requires
+its helper-disabling rewrite; never use this predicate to approve raw Bash."
+  (let ((words (read-only-command-words command)))
+    (and words
+         (or (member (first words) *read-only-commands* :test #'string=)
+             (and (equal (first words) "git")
+                  (member (second words) *read-only-git-commands* :test #'string=)
+                  (every #'read-only-option-p (cddr words))))
+         t)))
+
+;;; The hook runs before inherited/session allow rules, unlike permission
+;;; requests. Its source is saved in the Lisp image so the app needs no checkout.
+(defparameter *claude-read-only-hook-program*
+  "import json, os, shlex, shutil, sys
+
+def main():
+    policy = json.loads(sys.argv[1])
+    event = json.load(sys.stdin)
+    name = event.get('tool_name')
+    inp = event.get('tool_input', {})
+    result = {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+              'permissionDecisionReason': 'Review only: this tool or command may write files.'}
+    if name == 'AskUserQuestion':
+        return {}  # Leave interaction to Agent Duet's permission host.
+    if name in policy['tools']:
+        result['permissionDecision'] = 'allow'
+    elif name == 'Bash':
+        command = inp.get('command')
+        forbidden = ';&|<>`$(){}\\\\*?[]!'
+        if not isinstance(command, str) or any(c in forbidden or (ord(c) < 32 and c != '\\t') for c in command):
+            return {'hookSpecificOutput': result}
+        words = shlex.split(command, posix=True)
+        if not words:
+            return {'hookSpecificOutput': result}
+        git = words[0] == 'git' and len(words) > 1 and words[1] in policy['git']
+        if words[0] not in policy['commands'] and not git:
+            return {'hookSpecificOutput': result}
+        if git:
+            for word in words[2:]:
+                option = word.split('=', 1)[0]
+                if len(option) > 2 and option.startswith('--') and any(b.startswith(option) for b in policy['blocked']):
+                    return {'hookSpecificOutput': result}
+        program = shutil.which(words[0])
+        if not program or not os.path.isabs(program):
+            return {'hookSpecificOutput': result}
+        subcommand = words[1] if git else None
+        words[0] = program
+        if git:
+            # Avoid helpers (including fsmonitor and lazy object fetching), pager
+            # programs, and the optional index refresh done by git status.
+            words[1:1] = ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'log.showSignature=false', '-c', 'diff.submodule=short']
+            if subcommand in ('diff', 'log', 'show'):
+                end = next((i for i, w in enumerate(words) if w in ('--', '--end-of-options')), len(words))
+                words[end:end] = ['--no-ext-diff', '--no-textconv']
+            prefix = 'GIT_OPTIONAL_LOCKS=0 GIT_NO_LAZY_FETCH=1 '
+        else:
+            prefix = ''
+        result['permissionDecision'] = 'allow'
+        result['updatedInput'] = dict(inp, command=prefix + shlex.join(words))
+    return {'hookSpecificOutput': result}
+
+try:
+    print(json.dumps(main()))
+except Exception:
+    print('Review-only policy could not validate this tool call.', file=sys.stderr)
+    sys.exit(2)
+")
+
+(defun claude-read-only-settings ()
+  (let* ((python (string-trim '(#\Space #\Newline #\Return)
+                             (uiop:run-program '("/bin/sh" "-c" "command -v python3")
+                                               :output :string :ignore-error-status t)))
+         (policy (json-string (jobj "tools" (coerce *claude-read-only-tools* 'vector)
+                                   "commands" (coerce *read-only-commands* 'vector)
+                                   "git" (coerce *read-only-git-commands* 'vector)
+                                   "blocked" (coerce *read-only-blocked-options* 'vector)))))
+    (unless (and (plusp (length python)) (uiop:absolute-pathname-p python) (probe-file python))
+      (error "Review-only Claude requires python3 to enforce its tool policy."))
+    (json-string
+     (jobj "hooks" (jobj "PreToolUse"
+                         (vector (jobj "matcher" "*" "hooks"
+                                       (vector (jobj "type" "command" "timeout" 10
+                                                     "command"
+                                                     (format nil "~a -I -c ~a ~a || exit 2"
+                                                             (shell-quote python)
+                                                             (shell-quote (format nil "exec(~a)" (json-string *claude-read-only-hook-program*)))
+                                                             (shell-quote policy)))))))))))
+
 (defparameter *claude-efforts* '("low" "medium" "high" "xhigh" "max"))
 
 (defclass claude-agent (agent)
@@ -412,8 +559,38 @@ Running a command may need the user's approval; if one is denied, carry on witho
   (:default-initargs :id :claude :name "Claude" :partner-name "ChatGPT" :model *claude-model*))
 
 (defun claude-agent-wanted-config (agent)
+  "What the process is to be started with: (model effort permission directory
+shared-notes read-only)."
   (list (agent-model agent) (agent-effort agent) (agent-permission agent) (agent-directory agent)
-        *shared-notes*))
+        *shared-notes* (and (agent-read-only-p agent) t)))
+
+(defun claude-config-read-only (config)
+  (sixth config))
+
+(defun claude-agent-arguments (agent &key session-id resume)
+  "The CLI's arguments for AGENT's current settings. Read-only, whatever the
+permission: no edit tools, nothing run without asking but the read-only
+tools, and every permission request answered by CLAUDE-AGENT-EVENT."
+  (let ((permission (agent-permission agent))
+        (read-only (agent-read-only-p agent)))
+    (claude-arguments
+     :session-id session-id :resume resume
+     :model (agent-model agent) :effort (agent-effort agent)
+     :permission-mode (cond (read-only "default")
+                            ((eq permission :full) "bypassPermissions")
+                            (t "acceptEdits"))
+     ;; Always, so AskUserQuestion reaches the user (see CLAUDE-AGENT-EVENT).
+     :permission-tool "stdio"
+     :disallowed-tools (and read-only (append *claude-edit-tools* '("mcp__*" "Agent" "Task" "Skill")))
+     :tools (and read-only (append *claude-read-only-tools* '("Bash" "AskUserQuestion")))
+     :settings (and read-only (claude-read-only-settings))
+     :setting-sources (and read-only "")
+     :strict-mcp-config read-only
+     :mcp-config (and read-only "{\"mcpServers\":{}}")
+     :allowed-tools (cond (read-only *claude-read-only-tools*)
+                          ((eq permission :full) nil)
+                          (t *claude-review-tools*))
+     :system-prompt (collaboration-instructions agent))))
 
 (defun claude-agent-ensure-process (agent)
   "The agent's CLI process, started (or restarted, resuming the conversation)
@@ -429,15 +606,8 @@ when it isn't running with the current settings."
         (let* ((resume (and (claude-agent-started agent) (claude-agent-session-id agent)))
                (session (or (claude-agent-session-id agent)
                             (setf (claude-agent-session-id agent) (make-uuid))))
-               (permission (agent-permission agent))
-               (arguments (claude-arguments
-                           :session-id (unless resume session) :resume resume
-                           :model (agent-model agent) :effort (agent-effort agent)
-                           :permission-mode (if (eq permission :full) "bypassPermissions" "acceptEdits")
-                           ;; Always, so AskUserQuestion reaches the user (see CLAUDE-AGENT-EVENT).
-                           :permission-tool "stdio"
-                           :allowed-tools (unless (eq permission :full) *claude-review-tools*)
-                           :system-prompt (collaboration-instructions agent)))
+               (arguments (claude-agent-arguments agent :session-id (unless resume session)
+                                                        :resume resume))
                (new nil))
           (setf new (start-claude arguments
                                   :directory (agent-directory agent)
@@ -468,6 +638,17 @@ when it isn't running with the current settings."
   (cons :object (append (remove "answers" (cdr input) :key #'car :test #'equal)
                         (list (cons "answers" (cons :object answers))))))
 
+(defparameter *read-only-refusal*
+  "This is a review-only turn: files can't be changed, and only read-only commands run (git diff, log, show, status and the like; ls, cat, head, tail, wc, grep), one at a time, without redirection. Carry on with what you can read."
+  "What Claude is told when a read-only turn refuses it a tool.")
+
+(defun claude-read-only-request-p (name input)
+  "Whether NAME and INPUT are admissible. Bash must additionally pass through
+the PreToolUse hook, which replaces its command with a helper-free invocation."
+  (cond ((member name *claude-read-only-tools* :test #'equal) t)
+        ((equal name "Bash") (read-only-command-p (and (jobject-p input) (jget input "command"))))
+        (t nil)))
+
 (defun claude-agent-event (agent cp event)
   ;; A subagent's events aren't shown, but they are signs of life.
   (when (eq cp (claude-agent-process agent)) (agent-touch agent))
@@ -496,6 +677,14 @@ when it isn't running with the current settings."
                                                                  :input (question-answer-input input (cdr decision)))
                                        (claude-answer-permission cp id nil
                                                                  :message "The user declined to answer."))))))
+          ;; Bash must be validated AND rewritten by our PreToolUse hook.
+          ;; If it reaches the permission host anyway, fail closed. Other
+          ;; tools are allowed only when they read; never ask to grant writes.
+          ((or (claude-config-read-only (claude-agent-config agent)) (agent-read-only-p agent))
+           (if (and (not (equal (event-name event) "Bash"))
+                    (claude-read-only-request-p (event-name event) input))
+               (claude-answer-permission cp id t :input input)
+               (claude-answer-permission cp id nil :message *read-only-refusal*)))
           ;; The CLI asks here only so questions reach the user; outside Ask
           ;; mode, anything else needing approval is refused as before.
           ((not (eq (third (claude-agent-config agent)) :ask))
@@ -615,6 +804,8 @@ unless that turn is over by then."
 (defmethod agent-steer ((agent claude-agent) prompt &optional images)
   ;; Use the current process: changing settings must not restart a busy CLI.
   (let ((cp (claude-agent-process agent)))
+    (when (and (agent-read-only-p agent) (not (claude-config-read-only (claude-agent-config agent))))
+      (error "Claude's running turn may change files; send this once it has finished (review-only)."))
     (unless (claude-alive-p cp) (error "Claude is not ready to receive a message yet."))
     (claude-agent-send agent cp prompt images
                        :on-error (lambda (why)
@@ -665,16 +856,24 @@ unless that turn is over by then."
   (:default-initargs :id :codex :name "ChatGPT" :partner-name "Claude" :model *codex-model*))
 
 (defun codex-agent-sandbox (agent)
-  (if (eq (agent-permission agent) :full) "danger-full-access" "workspace-write"))
+  (cond ((agent-read-only-p agent) "read-only")
+        ((eq (agent-permission agent) :full) "danger-full-access")
+        (t "workspace-write")))
 
 (defun codex-agent-approval-policy (agent)
-  (if (eq (agent-permission agent) :ask) "untrusted" "never"))
+  ;; Read-only never asks: approving would let a command out of the sandbox.
+  (if (and (eq (agent-permission agent) :ask) (not (agent-read-only-p agent))) "untrusted" "never"))
 
-(defun codex-agent-ensure-server (agent)
+(defun codex-agent-read-only-server-p (agent)
+  "Whether the agent's app-server was started in the read-only sandbox."
+  (equal (first (codex-agent-config agent)) "read-only"))
+
+(defun codex-agent-ensure-server (agent &key (sandbox (codex-agent-sandbox agent))
+                                             (policy (codex-agent-approval-policy agent)))
   "The agent's app-server with its thread started, (re)started when it isn't
-running in the current directory and sandbox. Blocks: call it off the GUI thread."
+running in the current directory and SANDBOX. Blocks: call it off the GUI thread."
   (let ((server (codex-agent-server agent))
-        (config (list (codex-agent-sandbox agent) (agent-directory agent) *shared-notes*)))
+        (config (list sandbox (agent-directory agent) *shared-notes*)))
     (when (and (codex-alive-p server) (not (equal config (codex-agent-config agent))))
       (setf (codex-agent-server agent) nil)
       (stop-codex-app-server server)
@@ -690,24 +889,24 @@ running in the current directory and sandbox. Blocks: call it off the GUI thread
         (setf server new
               (codex-agent-server agent) new
               (codex-agent-config agent) config)
-        (codex-agent-open-thread agent server)))
+        (codex-agent-open-thread agent server sandbox policy)))
     server))
 
-(defun codex-agent-open-thread (agent server)
+(defun codex-agent-open-thread (agent server sandbox policy)
   "Start or resume the agent's thread on the new SERVER. If that fails, the
 server is stopped and forgotten, so the next turn starts again from scratch
 rather than using a server with no thread."
   (let ((ready nil))
     (unwind-protect
         (progn
-          (codex-agent-setup-thread agent server)
+          (codex-agent-setup-thread agent server sandbox policy)
           (setf ready t))
       (unless ready
         (when (eq server (codex-agent-server agent))
           (setf (codex-agent-server agent) nil))
         (stop-codex-app-server server)))))
 
-(defun codex-agent-setup-thread (agent server)
+(defun codex-agent-setup-thread (agent server sandbox policy)
   (let ((instructions (collaboration-instructions agent)))
     (when (codex-agent-thread-id agent)
       (codex-initialize-app-server server)
@@ -718,8 +917,8 @@ rather than using a server with no thread."
             (codex-request server "thread/resume"
                            (jobj "threadId" (codex-agent-thread-id agent)
                                  "cwd" (uiop:native-namestring (codex-directory server))
-                                 "sandbox" (codex-agent-sandbox agent)
-                                 "approvalPolicy" (codex-agent-approval-policy agent)
+                                 "sandbox" sandbox
+                                 "approvalPolicy" policy
                                  "developerInstructions" instructions))
             (setf (codex-thread-id server) (codex-agent-thread-id agent)))
         (codex-request-error (e)
@@ -729,8 +928,7 @@ rather than using a server with no thread."
     (unless (codex-agent-thread-id agent)
       (setf (codex-agent-thread-id agent)
             (codex-start-thread server :model (agent-model agent) :instructions instructions
-                                :sandbox (codex-agent-sandbox agent)
-                                :approval-policy (codex-agent-approval-policy agent))))))
+                                :sandbox sandbox :approval-policy policy)))))
 
 (defun codex-agent-event (agent server event)
   (when (eq server (codex-agent-server agent))
@@ -745,11 +943,16 @@ rather than using a server with no thread."
                    :error (codex-event-error event)))
       (:approval
        (let ((id (codex-event-id event)) (params (codex-event-data event)))
-         (agent-ask-approval agent id (codex-event-text event)
-                             (let ((reason (jget params "reason"))) (and (stringp reason) reason))
-                             (lambda (decision)
-                               (when (codex-alive-p server)
-                                 (codex-answer-approval server id decision))))))
+         (if (or (codex-agent-read-only-server-p agent) (agent-read-only-p agent))
+             ;; Not asked for in read-only (policy never); refused if it is.
+             (progn (codex-answer-approval server id :deny)
+                    (agent-emit agent :note :text (format nil "Review-only: refused ~a's request: ~a"
+                                                          (agent-name agent) (codex-event-text event))))
+             (agent-ask-approval agent id (codex-event-text event)
+                                 (let ((reason (jget params "reason"))) (and (stringp reason) reason))
+                                 (lambda (decision)
+                                   (when (codex-alive-p server)
+                                     (codex-answer-approval server id decision)))))))
       (:rate-limits (setf (agent-usage agent) (merge-rate-limits (agent-usage agent) (codex-event-data event)))
        (codex-agent-usage-changed agent))
       ((:stderr :protocol-error) (agent-note-stderr agent (codex-event-text event)))
@@ -789,6 +992,7 @@ rather than using a server with no thread."
   (let ((deliver (agent-deliver agent))
         (model (agent-model agent))
         (effort (agent-effort agent))
+        (sandbox (codex-agent-sandbox agent))
         (policy (codex-agent-approval-policy agent))
         (images (agent-turn-images agent))
         (token (agent-turn-token agent)))
@@ -802,7 +1006,7 @@ rather than using a server with no thread."
       (sb-thread:make-thread
        (lambda ()
          (handler-case
-             (let ((server (codex-agent-ensure-server agent)))
+             (let ((server (codex-agent-ensure-server agent :sandbox sandbox :policy policy)))
                (if (not (car token))
                    (stopped)
                    (let ((turn-id (jget (codex-start-turn server prompt :model model :effort effort
@@ -822,6 +1026,8 @@ rather than using a server with no thread."
          (turn-id (and server (codex-turn-id server)))
          (thread-id (and server (codex-thread-id server)))
          (deliver (agent-deliver agent)))
+    (when (and (agent-read-only-p agent) (not (codex-agent-read-only-server-p agent)))
+      (error "ChatGPT's running turn may change files; send this once it has finished (review-only)."))
     (unless (and (codex-alive-p server) turn-id thread-id)
       (error "Codex is still starting; send again when it begins responding."))
     ;; JSON-RPC waits for acknowledgement, so keep it off the GUI thread.
