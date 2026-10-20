@@ -40,6 +40,18 @@ their paths into the request instead.
 
 Type a request in the middle and press Return. Choose how they work:
 
+- **Review only.** Choose uncommitted changes (including untracked files), a
+  branch, or the last N commits along the first-parent history. Branch review
+  compares from the merge base with the base branch (HEAD by default); **Branch (compare tips)** compares
+  the two tips instead. Choose **Both review**, **Lead reviews**, or **Partner
+  reviews**; the lead selector identifies those agents. The request box is an
+  optional review focus. Reviewers produce the same F1… checklist, independently,
+  without an author turn, checks, or automatic fixes. **Fix these** starts a new
+  *Write & review* task with the open findings and their reviewer names.
+  Reviews enforce read-only execution regardless of the permission setting:
+  Claude has edit tools disabled and commands restricted to read-only operations;
+  Codex uses its read-only sandbox with no write approval path. Previous access
+  is restored when the review finishes or stops.
 - **Write & review.** The lead does the work. The other reviews it, reading the
   files and `git diff`, and ends with `VERDICT: APPROVED` or
   `VERDICT: CHANGES REQUESTED`. The lead addresses the review, and so on, until

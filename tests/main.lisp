@@ -1931,3 +1931,123 @@ tests/fake-claude, its notes pushed onto NOTES."
     (ai::check-in workflow part token "test" 0 1 "Failure" nil)
     (is string= "Complete combined answer after fixing the check" (ai::loop-summary part))
     (true (search "Complete combined answer after fixing the check" (first (fake-prompts reviewer))))))
+
+;;; Review-only mode: no writing turn, even when changes are requested.
+
+(defun review-only-fixture (repo &key (agents :both) (target :uncommitted) branch (base "HEAD") (count 1) reply)
+  (let* ((claude (make-instance 'fake-agent :id :claude :name "Claude" :directory repo))
+         (codex (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory repo))
+         (workflow (make-instance 'ai:workflow :mode :review-only :lead claude :partner codex
+                                  :request "Check regressions" :review-agents agents :review-target target
+                                  :review-branch branch :review-base base :review-count count
+                                  :check-command "must never run")))
+    (dolist (agent (list claude codex))
+      (let ((agent agent))
+        (setf (ai:agent-permission agent) :full
+              (fake-replies agent)
+              (list (lambda (prompt)
+                      (true (ai::agent-read-only-p agent))
+                      (true (search "Review only" prompt))
+                      (if reply (funcall reply agent prompt)
+                          (format nil "FINDINGS:~%- F1 [open] `shared.txt:1` Fix bug~%VERDICT: CHANGES REQUESTED")))))))
+    (values workflow claude codex)))
+
+(define-test review-only-both
+    :parent agent-duet
+  (with-git-folder (repo)
+    (write-file-text repo "untracked.txt" "untracked")
+    (let ((status (ai::worktree-git repo "status" "--porcelain")))
+      (multiple-value-bind (workflow claude codex) (review-only-fixture repo)
+        (ai:start-workflow workflow)
+        (is eq :finished (ai:workflow-state workflow))
+        (is = 2 (length (ai::workflow-loops workflow)))
+        (dolist (agent (list claude codex))
+          (is = 1 (length (fake-prompts agent)))
+          (false (ai::agent-read-only-p agent)))
+        (is string= status (ai::worktree-git repo "status" "--porcelain"))
+        (false (ai::workflow-continuable-p workflow))
+        (true (search "Claude's review" (ai::review-fix-request workflow)))
+        (true (search "ChatGPT's review" (ai::review-fix-request workflow)))
+        (true (every (lambda (l) (= 1 (ai::count-findings (ai::loop-findings l) :open)))
+                     (ai::workflow-loops workflow)))))))
+
+(define-test review-only-selection-and-failure
+    :parent agent-duet
+  (with-git-folder (repo)
+    (dolist (choice '(:lead :partner))
+      (multiple-value-bind (workflow claude codex)
+          (review-only-fixture repo :agents choice :reply (lambda (agent prompt) (declare (ignore agent prompt)) '(:error "failed")))
+        (ai:start-workflow workflow)
+        (is = 1 (length (ai::workflow-loops workflow)))
+        (is = (if (eq choice :lead) 1 0) (length (fake-prompts claude)))
+        (is = (if (eq choice :partner) 1 0) (length (fake-prompts codex)))
+        (false (ai::agent-read-only-p claude))
+        (false (ai::agent-read-only-p codex))
+        (is eq :failed (ai::loop-state (first (ai::workflow-loops workflow))))))))
+
+(define-test review-only-pause-stop-restores-access
+    :parent agent-duet
+  (with-git-folder (repo)
+    (multiple-value-bind (workflow claude codex)
+        (review-only-fixture repo :agents :lead :reply (lambda (a p) (declare (ignore a p)) :out-of-usage))
+      (ai:start-workflow workflow)
+      (true (ai::workflow-paused workflow))
+      (true (ai::agent-read-only-p claude))
+      (ai:stop-workflow workflow)
+      (false (ai::agent-read-only-p claude))
+      (false (ai::agent-read-only-p codex)))))
+
+(define-test review-only-target-ranges
+    :parent agent-duet
+  (with-git-folder (repo)
+    (let ((base (ai::worktree-git-line repo "rev-parse" "HEAD")))
+      (ai::worktree-git repo "branch" "review-topic")
+      (write-file-text repo "main.txt" "main change")
+      (ai::commit-worktree repo "main change")
+      (let ((tip (ai::worktree-git-line repo "rev-parse" "HEAD")))
+        (ai::worktree-git repo "checkout" "review-topic")
+        (write-file-text repo "topic.txt" "topic change")
+        (ai::commit-worktree repo "topic change")
+        (dolist (target '(:branch :branch-tips :commits))
+          (multiple-value-bind (workflow claude codex)
+              (review-only-fixture repo :target target :branch "HEAD" :base tip :agents :lead)
+            (declare (ignore claude codex))
+            (let ((description (ai::review-target-description workflow)))
+              (true (search (if (eq target :branch-tips) tip base) description)))))
+        (multiple-value-bind (workflow claude codex)
+            (review-only-fixture repo :target :branch :branch "--bad-ref")
+          (ai:start-workflow workflow)
+          (true (ai::workflow-completion-error workflow))
+          (false (fake-prompts claude))
+          (false (fake-prompts codex)))))))
+
+(define-test review-only-root-and-approval
+    :parent agent-duet
+  (with-git-folder (repo)
+    (multiple-value-bind (workflow claude codex)
+        (review-only-fixture repo :target :commits :agents :lead
+                             :reply (lambda (a p) (declare (ignore a p)) "FINDINGS: NONE
+VERDICT: APPROVED"))
+      (declare (ignore codex))
+      (setf (ai::agent-read-only-p claude) t)
+      (ai:start-workflow workflow)
+      (is eq :approved (ai::loop-state (first (ai::workflow-loops workflow))))
+      (true (ai::agent-read-only-p claude))
+      (false (ai::review-fix-request workflow)))))
+
+(define-test review-only-independent-delayed-replies
+    :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((claude (make-instance 'hanging-agent :id :claude :name "Claude" :directory repo :replies nil))
+           (codex (make-instance 'hanging-agent :id :codex :name "ChatGPT" :directory repo :replies nil))
+           (workflow (make-instance 'ai:workflow :mode :review-only :lead claude :partner codex :request "Review")))
+      (ai:start-workflow workflow)
+      (ai:agent-turn-finished codex (format nil "FINDINGS:~%- F1 [open] Codex issue~%VERDICT: CHANGES REQUESTED") nil)
+      (is eq :running (ai:workflow-state workflow))
+      (ai:agent-turn-finished claude "FINDINGS: NONE
+VERDICT: APPROVED" nil)
+      (is eq :finished (ai:workflow-state workflow))
+      (is eq :approved (ai::loop-state (first (ai::workflow-loops workflow))))
+      (is eq :unresolved (ai::loop-state (second (ai::workflow-loops workflow))))
+      (false (ai::agent-read-only-p claude))
+      (false (ai::agent-read-only-p codex)))))

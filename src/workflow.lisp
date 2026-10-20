@@ -1,6 +1,8 @@
 ;;;; workflow.lisp — the two agents working on one request together
 ;;;;
-;;;; Three modes:
+;;;; Four modes:
+;;;;
+;;;;   :review-only  One or both agents inspect existing Git changes, read-only.
 ;;;;
 ;;;;   :review   The lead does the work; the partner reviews it; the lead
 ;;;;             addresses the review; and so on until the partner approves
@@ -60,7 +62,14 @@
 (defparameter *default-max-rounds* 3)
 
 (defclass workflow ()
-  ((completion :initform nil :accessor workflow-completion-data)
+  ((review-target :initarg :review-target :initform :uncommitted :reader workflow-review-target)
+   (review-base :initarg :review-base :initform "HEAD" :reader workflow-review-base)
+   (review-branch :initarg :review-branch :initform nil :reader workflow-review-branch)
+   (review-count :initarg :review-count :initform 1 :reader workflow-review-count)
+   (review-agents :initarg :review-agents :initform :both :reader workflow-review-agents)
+   (review-description :initform nil :accessor workflow-review-description)
+   (review-access :initform nil :accessor workflow-review-access)
+   (completion :initform nil :accessor workflow-completion-data)
    (completion-state :initform nil :accessor workflow-completion-state)
    (completion-capture :initform nil :accessor workflow-completion-capture)
    (repository-start :initform nil :accessor workflow-repository-start)
@@ -160,6 +169,7 @@ instead (PAUSE-STEP); another failed turn ends the workflow's part in it."
   "Whether WORKFLOW finished with a loop stopped at its last round, unapproved,
 and the agents are still where it finished."
   (and (eq (workflow-state workflow) :finished)
+       (not (eq (workflow-mode workflow) :review-only))
        (equal (workflow-context workflow) (working-context workflow))
        (some #'continuable-loop-p (workflow-loops workflow))))
 
@@ -598,6 +608,8 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
         (fail workflow "Can't give each part its own worktree: ~a." problem)
         (return-from start-workflow workflow)))
     (ecase (workflow-mode workflow)
+      (:review-only
+       (start-review-only workflow))
       (:review
        (note workflow "~a writes, ~a reviews (up to ~d rounds)." (agent-name lead) (agent-name partner)
              (workflow-max-rounds workflow))
@@ -909,6 +921,7 @@ still open, and is asked once to settle them (that's no new round)."
 
 (defun finish-workflow (workflow)
   (cancel-workflow-checks workflow)
+  (restore-review-access workflow)
   (let ((merged (workflow-merged-loop workflow)))
     (when (and merged (eq (loop-state merged) :approved))
       (cleanup-workflow-worktrees workflow)))
@@ -925,6 +938,7 @@ still open, and is asked once to settle them (that's no new round)."
 
 (defun fail (workflow fmt &rest args)
   (cancel-workflow-checks workflow)
+  (restore-review-access workflow)
   (setf (workflow-completion-error workflow) (apply #'format nil fmt args))
   (apply #'note workflow fmt args)
   (leave-worktrees workflow)
@@ -943,6 +957,7 @@ still open, and is asked once to settle them (that's no new round)."
     (cancel-workflow-checks workflow)
     (agent-cancel (workflow-lead workflow))
     (agent-cancel (workflow-partner workflow))
+    (restore-review-access workflow)
     (dolist (loop (workflow-loops workflow))
       (unless (loop-done-p loop)
         (update-loop-state workflow loop :stopped)))
@@ -1371,3 +1386,96 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
             (list :status :committed :message (format nil "Committed changes (~a)." (subseq hash 0 12))
                   :commit hash))))
     (error (e) (list :status :error :message (format nil "Could not commit changes: ~a" e) :commit nil))))
+
+;;; Review existing work without an author turn or a fix loop.
+
+(defun restore-review-access (workflow)
+  (dolist (entry (workflow-review-access workflow))
+    (setf (agent-read-only-p (car entry)) (cdr entry)))
+  (setf (workflow-review-access workflow) nil))
+
+(defun review-commit (directory ref)
+  ;; Resolve before constructing a range; user text never becomes a Git option.
+  (unless (blank-to-nil ref) (error "Choose a branch or commit."))
+  (worktree-git-line directory "rev-parse" "--verify" "--end-of-options"
+                     (concatenate 'string ref "^{commit}")))
+
+(defun review-target-description (workflow)
+  (let* ((directory (agent-directory (workflow-lead workflow)))
+         (head (review-commit directory "HEAD")))
+    (ecase (workflow-review-target workflow)
+      (:uncommitted
+       (format nil "Review all uncommitted changes against ~a (staged, unstaged, and untracked files). Use git diff ~a -- and git ls-files --others --exclude-standard; read untracked files too. Do not stage anything." head head))
+      ((:branch :branch-tips)
+       (let* ((base (review-commit directory (workflow-review-base workflow)))
+              (branch (review-commit directory (workflow-review-branch workflow)))
+              (start (if (eq (workflow-review-target workflow) :branch)
+                         (worktree-git-line directory "merge-base" base branch) base)))
+         (format nil "Review the changes from ~a to ~a (~a comparison). Use git diff ~a ~a -- and git show to read the target files; the working tree may be on a different branch."
+                 start branch (if (eq (workflow-review-target workflow) :branch) "merge-base" "branch tips") start branch)))
+      (:commits
+       (let ((count (workflow-review-count workflow)))
+         (unless (and (integerp count) (plusp count)) (error "Commit count must be a positive integer."))
+         (let* ((history (uiop:split-string
+                          (worktree-git-line directory "rev-list" "--first-parent"
+                                             (format nil "--max-count=~d" (1+ count)) head)
+                          :separator '(#\Newline)))
+                (base (if (> (length history) count) (nth count history)
+                          (progn
+                            (unless (= (length history) count)
+                              (error "The branch has fewer than ~d commits." count))
+                            (worktree-git-line directory "hash-object" "-t" "tree" "/dev/null")))))
+           (format nil "Review the last ~d first-parent commits, the changes from ~a to ~a. Use git diff ~a ~a -- and git log --first-parent -n ~d ~a."
+                   count base head base head count head)))))))
+
+(defun start-review-only (workflow)
+  (handler-case
+      (let* ((target (review-target-description workflow))
+             (agents (ecase (workflow-review-agents workflow)
+                       (:lead (list (workflow-lead workflow)))
+                       (:partner (list (workflow-partner workflow)))
+                       (:both (list (workflow-lead workflow) (workflow-partner workflow)))))
+             (loops (mapcar (lambda (agent)
+                              (make-review-loop :author (other-agent workflow agent) :reviewer agent
+                                                :task (workflow-request workflow) :state :reviewing
+                                                :label (format nil "~a's review" (agent-name agent)))) agents)))
+        (setf (workflow-loops workflow) loops
+              (workflow-review-description workflow) target)
+        ;; Register all loops and lock all reviewers before submitting: fake agents
+        ;; and cached failures may call back synchronously.
+        (dolist (agent agents)
+          (push (cons agent (agent-read-only-p agent)) (workflow-review-access workflow))
+          (setf (agent-read-only-p agent) t))
+        (dolist (loop loops)
+          (let ((loop loop))
+            (publish-checklist workflow loop)
+            (submit workflow (loop-reviewer loop)
+                    (format nil "Review only. Do not modify files or run commands that write. ~a~%~%Review focus: ~a~%~%Report bugs and missed requirements with locations. List findings in this form:~%FINDINGS:~%- F1 [open] `path:line` Problem and suggested fix~%Write FINDINGS: NONE if there are none. End with VERDICT: APPROVED or VERDICT: CHANGES REQUESTED."
+                            target (workflow-request workflow))
+                    (lambda (text error)
+                      (if error
+                          (loop-failed workflow loop (format nil "Review failed: ~a" text))
+                          (progn
+                            (incf (loop-round loop))
+                            (setf (loop-last-review loop) text
+                                  (loop-summary loop) text)
+                            (post workflow (loop-reviewer loop) :user text :review)
+                            (take-findings workflow loop text)
+                            (update-loop-state workflow loop
+                                               (if (and (eq (review-verdict text) :approved)
+                                                        (zerop (count-findings (loop-findings loop) :open)))
+                                                   :approved :unresolved))
+                            (check-finished workflow))))
+                    :role :review :loop loop))))
+    (error (e) (fail workflow "Can't start review: ~a" e))))
+
+(defun review-fix-request (workflow)
+  "A standalone writing task, retaining reviewer identity and local finding IDs."
+  (when (eq (workflow-mode workflow) :review-only)
+    (let ((sections
+            (loop for loop in (workflow-loops workflow)
+                  for open = (remove-if-not (lambda (f) (eq (finding-status f) :open)) (loop-findings loop))
+                  when open collect (format nil "~a:~%~a" (loop-label loop) (findings-lines open)))))
+      (when sections
+        (format nil "Fix these review findings. Inspect the current repository and address the findings you agree with; explain any you dismiss. The reviewed target was:~%~a~%~%Original focus: ~a~%~%~{~a~^~%~%~}"
+                (workflow-review-description workflow) (workflow-request workflow) sections)))))

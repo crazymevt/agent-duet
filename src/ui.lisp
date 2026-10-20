@@ -1171,6 +1171,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
   (case (gtk:drop-down-get-selected (control :mode))
     (1 :divide)
     (2 :compare)
+    (3 :review-only)
     (t :review)))
 
 (defun workflow-running-p ()
@@ -1181,11 +1182,19 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (let ((running (workflow-running-p)))
       (gtk:button-set-label (control :send) (if running "Stop" "Start"))
       (gtk:widget-set-css-classes (control :send) (if running '("destructive-action") '("suggested-action")))
-      (dolist (name '(:mode :lead :rounds :check :folder :permission))
+      (dolist (name '(:mode :lead :rounds :check :folder :permission :review-target :review-base :review-branch :review-count :review-agents))
         (gtk:widget-set-sensitive (control name) (not running)))
       ;; Only the modes that make a plan wait for one.
       (dolist (name '(:approve-plan :worktrees))
-        (gtk:widget-set-sensitive (control name) (and (not running) (not (eq (selected-mode) :review)))))
+        (gtk:widget-set-sensitive (control name) (and (not running) (member (selected-mode) '(:divide :compare)))))
+      (gtk:widget-set-visible (control :review-options) (eq (selected-mode) :review-only))
+      (let ((branch (member (gtk:drop-down-get-selected (control :review-target)) '(1 2))))
+        (dolist (name '(:review-base :review-branch))
+          (gtk:widget-set-sensitive (control name) (and (not running) branch)))
+        (gtk:widget-set-sensitive (control :review-count)
+                                  (and (not running) (= 3 (gtk:drop-down-get-selected (control :review-target))))))
+      (dolist (name '(:rounds :check))
+        (gtk:widget-set-sensitive (control name) (and (not running) (not (eq (selected-mode) :review-only)))))
       (gtk:label-set-text (pane-status *middle*)
                           (cond ((not running) "")
                                 ((workflow-pending-plan *workflow*) "Waiting for you to approve the plan")
@@ -1783,6 +1792,23 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                            '("It stopped before any work was done")))))
   (when (eq (workflow-state workflow) :finished)
     (show-summary-card workflow))
+  (when (and (eq (workflow-state workflow) :finished)
+             (eq (workflow-mode workflow) :review-only)
+             (some (lambda (l) (plusp (count-findings (loop-findings l) :open))) (workflow-loops workflow)))
+    (let ((button (make-instance 'gtk:button :label "Fix these" :halign :start :css-classes '("suggested-action"))))
+      (gobject:connect button :clicked
+                       (lambda (b)
+                         (when (and (eq workflow *workflow*) (not (workflow-running-p))
+                                    (not (agent-busy *claude*)) (not (agent-busy *codex*)))
+                           (handler-case
+                               (let ((request (review-fix-request workflow)))
+                                 (when request
+                                   (gtk:drop-down-set-selected (control :mode) 0)
+                                   (gtk:text-buffer-set-text (gtk:text-view-get-buffer (control :input)) request -1)
+                                   (gtk:widget-set-sensitive b nil)
+                                   (start-request)))
+                             (error (e) (pane-note *middle* (princ-to-string e) "error"))))))
+      (pane-append *middle* button)))
   (when (workflow-continuable-p workflow)
     (show-continue-card workflow))
   (update-controls))
@@ -1872,7 +1898,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
       (stop-workflow *workflow*)
       (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input))))
             (problem nil))
-        (when (plusp (length text))
+        (when (or (plusp (length text)) (eq (selected-mode) :review-only))
           (cond
             ((committing-p *middle*))
             ((or (agent-busy *claude*) (agent-busy *codex*))
@@ -1885,11 +1911,17 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                (clear-text-view (control :input))
                (setf *workflow* (make-instance 'workflow
                                                :mode (selected-mode) :lead lead :partner partner
-                                               :request text
+                                               :request (if (plusp (length text)) text "Review for bugs, regressions, and missed requirements.")
+                                               :review-target (nth (gtk:drop-down-get-selected (control :review-target))
+                                                                   '(:uncommitted :branch :branch-tips :commits))
+                                               :review-base (gtk:editable-get-text (control :review-base))
+                                               :review-branch (gtk:editable-get-text (control :review-branch))
+                                               :review-count (gtk:spin-button-get-value-as-int (control :review-count))
+                                               :review-agents (nth (gtk:drop-down-get-selected (control :review-agents)) '(:both :lead :partner))
                                                :max-rounds (gtk:spin-button-get-value-as-int (control :rounds))
                                                :on-message #'middle-message
                                                :on-pause #'show-paused-step
-                                               :approve-plan (and (not (eq (selected-mode) :review))
+                                               :approve-plan (and (member (selected-mode) '(:divide :compare))
                                                                   (gtk:check-button-get-active (control :approve-plan)))
                                                :on-plan #'show-plan-card
                                                :worktrees (worktrees-wanted-p)
@@ -1900,23 +1932,34 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                (update-controls))))))))
 
 (defun worktrees-wanted-p ()
-  (and (not (eq (selected-mode) :review)) (gtk:check-button-get-active (control :worktrees))))
+  (and (member (selected-mode) '(:divide :compare)) (gtk:check-button-get-active (control :worktrees))))
 
 (defun make-middle-pane ()
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 1.0 :hexpand t :ellipsize :end :css-classes '("dim-label")))
            (input (make-input))
            (send (make-instance 'gtk:button :label "Start" :valign :end :css-classes '("suggested-action")))
-           (mode (gtk:drop-down-new-from-strings '("Write & review" "Split the work" "Compare proposals")))
+           (mode (gtk:drop-down-new-from-strings '("Write & review" "Split the work" "Compare proposals" "Review only")))
+           (review-target (gtk:drop-down-new-from-strings '("Uncommitted changes" "Branch (merge base)" "Branch (compare tips)" "Last N commits")))
+           (review-base (make-instance 'gtk:entry :text "HEAD" :placeholder-text "Base branch" :width-chars 10))
+           (review-branch (make-instance 'gtk:entry :placeholder-text "Branch to review" :width-chars 12))
+           (review-count (gtk:spin-button-new-with-range 1d0 1000d0 1d0))
+           (review-agents (gtk:drop-down-new-from-strings '("Both review" "Lead reviews" "Partner reviews")))
+           (review-options nil)
            (approve-plan (make-instance 'gtk:check-button :label "Approve plan" :active (setting :approve-plan nil)))
            (worktrees (make-instance 'gtk:check-button :label "Own worktrees" :active (setting :worktrees nil)))
            (lead (gtk:drop-down-new-from-strings '("Claude leads" "ChatGPT leads")))
            (rounds (gtk:spin-button-new-with-range 1d0 10d0 1d0))
            (check (make-instance 'gtk:entry :placeholder-text "Check command" :width-chars 14 :hexpand t)))
+      (setf review-options (wrapping-controls review-target review-base review-branch review-count review-agents))
+      (gtk:widget-set-visible review-options nil)
+      (gtk:widget-set-tooltip-text review-base "Base for branch review (HEAD by default)")
+      (gtk:widget-set-tooltip-text review-count "Number of commits for Last N commits")
       (setf *middle* (make-pane :messages messages :scroller scroller :status status :input input :send send))
       (gtk:spin-button-set-value rounds (coerce *default-max-rounds* 'double-float))
-      (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part. Compare proposals: both propose an approach on their own, the lead reconciles them into a plan, and then the work is split.")
+      (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part. Compare proposals: both propose an approach on their own, the lead reconciles them into a plan, and then the work is split. Review only: selected agents inspect existing changes with enforced read-only access; Fix these starts a writing task.")
       (gtk:widget-set-tooltip-text approve-plan "Wait for you to look over (and edit) the plan before any work starts")
+      (gobject:connect review-target "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
       (gobject:connect mode "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
       (gobject:connect approve-plan :toggled
                        (lambda (b) (setf (setting :approve-plan) (gtk:check-button-get-active b))))
@@ -1932,7 +1975,9 @@ and summary, with Changes and, when the work can be committed, Commit changes."
       (gtk:widget-set-tooltip-text input "Drop files here to put their paths in the request")
       (on-file-drop input (lambda (paths) (insert-paths input paths)))
       (setf *controls* (list* :input input :send send :mode mode :lead lead :rounds rounds :check check
-                              :approve-plan approve-plan :worktrees worktrees *controls*))
+                              :approve-plan approve-plan :worktrees worktrees
+                              :review-options review-options :review-target review-target :review-base review-base
+                              :review-branch review-branch :review-count review-count :review-agents review-agents *controls*))
       (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (start-request)))
       (on-return input (lambda () (unless (workflow-running-p) (start-request))))
       (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; each side shows that agent's own work in full.~%~%Return starts; Shift+Return starts a new line."))
@@ -1954,6 +1999,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                  (gtk:build
                   (gtk:box :spacing 6
                            (gtk:label :label "Check" :css-classes '("dim-label")) check)))
+                review-options
                 (composer input send))))))
 
 ;;; The folder, what the agents may do, and the look
