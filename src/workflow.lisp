@@ -21,9 +21,10 @@
 ;;;; worktree (worktree.lisp), each agent in a new conversation there, so
 ;;;; the parts can't get in each other's way. Once both are done, each is
 ;;;; committed on its branch and the branches are merged into the folder's
-;;;; current branch; the lead resolves any conflicts; then the partner
-;;;; reviews the merged result, as another review loop. A part that failed
-;;;; stops it before anything is merged. It needs a git
+;;;; current branch; the lead resolves any conflicts and reconciles both written
+;;;; replies; then the partner reviews the merged result,
+;;;; as another review loop. Worktrees and recovery refs stay until approval.
+;;;; A failed part stops it before anything is merged. It needs a git
 ;;;; repository with nothing uncommitted: the worktrees start from HEAD.
 ;;;;
 ;;;; Each review lists its findings in a FINDINGS section; the loop keeps
@@ -78,6 +79,11 @@
    (home :initform nil :accessor workflow-home :documentation "The folder, while the agents are in worktrees")
    (base :initform nil :accessor workflow-base :documentation "The commit the worktrees started from")
    (trees :initform '() :accessor workflow-trees :documentation "(agent . worktree directory)s")
+   (tree-branches :initform nil :accessor workflow-tree-branches)
+   (merged-loop :initform nil :accessor workflow-merged-loop)
+   (worktrees-cleaned :initform nil :accessor workflow-worktrees-cleaned)
+   (recovery-recorded :initform nil :accessor workflow-recovery-recorded)
+   (retention-id :initform (make-uuid) :reader workflow-retention-id)
    (integrated :initform nil :accessor workflow-integrated :documentation "True once merging has begun")
    (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
    (loops :initform '() :accessor workflow-loops)
@@ -92,6 +98,8 @@
   (summary "")                          ; the author's latest report
   (last-review nil)                     ; the reviewer's latest review
   (findings '())                        ; the review checklist: FINDINGs, by id
+  (combined-result nil)                ; replies must remain full combined answers
+  (file-changes nil)                    ; whether this part changed files against its base
   (tree nil)                            ; the worktree it's done in, or nil for the folder
   (check-handle nil)                    ; active asynchronous check
   (check-report nil)                    ; most recent result for the reviewer
@@ -293,13 +301,19 @@ Read the files there; here is everything it changed, against where it started~:[
             (agent-name (loop-author loop)) (namestring tree)
             (> (length diff) *review-diff-limit*) (subseq diff 0 (min (length diff) *review-diff-limit*)))))
 
+(defun work-reply-instruction (loop)
+  (if (loop-combined-result loop)
+      "Then provide the full revised combined answer to the overall request, preserving useful results from both parts; a summary of edits alone is not sufficient."
+      "Then summarize what you changed."))
+
 (defun fix-prompt (loop review)
   (let ((open (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq)))
     (format nil "~a reviewed your work~:[ and requested changes~;~]:~%~%~a~%~%~
 ~@[These findings are still open:~%~%~a~%~%~]~
-Address the points you agree with, and say briefly why for any you don't. Then summarize what you changed."
+Address the points you agree with, and say briefly why for any you don't. ~a"
             (agent-name (loop-reviewer loop)) (eq (review-verdict review) :approved) review
-            (and open (findings-lines open)))))
+            (and open (findings-lines open))
+            (work-reply-instruction loop))))
 
 (defun plan-form (partner)
   "How the lead is to set out a plan split with PARTNER."
@@ -737,7 +751,7 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
             (progn
               (setf (loop-state loop) :working)
               (submit workflow (loop-author loop)
-                      (format nil "~a~%~%Fix the failing check, then summarize what you changed." report)
+                      (format nil "~a~%~%Fix the failing check. ~a" report (work-reply-instruction loop))
                       (lambda (text error)
                         (if error
                             (loop-failed workflow loop (format nil "Check fix failed: ~a" text))
@@ -852,12 +866,16 @@ still open, and is asked once to settle them (that's no new round)."
 
 (defun finish-workflow (workflow)
   (cancel-workflow-checks workflow)
+  (let ((merged (workflow-merged-loop workflow)))
+    (when (and merged (eq (loop-state merged) :approved))
+      (cleanup-workflow-worktrees workflow)))
   (setf (workflow-state workflow) :finished
         (workflow-context workflow) (working-context workflow))
   (note workflow "Done: ~{~a~^; ~}."
         (loop for l in (workflow-loops workflow)
               collect (format nil "~@[~a ~]~a~[~:;, ~:*~d finding~:p open~]" (loop-label l)
                               (loop-outcome l) (count-findings (loop-findings l) :open))))
+  (note-retained-worktrees workflow)
   (when (workflow-on-finish workflow)
     (funcall (workflow-on-finish workflow) workflow)))
 
@@ -866,6 +884,7 @@ still open, and is asked once to settle them (that's no new round)."
   (apply #'note workflow fmt args)
   (leave-worktrees workflow)
   (setf (workflow-state workflow) :finished)
+  (note-retained-worktrees workflow)
   (when (workflow-on-finish workflow)
     (funcall (workflow-on-finish workflow) workflow)))
 
@@ -880,6 +899,7 @@ still open, and is asked once to settle them (that's no new round)."
     (agent-cancel (workflow-partner workflow))
     (note workflow "Stopped.")
     (leave-worktrees workflow)
+    (note-retained-worktrees workflow)
     (when (workflow-on-finish workflow)
       (funcall (workflow-on-finish workflow) workflow))))
 
@@ -1010,6 +1030,7 @@ made; otherwise the workflow fails."
           (dolist (agent (list (workflow-lead workflow) (workflow-partner workflow)))
             (let ((tree (create-worktree home (format nil "~(~a~)-~a" (agent-id agent) (subseq (make-uuid) 0 8)))))
               (push (cons agent tree) (workflow-trees workflow))
+              (push (cons tree (worktree-branch tree)) (workflow-tree-branches workflow))
               (move-agent agent tree)
               (note workflow "~a works in its own worktree, ~a (branch ~a), in a new conversation."
                     (agent-name agent) (namestring tree) (worktree-branch tree))))
@@ -1040,9 +1061,13 @@ to the folder, and merge the branches into it."
         (progn
           (dolist (l (workflow-loops workflow))
             (when (loop-tree l)
+              (setf (loop-file-changes l) (plusp (length (worktree-diff (loop-tree l)))))
               (commit-worktree (loop-tree l) (format nil "~a~%~%~a" (string-capitalize (loop-label l) :end 1)
-                                                     (loop-task l)))))
-          (note workflow "Both parts are committed on their branches; merging them into the folder.")
+                                                     (loop-task l)))
+              (retain-worktree home (loop-tree l) (workflow-retention-id workflow))
+              (setf (workflow-recovery-recorded workflow) t)))
+          (note workflow "Both parts are committed on their branches; recovery refs are kept for task ~a. Merging them into the folder."
+                (workflow-retention-id workflow))
           (merge-parts workflow trees))
       (error (e) (integration-failed workflow (princ-to-string e) trees)))))
 
@@ -1086,22 +1111,86 @@ conflicts; then the merged result is reviewed."
                        :role :resolve))
               (t (integration-failed workflow files trees))))))))
 
-(defun merged (workflow)
-  "Both branches are in: the worktrees go, and the partner reviews the merged result."
-  (let ((home (workflow-home workflow))
-        (base (workflow-base workflow))
-        (lead (workflow-lead workflow)))
+(defun split-results-text (workflow)
+  "Keep both parts' written results, including parts that changed no files."
+  (format nil "~{~a~^~%~%~}"
+          (loop for part in (workflow-loops workflow)
+                when (loop-tree part)
+                  collect (format nil "~a (~a):~%Task: ~a~%Final reply:~%~a"
+                                  (loop-label part)
+                                  (if (loop-file-changes part) "file changes" "no file changes")
+                                  (loop-task part)
+                                  (let ((reply (loop-summary part)))
+                                    (if (> (length reply) *review-diff-limit*)
+                                        (format nil "~a~%[Final reply cut short; full reply retained in the part's conversation.]"
+                                                (subseq reply 0 *review-diff-limit*))
+                                        reply))))))
+
+(defun note-retained-worktrees (workflow)
+  "Make recovery locations visible when integration ends without cleanup."
+  (when (and (workflow-recovery-recorded workflow) (workflow-trees workflow)
+             (not (workflow-worktrees-cleaned workflow)))
+    (note workflow "Split-task worktrees and branches are kept: ~{~a~^, ~}. Recovery task ID: ~a; recorded recovery refs remain under refs/agent-duet/tasks/~a/."
+          (loop for entry in (reverse (workflow-trees workflow))
+                for tree = (cdr entry)
+                collect (format nil "~a (branch ~a)" (namestring tree)
+                                (or (cdr (assoc tree (workflow-tree-branches workflow) :test #'equal))
+                                    "unknown")))
+          (workflow-retention-id workflow) (workflow-retention-id workflow))))
+
+(defun cleanup-workflow-worktrees (workflow)
+  "Release split work only after the merged result has been approved.
+Worktrees intentionally stay through review for inspection; recovery refs also
+protect committed results if a worktree or branch is removed outside the workflow."
+  (let ((cleaned t)
+        (home (workflow-home workflow)))
     (dolist (entry (workflow-trees workflow))
-      (handler-case (remove-worktree home (cdr entry) :delete-branch t)
-        (error (e) (note workflow "Couldn't remove the worktree ~a: ~a" (namestring (cdr entry)) e))))
-    (let ((l (make-review-loop :author lead :reviewer (workflow-partner workflow) :label "the merged result"
-                               :task (format nil "Merge the two parts of this task, each done in its own git ~
-worktree, into this folder. The overall request:~%~%~a" (workflow-request workflow))
-                               :summary (format nil "Both parts are merged. The changes are the commits since ~a: ~
-`git diff ~a` shows all of them." (subseq base 0 (min 12 (length base))) base))))
-      (setf (workflow-loops workflow) (append (workflow-loops workflow) (list l)))
-      (note workflow "~a reviews the merged result." (agent-name (workflow-partner workflow)))
-      (loop-check workflow l))))
+      (let* ((tree (cdr entry))
+             (branch (cdr (assoc tree (workflow-tree-branches workflow) :test #'equal))))
+        (handler-case
+            (if (probe-file tree)
+                (remove-worktree home tree :delete-branch t)
+                (progn
+                  ;; Git can remove a registered worktree whose folder is missing.
+                  ;; It may already have been unregistered. Branch deletion below
+                  ;; still fails safely if Git retains a locked registration.
+                  (ignore-errors (worktree-git home "worktree" "remove" (string-right-trim "/" (namestring tree))))
+                  (when (and branch (plusp (length (worktree-git home "branch" "--list" branch))))
+                    (worktree-git home "branch" "-D" branch))))
+          (error (e)
+            (setf cleaned nil)
+            (note workflow "Couldn't remove the worktree ~a: ~a" (namestring tree) e)))))
+    (when cleaned
+      (handler-case
+          (progn
+            (delete-worktree-recovery-refs home (workflow-retention-id workflow))
+            (setf (workflow-worktrees-cleaned workflow) t))
+        (error (e) (note workflow "Couldn't remove recovery refs for task ~a: ~a"
+                         (workflow-retention-id workflow) e))))))
+
+(defun merged (workflow)
+  "Reconcile the written results as well as the merged files, then review both."
+  (let* ((base (workflow-base workflow))
+         (lead (workflow-lead workflow))
+         (results (split-results-text workflow))
+         (task (format nil "Combine the two parts of this task, each done in its own git worktree. ~
+The overall request:~%~%~a~%~%Both parts' final replies follow. Review their written results as well as any files, ~
+including parts with no file changes. A text-only task is complete with a combined answer; ~
+a nonempty Git diff is not required.~%~%~a~%~%~
+Both branches are merged. `git diff ~a` shows any file changes."
+                       (workflow-request workflow) results base))
+         (l (make-review-loop :author lead :reviewer (workflow-partner workflow)
+                              :label "the merged result" :combined-result t :task task :summary results)))
+    (setf (workflow-loops workflow) (append (workflow-loops workflow) (list l))
+          (workflow-merged-loop workflow) l)
+    (note workflow "~a combines both parts' written results before the merged-result review."
+          (agent-name lead))
+    (loop-work workflow l
+               (format nil "~a~%~%Produce one combined answer to the overall request, preserving the useful ~
+results from both parts and resolving any disagreement or overlap. For text-only work, write the ~
+answer in your final reply; do not create files just to produce a diff. Summarize any merged file ~
+changes where relevant. The partner will review this combined answer and the merged files."
+                       task))))
 
 (defun integration-failed (workflow why trees)
   "Merging stopped at TREES (the first not merged): say so, and end. The

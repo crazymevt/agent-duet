@@ -1575,7 +1575,7 @@ to now while it runs (or is still stopping)."
       (gobject:connect mode "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
       (gobject:connect approve-plan :toggled
                        (lambda (b) (setf (setting :approve-plan) (gtk:check-button-get-active b))))
-      (gtk:widget-set-tooltip-text worktrees "Each agent does its part in its own git worktree, in a new conversation; then the parts are committed, merged into the current branch, and the merged result reviewed. Needs a git repository with nothing uncommitted.")
+      (gtk:widget-set-tooltip-text worktrees "Each agent does its part in its own git worktree, in a new conversation; then the parts are committed and merged into the current branch. Both final replies are combined and reviewed with any file changes. Worktrees and recovery refs are kept until approval. Needs a git repository with nothing uncommitted.")
       (gobject:connect worktrees :toggled
                        (lambda (b) (setf (setting :worktrees) (gtk:check-button-get-active b))))
       (gtk:widget-set-tooltip-text lead "Who does the work (or splits it)")

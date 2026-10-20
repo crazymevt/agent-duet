@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Split worktree tasks combine both parts' written replies, including parts
+  with no file changes, before reviewing the merged result. Worktrees and
+  task-scoped recovery refs are kept until approval; unfinished tasks report
+  their recovery locations.
+
 ## 1.0.0 - 2026-10-20
 
 - Automated builds for macOS (Apple Silicon and Intel) and Linux x86_64;
