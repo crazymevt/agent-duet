@@ -18,6 +18,7 @@
                (:file "history")
                (:file "notify")
                (:file "worktree")
+               (:file "snapshot")
                (:file "agents")
                (:file "check")
                (:file "workflow")))
@@ -33,6 +34,7 @@
   :components ((:file "ui")
                (:file "terminal")
                (:file "preview")
+               (:file "changes")
                (:file "app"))
   :entry-point "agent-duet:main"
   :in-order-to ((test-op (test-op "agent-duet/tests"))))
@@ -49,5 +51,6 @@
                              (:file "history")
                              (:file "notify")
                              (:file "prompts")
-                             (:file "worktree"))))
+                             (:file "worktree")
+                             (:file "snapshot"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))
