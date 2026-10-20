@@ -62,6 +62,7 @@
 (defclass workflow ()
   ((completion :initform nil :accessor workflow-completion-data)
    (completion-state :initform nil :accessor workflow-completion-state)
+   (completion-capture :initform nil :accessor workflow-completion-capture)
    (repository-start :initform nil :accessor workflow-repository-start)
    (completion-error :initform nil :accessor workflow-completion-error)
    (commit-hash :initform nil :accessor workflow-commit-hash)
@@ -586,7 +587,7 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
         (workflow-completion-error workflow) nil
         (workflow-commit-hash workflow) nil
         (workflow-repository-start workflow)
-        (ignore-errors (repository-state (agent-directory (workflow-lead workflow)))))
+        (ignore-errors (repository-start-state (agent-directory (workflow-lead workflow)))))
   (let ((lead (workflow-lead workflow))
         (partner (workflow-partner workflow))
         (request (workflow-request workflow)))
@@ -1262,11 +1263,16 @@ the worktrees are kept: ~{~a~^, ~}."
                         ((every (lambda (l) (eq (loop-state l) :approved)) final) :approved)
                         ((some (lambda (l) (eq (loop-state l) :unresolved)) final) :unresolved)
                         (t :unreviewed))))
-    (setf (workflow-completion-state workflow)
-          (ignore-errors (repository-state
-                          (or (workflow-home workflow)
-                              (agent-directory (workflow-lead workflow)))))
-          (workflow-completion-data workflow)
+    ;; Capture immediately, but never run diffs or hash file contents on the
+    ;; caller's GTK thread. Readers join this worker off the UI thread.
+    (let ((directory (or (workflow-home workflow)
+                         (agent-directory (workflow-lead workflow)))))
+      (setf (workflow-completion-state workflow) nil
+            (workflow-completion-capture workflow)
+            (sb-thread:make-thread
+             (lambda () (ignore-errors (repository-state directory)))
+             :name "completion repository capture")))
+    (setf (workflow-completion-data workflow)
           (list :outcome outcome :review-status outcome
                 :summary (or (workflow-completion-error workflow)
                              (let ((summaries (remove-if
@@ -1279,8 +1285,19 @@ the worktrees are kept: ~{~a~^, ~}."
                                     ((some #'loop-check-report loops) :passed)
                                     (t :not-run))))))
 
+(defun await-completion-capture (workflow)
+  "Resolve the completion snapshot. Call from a worker, never the GTK thread."
+  (let ((capture (workflow-completion-capture workflow)))
+    (when capture
+      (let ((state (sb-thread:join-thread capture)))
+        ;; A continued task may already have scheduled a newer capture.
+        (when (eq capture (workflow-completion-capture workflow))
+          (setf (workflow-completion-state workflow) state
+                (workflow-completion-capture workflow) nil))))))
+
 (defun workflow-commit-reason (workflow)
   "NIL when eligible; otherwise a user-facing reason. Always rechecks Git."
+  (await-completion-capture workflow)
   (let* ((start (workflow-repository-start workflow))
          (end (workflow-completion-state workflow))
          (root (getf end :root)))

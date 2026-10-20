@@ -186,6 +186,14 @@ Each ref is deleted only if unchanged since read. Return the number deleted."
           (loop for file in regular for hash in hashes do (setf (third file) hash)))))
     files))
 
+(defun repository-start-state (directory)
+  "Only the root and initial dirtiness are needed for commit eligibility."
+  (let ((root (uiop:ensure-directory-pathname
+               (uiop:parse-native-namestring
+                (worktree-git-line directory "rev-parse" "--show-toplevel")))))
+    (list :root root
+          :status (worktree-git root "status" "--porcelain=v1" "-z" "--untracked-files=all"))))
+
 (defun repository-state (directory)
   "Capture HEAD, branch, index, tracked edits and untracked contents without staging."
   (let ((root (uiop:ensure-directory-pathname
