@@ -249,12 +249,14 @@ paused: only they count as where it stopped."
 (defun inspection-summary (inspection &optional checkpoint)
   "INSPECTION (INSPECT-WORKFLOW-RECOVERY) for the recovery card, each
 repository set against how CHECKPOINT saw it: a plist of :changed (true if
-anything changed since), :repositories (:path :available :error :branch
+anything changed since), :approximate (true if that snapshot may predate the
+agents' last edits), :repositories (:path :available :error :branch
 :head :files :operation :new-commits :branch-was :changed-since), :agents
 (:agent :busy :stopped :unavailable-until) and :recovery-refs (parts)."
   (let ((before (loop for r in (jlist (jget checkpoint "repositories"))
                       when (jobject-p r) collect (cons (jget r "path") r))))
     (list :changed (eq t (jget inspection "repository-changed"))
+          :approximate (eq t (jget inspection "repository-snapshot-pending"))
           :repositories
           (loop for r in (jlist (jget inspection "repositories"))
                 when (jobject-p r)

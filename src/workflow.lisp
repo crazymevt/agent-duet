@@ -109,6 +109,9 @@
    (steps :initform nil :accessor workflow-steps)
    (recovery-baseline :initform nil :accessor workflow-recovery-baseline)
    (recovery-capture :initform nil :accessor workflow-recovery-capture)
+   (recovery-stale :initform nil :accessor workflow-recovery-stale
+                   :documentation "Restored from a checkpoint saved before its snapshot was ready: :baseline
+while the workflow's baseline is that older one, and the paused steps whose own are.")
    (integration-state :initform nil :accessor workflow-integration-state)
    (on-checkpoint :initarg :on-checkpoint :initform nil :accessor workflow-on-checkpoint)
    (paused :initform '() :accessor workflow-paused :documentation "STEPs waiting for the user")
@@ -285,6 +288,7 @@ unapproved has its author address the last review. True if it carried on."
       (when (eq capture (workflow-recovery-capture workflow))
         (setf (workflow-recovery-baseline workflow) (recovery-capture-repositories capture)
               (workflow-recovery-capture workflow) nil
+              (workflow-recovery-stale workflow) (remove :baseline (workflow-recovery-stale workflow))
               changed t))
       (dolist (entry (recovery-capture-steps capture))
         (let ((step (car entry)))
@@ -292,6 +296,7 @@ unapproved has its author address the last review. True if it carried on."
                      (= (cdr entry) (step-generation step)) (eq (step-state step) :paused))
             (setf (step-repositories step) (recovery-capture-repositories capture)
                   (step-repository-capture step) nil
+                  (workflow-recovery-stale workflow) (remove step (workflow-recovery-stale workflow))
                   changed t))))
       (when changed (checkpoint-changed workflow)))))
 
@@ -311,6 +316,18 @@ unapproved has its author address the last review. True if it carried on."
                       (lambda () (apply-recovery-capture workflow capture))))
            :name "workflow repository snapshot"))
     capture))
+
+(defun recovery-snapshot-pending-p (workflow)
+  "Whether the repository snapshot that changes are judged against may predate
+the agents' last edits: one is still being taken, or the task was restored
+from a checkpoint saved before its snapshot was ready."
+  (let ((stale (workflow-recovery-stale workflow)))
+    (and (or (member :baseline stale)
+             (some (lambda (step) (member step stale)) (workflow-paused workflow))
+             (some (lambda (capture) (and capture (not (recovery-capture-ready capture))))
+                   (cons (workflow-recovery-capture workflow)
+                         (mapcar #'step-repository-capture (workflow-paused workflow)))))
+         t)))
 
 (defun await-recovery-captures (workflow)
   "Wait only from inspection workers or headless callers, never GTK."
@@ -1766,8 +1783,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           "shutdown-processes" (coerce (workflow-process-records workflow) 'vector)
           "repositories" (or (captured-recovery-repositories (workflow-recovery-capture workflow)
                                                              (workflow-recovery-baseline workflow)) #())
-          "repository-snapshot-pending" (if (and (workflow-recovery-capture workflow)
-                                                   (not (recovery-capture-ready (workflow-recovery-capture workflow)))) t :false)
+          "repository-snapshot-pending" (if (recovery-snapshot-pending-p workflow) t :false)
           "error" (workflow-completion-error workflow)
           "merged-loop" (position (workflow-merged-loop workflow) (workflow-loops workflow))
           "loops" (coerce
@@ -1917,6 +1933,10 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           (setf (step-then step) (restored-step-continuation workflow step))
           (push step (workflow-steps workflow))
           (when (eq (step-state step) :paused) (push step (workflow-paused workflow)))))
+      ;; Saved before the snapshot after the agents' last edits was ready: the
+      ;; baselines are older, so their edits can read as changes since.
+      (when (jtrue-p (jget checkpoint "repository-snapshot-pending"))
+        (setf (workflow-recovery-stale workflow) (cons :baseline (copy-list (workflow-paused workflow)))))
       ;; A restart during a check must not replay the shell command automatically.
       (dolist (l (workflow-loops workflow))
         (when (and (eq (loop-state l) :checking)
@@ -1962,6 +1982,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           "merged-refs" (coerce (workflow-merged-refs workflow) 'vector)
           "repositories" now
           "repository-changed" (if (and baseline (not (equalp now baseline))) t :false)
+          "repository-snapshot-pending" (if (recovery-snapshot-pending-p workflow) t :false)
           "recovery-refs" (coerce (mapcar (lambda (entry)
                                             (jobj "part" (getf entry :part) "head" (getf entry :head)
                                                   "base" (getf entry :base)))
@@ -2080,7 +2101,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
         (setf (agent-read-only-p agent) t))
       (setf (workflow-state workflow) :running
             (workflow-recovery-baseline workflow) (jget inspection "repositories")
-            (workflow-recovery-capture workflow) nil)
+            (workflow-recovery-capture workflow) nil
+            (workflow-recovery-stale workflow) (remove :baseline (workflow-recovery-stale workflow)))
       (cond ((eq (step-role step) :check)
              (unpause workflow step) (setf (step-state step) :completed)
              (loop-check workflow (step-loop step) (loop-check-fixes (step-loop step))))
@@ -2174,7 +2196,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
           (push (cons path (worktree-branch path)) (workflow-tree-branches workflow))
           (note workflow "Restored committed progress in ~a. Uncommitted edits from the missing worktree cannot be reconstructed." path)
           (checkpoint-changed workflow)))))
-  (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
+  (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow)
+        (workflow-recovery-stale workflow) (remove :baseline (workflow-recovery-stale workflow)))
   :restored)
 
 (defun workflow-checks-quiescent-p (workflow)

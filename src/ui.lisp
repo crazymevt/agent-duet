@@ -1427,23 +1427,15 @@ started: the same files could be edited twice. Try again in a moment, or stop th
           ((and (consp result) (eq (first result) :error)) (format nil "That didn't work: ~a" (second result)))
           (t nil))))
 
-(defun resume-when-reset (workflow step reset)
-  "Give STEP to its agent again a minute after RESET (a universal time)."
+(defun resume-when-reset (step reset fire)
+  "Call FIRE, the card's own Resume, a minute after RESET (a universal time),
+so what comes of it shows on STEP's card."
   (let ((seconds (max 5 (+ 60 (- reset (get-universal-time))))))
     (clear-pause-timer step)
     (push (cons step (glib:timeout-add-seconds glib:+priority-default+ seconds
                                                (lambda ()
                                                  (setf *pause-timers* (remove step *pause-timers* :key #'car))
-                                                 (let ((entry (assoc step *pause-cards*)))
-                                                   (attempt-recovery
-                                                    workflow :resume
-                                                    (lambda (result)
-                                                      (let ((text (recovery-outcome-text result (step-agent step))))
-                                                        (cond ((member result '(:started :pending-shutdown)))
-                                                              (text (pane-note *middle* text "error")))
-                                                        (when (and entry (eq result :started))
-                                                          (funcall (third entry) "Carried on"))))
-                                                    :step step))
+                                                 (funcall fire)
                                                  nil)))
           *pause-timers*)))
 
@@ -1515,7 +1507,9 @@ later (Codex reads its usage after the turn) brings the Wait button."
                (let ((reset (reset)))
                  (when reset
                    (setf waiting-for reset)
-                   (resume-when-reset workflow step reset)
+                   ;; As choosing Resume would: a folder changed meanwhile asks
+                   ;; first (Carry on anyway), and the card says why it didn't.
+                   (resume-when-reset step reset (lambda () (choose :resume "Carried on")))
                    (say (format nil "Waiting: ~a will carry on at about ~a. Leave the app open."
                                 (agent-name agent) (format-reset-time (+ reset 60)))))))
              (refresh ()
@@ -1691,7 +1685,10 @@ SUMMARY and, once it's read, INSPECTION's of the repository now."
           ((null inspection) (line '("dim-label") "Looking at the folder and worktrees as they are now…"))
           (t
            (when (getf inspection :changed)
-             (line '("warning") "The folder or a worktree has changed since the task stopped."))
+             (line '("warning") "~:[The folder or a worktree has changed since the task stopped.~;~
+The folder or a worktree differs from the last snapshot saved. The app closed before a newer one was ~
+taken, so this may include the agents' own last edits.~]"
+                   (getf inspection :approximate)))
            (dolist (r (getf inspection :repositories))
              (cond
                ((not (getf r :available))

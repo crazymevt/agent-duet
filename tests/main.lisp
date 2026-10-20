@@ -2393,6 +2393,40 @@ VERDICT: APPROVED" nil)
         (ai::await-recovery-captures workflow)
         (setf (symbol-function 'ai::workflow-repositories) old)))))
 
+;;; Saved before its snapshot was ready: reopened, the card says the
+;;; comparison may include the agents' own edits, until a fresh baseline.
+(define-test recovery-pending-snapshot-survives-restart :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let ((old (symbol-function 'ai::workflow-repositories))
+          (entered (sb-thread:make-semaphore))
+          (release (sb-thread:make-semaphore))
+          (checkpoint nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ai::workflow-repositories)
+                   (lambda (w)
+                     (sb-thread:signal-semaphore entered)
+                     (sb-thread:wait-on-semaphore release)
+                     (funcall old w)))
+             (ai:pause-workflow-agent workflow lead)
+             (true (sb-thread:wait-on-semaphore entered :timeout 10))
+             (ai:agent-turn-finished lead "Stopped" :interrupted)
+             (setf checkpoint (ai::json-copy (ai:workflow-checkpoint workflow))))
+        (setf (symbol-function 'ai::workflow-repositories) old)
+        (sb-thread:signal-semaphore release)
+        (ai::await-recovery-captures workflow))
+      (is eq t (ai:jget checkpoint "repository-snapshot-pending"))
+      (let* ((restored (ai:restore-workflow checkpoint :lead lead :partner partner))
+             (inspection (ai:inspect-workflow-recovery restored)))
+        (is eq t (ai:jget inspection "repository-snapshot-pending"))
+        (true (getf (ai::inspection-summary inspection checkpoint) :approximate))
+        ;; Saved again before anything is carried on, it stays marked.
+        (is eq t (ai:jget (ai:workflow-checkpoint restored) "repository-snapshot-pending"))
+        (is eq :started (ai:recover-workflow restored :resume :acknowledge-changes t))
+        (is eq :false (ai:jget (ai:workflow-checkpoint restored) "repository-snapshot-pending"))
+        (ai:stop-workflow restored))
+      (ai:stop-workflow workflow))))
+
 ;;; Transport failures must not depend on EOF and process death arriving together.
 (defun exercise-disconnected-workflow (agent directory mode)
   (touch directory "disconnect")

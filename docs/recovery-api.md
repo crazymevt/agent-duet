@@ -58,7 +58,8 @@ It signals an error for a checkpoint it can't use; the card then offers only
 
 `(inspect-workflow-recovery workflow)`, also `(recover-workflow workflow
 :review)` → JSON: `"repositories"` as now, `"repository-changed"` against the
-checkpoint's, `"recovery-refs"`, the paused `"steps"`, and `"agents"`
+checkpoint's, `"repository-snapshot-pending"` when that snapshot may predate
+the agents' last edits, `"recovery-refs"`, the paused `"steps"`, and `"agents"`
 (`"busy"`, `"shutdown-confirmed"`, `"unavailable"`). It runs git: the UI
 calls it off the GTK thread. `inspection-summary` reads it for the card,
 each repository against the checkpoint's (changed files, new commits, a
@@ -81,7 +82,10 @@ step or its id, by default the first paused:
 now; `:retry` gives it the step as first given; `:hand-off` gives the other
 agent the first. `:pending-shutdown` means the stopped turn, or a process it
 started, isn't confirmed gone: nothing has started. The UI tries again every
-2 seconds for 30 (`attempt-recovery`), then says it couldn't confirm.
+2 seconds for 30 (`attempt-recovery`), then says it couldn't confirm. *Wait until …* on
+a pause card resumes through the card's own *Resume*, so a changed folder,
+a block or a shutdown not confirmed shows on that card, with *Carry on
+anyway* where it applies.
 
 With no step, `:resume` shows a pending plan again (`:awaiting-plan`, through
 `:on-plan`) or carries integration on.
@@ -108,8 +112,13 @@ Completed steps and new pauses refresh the repository baseline on a worker and
 publish it through
 the agent delivery callback. Recovery inspection waits for this snapshot off GTK;
 checkpoint serialization never waits. A pending snapshot is marked in the saved
-checkpoint, and ready snapshots replace the cached repositories and paused-step
-baselines. Each paused step keeps its own snapshot, even if a peer pauses later or the
+checkpoint (`"repository-snapshot-pending"`), and ready snapshots replace the
+cached repositories and paused-step baselines. A workflow restored from a
+checkpoint so marked keeps the mark (`recovery-snapshot-pending-p`, and
+`"repository-snapshot-pending"` in the inspection) until a fresh baseline
+replaces the old one: changes are still reported against the older snapshot,
+so carrying on still asks first, but the card says they may include the
+agents' own last edits. Each paused step keeps its own snapshot, even if a peer pauses later or the
 whole task is stopped. Stop captures only steps without a snapshot (or with a
 failed capture), preserving user edits made between Pause and Stop.
 Superseded captures cannot overwrite newer recovery state. Recovery actions in
