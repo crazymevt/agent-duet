@@ -5,7 +5,7 @@
   :author "Jessie Hughart"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("uiop")
+  :depends-on ("uiop" "sb-posix")
   :pathname "src/"
   :serial t
   :components ((:file "package")

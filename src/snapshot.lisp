@@ -2,7 +2,24 @@
 (in-package #:agent-duet)
 
 (defstruct snapshot label head index working-tree time)
-(defstruct snapshot-change path status old-path diff)
+(defstruct snapshot-change path status old-path
+  directory from to                     ; what SNAPSHOT-CHANGE-DIFF compares
+  (%diff nil))                          ; its text, once computed
+
+(defun snapshot-change-diff (change)
+  "CHANGE's diff text, computed by Git on first use and kept. Slow for large
+changes: call it off the GTK thread."
+  (or (snapshot-change-%diff change)
+      (setf (snapshot-change-%diff change)
+            (let* ((old (snapshot-change-old-path change))
+                   (diff (snapshot-output (snapshot-change-directory change)
+                                          (append (list "--literal-pathspecs" "diff" "--no-ext-diff" "--no-textconv"
+                                                        "--no-color" "-M" (snapshot-change-from change)
+                                                        (snapshot-change-to change) "--")
+                                                  (if old (list old (snapshot-change-path change))
+                                                      (list (snapshot-change-path change)))))))
+              (if (plusp (length diff)) diff
+                  "Diff unavailable: the path may contain non-UTF-8 bytes.")))))
 
 (defun snapshot-ref (label)
   (concatenate 'string "refs/agent-duet/snapshots/" label))
@@ -24,6 +41,13 @@
 
 (defun snapshot-git (directory index &rest args)
   (string-right-trim '(#\Newline #\Return) (snapshot-output directory args index)))
+
+(defun snapshot-file-entry-p (directory path)
+  "True if PATH under DIRECTORY exists and isn't a real directory. Symlinks
+aren't followed: one to a directory, or a dangling one, is a file to Git."
+  (let ((stat (ignore-errors
+               (sb-posix:lstat (concatenate 'string (uiop:native-namestring directory) path)))))
+    (and stat (/= (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt) sb-posix:s-ifdir))))
 
 (defun snapshot-folder (directory label)
   "Capture HEAD, index and working tree under LABEL. NIL without a committed Git repository.
@@ -56,9 +80,7 @@ an unresolved index) are reported; the user's index and files are never written.
                ;; A HEAD-tracked file can have been removed from the index and
                ;; subsequently ignored. It still belongs to the working state.
                (let ((paths (remove-if-not
-                             (lambda (path)
-                               (let ((file (merge-pathnames (uiop:parse-native-namestring path) directory)))
-                                 (and (probe-file file) (not (uiop:directory-exists-p file)))))
+                             (lambda (path) (snapshot-file-entry-p directory path))
                              (remove "" (uiop:split-string
                                          (snapshot-git directory temporary "diff-index" "--cached" "--name-only"
                                                        "--diff-filter=D" "-z" head "--")
@@ -78,7 +100,8 @@ an unresolved index) are reported; the user's index and files are never written.
           (when (probe-file lock) (delete-file lock)))))))
 
 (defun snapshot-changes (directory start end)
-  "Return SNAPSHOT-CHANGE records comparing the snapshots' working trees, including renames."
+  "Return SNAPSHOT-CHANGE records comparing the snapshots' working trees, including renames.
+Each one's diff is computed when SNAPSHOT-CHANGE-DIFF first asks for it."
   (when (and start end (git-repository-p directory))
     (let* ((a (snapshot-working-tree start)) (b (snapshot-working-tree end))
            (fields (remove "" (uiop:split-string
@@ -91,14 +114,8 @@ an unresolved index) are reported; the user's index and files are never written.
             for path = (if renamed (pop fields) first)
             collect
             (make-snapshot-change
-             :path path :old-path (and renamed first)
-             :status (case (char code 0) (#\A :added) (#\D :deleted) (#\R :renamed) (t :modified))
-             :diff (let ((diff (snapshot-output directory
-                          (append (list "--literal-pathspecs" "diff" "--no-ext-diff" "--no-textconv"
-                                        "--no-color" "-M" a b "--")
-                                  (if renamed (list first path) (list path))))))
-                     (if (plusp (length diff)) diff
-                         "Diff unavailable: the path may contain non-UTF-8 bytes.")))))))
+             :path path :old-path (and renamed first) :directory directory :from a :to b
+             :status (case (char code 0) (#\A :added) (#\D :deleted) (#\R :renamed) (t :modified)))))))
 
 (defun delete-snapshot (directory snapshot)
   "Delete SNAPSHOT's ref only if it still points to that snapshot. Return T.

@@ -10,7 +10,9 @@
 - *Changes*: the folder's state is recorded (as git commits under
   `refs/agent-duet/snapshots/`, without touching the index, files or stash)
   when a task starts and finishes, and **Changes** in the header shows what
-  the latest task changed, file by file, with each file's diff.
+  the latest task changed, file by file, with each file's diff. Git runs off
+  the interface's thread: the file list loads after the window opens, and
+  each diff when its file is selected.
 - *Check* command per folder (`make test`, `npm test`, …): it runs after
   each round of work, before the review. A failure goes back to the author
   with its output (up to twice a round), and the review prompt says how the

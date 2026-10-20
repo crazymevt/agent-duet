@@ -153,3 +153,25 @@
         (true (search "unmerged" message))
         (true (search "shared.txt" message))
         (is string= before (ai::worktree-git repo "ls-files" "--stage"))))))
+
+(define-test snapshot-ignored-tracked-directory-symlink :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let ((start (ai:snapshot-folder repo "symlink-start")))
+      (ai::worktree-git repo "rm" "--cached" "-f" "shared.txt")
+      (delete-file (merge-pathnames "shared.txt" repo))
+      (ensure-directories-exist (merge-pathnames "target/" repo))
+      (write-worktree-file repo "target/inside.txt" "inside")
+      (uiop:run-program (list "ln" "-s" "target" (uiop:native-namestring (merge-pathnames "shared.txt" repo))))
+      (write-worktree-file repo ".gitignore" (format nil "shared.txt~%target/"))
+      ;; Followed, the symlink is a directory; Git records it as a link.
+      (let* ((end (ai:snapshot-folder repo "symlink-end"))
+             (entry (ai::worktree-git repo "ls-tree" (ai:snapshot-working-tree end) "shared.txt"))
+             (changes (ai:snapshot-changes repo start end))
+             (change (find "shared.txt" changes :key #'ai:snapshot-change-path :test #'string=)))
+        (true (uiop:string-prefix-p "120000" entry))
+        (true change)
+        (is eq :modified (ai:snapshot-change-status change))
+        ;; Diffs wait until they're asked for.
+        (false (ai::snapshot-change-%diff change))
+        (true (search "+target" (ai:snapshot-change-diff change)))
+        (true (ai::snapshot-change-%diff change))))))

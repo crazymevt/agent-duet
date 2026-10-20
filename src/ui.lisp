@@ -1393,14 +1393,14 @@ to now while it runs (or is still stopping)."
               (:final
                (show-changes-window directory start end :title (format nil "Changes · ~a" (folder-label directory))))
               (:live
-               (multiple-value-bind (now why) (task-snapshot task (format nil "now-~a" (subseq (make-uuid) 0 8)))
-                 (if (null now)
-                     (snapshot-failed (or why "the folder is no longer a git repository with a commit"))
-                     (unwind-protect
-                          (show-changes-window directory start now
-                                               :title (format nil "Changes so far · ~a" (folder-label directory)))
-                       ;; The window has read what it shows.
-                       (ignore-errors (funcall *task-snapshot-delete* directory now))))))))))))
+               ;; Recorded off the GTK thread; the window has read what it
+               ;; shows once it's closed.
+               (show-changes-window directory start
+                                    (lambda () (task-snapshot task (format nil "now-~a" (subseq (make-uuid) 0 8))))
+                                    :title (format nil "Changes so far · ~a" (folder-label directory))
+                                    :on-close (lambda (now)
+                                                (when now
+                                                  (ignore-errors (funcall *task-snapshot-delete* directory now))))))))))))
 
 ;;; A workflow stopped at its last round, unapproved
 
