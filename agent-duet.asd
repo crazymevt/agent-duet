@@ -19,6 +19,7 @@
                (:file "notify")
                (:file "worktree")
                (:file "snapshot")
+               (:file "read-only")
                (:file "agents")
                (:file "check")
                (:file "workflow")))

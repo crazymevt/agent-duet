@@ -355,3 +355,4 @@ make test
 ```
 
 They run without GTK or the CLIs: the workflows are driven by scripted agents.
+The fake CLIs and review enforcement use Lisp; Python is not required.

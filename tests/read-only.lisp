@@ -2,9 +2,6 @@
 
 (in-package #:agent-duet/tests)
 
-(defun python-missing-p ()
-  (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string))))
-
 (defun argument-after (flag args)
   (second (member flag args :test #'string=)))
 
@@ -66,94 +63,88 @@
 
 (define-test claude-read-only-permissions
     :parent agent-duet
-  (if (python-missing-p)
-      (skip "python3 is needed for the fake Claude" (true t))
-      (dolist (case '(("Bash" "rm -rf build" "deny")
-                      ("Bash" "git diff HEAD" "allow")
-                      ("Read" nil "allow")
-                      ("Write" nil "deny")))
-        (destructuring-bind (tool command behavior) case
-          (with-fake-claude (agent directory notes)
-            (let ((results nil) (approvals nil))
-              ;; Ask mode would ask the user: read-only decides by itself.
-              (setf (ai:agent-permission agent) :ask
-                    (ai:agent-read-only-p agent) t
-                    (ai:agent-listener agent)
-                    (lambda (agent kind &rest plist)
-                      (declare (ignore agent plist))
-                      (when (eq kind :approval) (push kind approvals))))
-              (write-file (merge-pathnames "permission-request" directory)
-                          (ai:json-string (ai:jobj "tool_name" tool
-                                                   "input" (if command
-                                                               (ai:jobj "command" command)
-                                                               (ai:jobj "file_path" "x")))))
-              (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
-              (true (wait-until (lambda () results)))
-              (is equal (list (format nil "fresh reply (~a)" behavior) nil) (first results) "~a ~a" tool command)
-              (false approvals)
-              (false (ai::agent-approvals agent))))))))
+  (dolist (case '(("Bash" "rm -rf build" "deny")
+                  ("Bash" "git diff HEAD" "allow")
+                  ("Read" nil "allow")
+                  ("Write" nil "deny")))
+    (destructuring-bind (tool command behavior) case
+      (with-fake-claude (agent directory notes)
+        (let ((results nil) (approvals nil))
+          ;; Ask mode would ask the user: read-only decides by itself.
+          (setf (ai:agent-permission agent) :ask
+                (ai:agent-read-only-p agent) t
+                (ai:agent-listener agent)
+                (lambda (agent kind &rest plist)
+                  (declare (ignore agent plist))
+                  (when (eq kind :approval) (push kind approvals))))
+          (write-file (merge-pathnames "permission-request" directory)
+                      (ai:json-string (ai:jobj "tool_name" tool
+                                               "input" (if command
+                                                           (ai:jobj "command" command)
+                                                           (ai:jobj "file_path" "x")))))
+          (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
+          (true (wait-until (lambda () results)))
+          (is equal (list (format nil "fresh reply (~a)" behavior) nil) (first results) "~a ~a" tool command)
+          (false approvals)
+          (false (ai::agent-approvals agent)))))))
 
 (define-test claude-ask-mode-still-asks
     :parent agent-duet
   ;; Once read-only is cleared, Ask mode asks the user again.
-  (if (python-missing-p)
-      (skip "python3 is needed for the fake Claude" (true t))
-      (with-fake-claude (agent directory notes)
-        (let ((results nil))
-          (setf (ai:agent-permission agent) :ask
-                (ai:agent-read-only-p agent) t)
-          (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () results)))
-          (setf (ai:agent-read-only-p agent) nil)
-          (write-file (merge-pathnames "permission-request" directory)
-                      (ai:json-string (ai:jobj "tool_name" "Bash" "input" (ai:jobj "command" "make test"))))
-          (ai:agent-submit agent "fix" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () (ai::agent-approvals agent))))
-          (ai::agent-answer-approval agent (car (first (ai::agent-approvals agent))) :allow)
-          (true (wait-until (lambda () (= 2 (length results)))))
-          (is equal '("fresh reply (allow)" nil) (first results))))))
+  (with-fake-claude (agent directory notes)
+    (let ((results nil))
+      (setf (ai:agent-permission agent) :ask
+            (ai:agent-read-only-p agent) t)
+      (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () results)))
+      (setf (ai:agent-read-only-p agent) nil)
+      (write-file (merge-pathnames "permission-request" directory)
+                  (ai:json-string (ai:jobj "tool_name" "Bash" "input" (ai:jobj "command" "make test"))))
+      (ai:agent-submit agent "fix" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () (ai::agent-approvals agent))))
+      (ai::agent-answer-approval agent (car (first (ai::agent-approvals agent))) :allow)
+      (true (wait-until (lambda () (= 2 (length results)))))
+      (is equal '("fresh reply (allow)" nil) (first results)))))
 
 ;;; Claude's process across read-only and back
 
 (define-test claude-read-only-session-transitions
     :parent agent-duet
-  (if (python-missing-p)
-      (skip "python3 is needed for the fake Claude" (true t))
-      (with-fake-claude (agent directory notes)
-        (let ((results nil))
-          (setf (ai:agent-permission agent) :full)
-          (flet ((turn (prompt)
-                   (let ((n (length results)))
-                     (ai:agent-submit agent prompt (lambda (text error) (push (list text error) results)))
-                     (true (wait-until (lambda () (> (length results) n))))
-                     (is equal '("fresh reply" nil) (first results))))
-                 (args (n)
-                   (uiop:split-string (nth n (uiop:read-file-lines (merge-pathnames "args" directory)))
-                                      :separator " ")))
-            (turn "write")
-            (let ((session (ai::agent-conversation-handle agent))
-                  (writable (ai::claude-agent-process agent)))
-              (setf (ai:agent-read-only-p agent) t)
-              (turn "review")
-              ;; A new process, carrying on the conversation, without edit tools.
-              (isnt eq writable (ai::claude-agent-process agent))
-              (is string= session (argument-after "--resume" (args 1)))
-              (true (search "Edit,MultiEdit,Write,NotebookEdit" (argument-after "--disallowedTools" (args 1))))
-              (is string= "default" (argument-after "--permission-mode" (args 1)))
-              ;; Another read-only turn keeps that process.
-              (let ((read-only (ai::claude-agent-process agent)))
-                (turn "review again")
-                (is eq read-only (ai::claude-agent-process agent))
-                (is = 2 (length (uiop:read-file-lines (merge-pathnames "args" directory))))
-                ;; Cleared: back to the permission, in the same conversation.
-                (setf (ai:agent-read-only-p agent) nil)
-                (turn "fix")
-                (isnt eq read-only (ai::claude-agent-process agent))
-                (is string= session (argument-after "--resume" (args 2)))
-                (false (member "--disallowedTools" (args 2) :test #'string=))
-                (is string= "bypassPermissions" (argument-after "--permission-mode" (args 2)))
-                (is string= session (ai::agent-conversation-handle agent))
-                (false notes))))))))
+  (with-fake-claude (agent directory notes)
+    (let ((results nil))
+      (setf (ai:agent-permission agent) :full)
+      (flet ((turn (prompt)
+               (let ((n (length results)))
+                 (ai:agent-submit agent prompt (lambda (text error) (push (list text error) results)))
+                 (true (wait-until (lambda () (> (length results) n))))
+                 (is equal '("fresh reply" nil) (first results))))
+             (args (n)
+               (uiop:split-string (nth n (uiop:read-file-lines (merge-pathnames "args" directory)))
+                                  :separator " ")))
+        (turn "write")
+        (let ((session (ai::agent-conversation-handle agent))
+              (writable (ai::claude-agent-process agent)))
+          (setf (ai:agent-read-only-p agent) t)
+          (turn "review")
+          ;; A new process, carrying on the conversation, without edit tools.
+          (isnt eq writable (ai::claude-agent-process agent))
+          (is string= session (argument-after "--resume" (args 1)))
+          (true (search "Edit,MultiEdit,Write,NotebookEdit" (argument-after "--disallowedTools" (args 1))))
+          (is string= "default" (argument-after "--permission-mode" (args 1)))
+          ;; Another read-only turn keeps that process.
+          (let ((read-only (ai::claude-agent-process agent)))
+            (turn "review again")
+            (is eq read-only (ai::claude-agent-process agent))
+            (is = 2 (length (uiop:read-file-lines (merge-pathnames "args" directory))))
+            ;; Cleared: back to the permission, in the same conversation.
+            (setf (ai:agent-read-only-p agent) nil)
+            (turn "fix")
+            (isnt eq read-only (ai::claude-agent-process agent))
+            (is string= session (argument-after "--resume" (args 2)))
+            (false (member "--disallowedTools" (args 2) :test #'string=))
+            (is string= "bypassPermissions" (argument-after "--permission-mode" (args 2)))
+            (is string= session (ai::agent-conversation-handle agent))
+            (false notes)))))))
 
 (define-test claude-read-only-refuses-steering-writable-turn
     :parent agent-duet
@@ -188,59 +179,55 @@
 
 (define-test codex-read-only-session-transitions
     :parent agent-duet
-  (if (python-missing-p)
-      (skip "python3 is needed for the fake Codex" (true t))
-      (with-fake-codex (agent directory)
-        (let ((results nil))
-          (setf (ai:agent-permission agent) :ask)
-          (flet ((turn (prompt)
-                   (let ((n (length results)))
-                     (ai:agent-submit agent prompt (lambda (text error) (push (list text error) results)))
-                     (true (wait-until (lambda () (> (length results) n))))
-                     (is equal '("hi" nil) (first results)))))
-            (turn "write")
-            (let ((writable (ai::codex-agent-server agent)))
-              (is string= "workspace-write" (ai:jget (first (fake-requests directory "thread/start")) "sandbox"))
-              (is string= "untrusted" (ai:jget (first (fake-requests directory "turn/start")) "approvalPolicy"))
-              (setf (ai:agent-read-only-p agent) t)
-              (turn "review")
-              ;; A new server, resuming the thread in the read-only sandbox, never asking.
-              (isnt eq writable (ai::codex-agent-server agent))
-              (let ((resume (first (fake-requests directory "thread/resume"))))
-                (is string= "thread-1" (ai:jget resume "threadId"))
-                (is string= "read-only" (ai:jget resume "sandbox"))
-                (is string= "never" (ai:jget resume "approvalPolicy")))
-              (is string= "never" (ai:jget (second (fake-requests directory "turn/start")) "approvalPolicy"))
-              ;; Cleared: back to the permission's sandbox, same thread.
-              (let ((read-only (ai::codex-agent-server agent)))
-                (setf (ai:agent-read-only-p agent) nil)
-                (turn "fix")
-                (isnt eq read-only (ai::codex-agent-server agent))
-                (let ((resume (second (fake-requests directory "thread/resume"))))
-                  (is string= "thread-1" (ai:jget resume "threadId"))
-                  (is string= "workspace-write" (ai:jget resume "sandbox"))
-                  (is string= "untrusted" (ai:jget resume "approvalPolicy")))
-                (is string= "untrusted" (ai:jget (third (fake-requests directory "turn/start")) "approvalPolicy"))
-                (is = 1 (length (fake-requests directory "thread/start"))))))))))
+  (with-fake-codex (agent directory)
+    (let ((results nil))
+      (setf (ai:agent-permission agent) :ask)
+      (flet ((turn (prompt)
+               (let ((n (length results)))
+                 (ai:agent-submit agent prompt (lambda (text error) (push (list text error) results)))
+                 (true (wait-until (lambda () (> (length results) n))))
+                 (is equal '("hi" nil) (first results)))))
+        (turn "write")
+        (let ((writable (ai::codex-agent-server agent)))
+          (is string= "workspace-write" (ai:jget (first (fake-requests directory "thread/start")) "sandbox"))
+          (is string= "untrusted" (ai:jget (first (fake-requests directory "turn/start")) "approvalPolicy"))
+          (setf (ai:agent-read-only-p agent) t)
+          (turn "review")
+          ;; A new server, resuming the thread in the read-only sandbox, never asking.
+          (isnt eq writable (ai::codex-agent-server agent))
+          (let ((resume (first (fake-requests directory "thread/resume"))))
+            (is string= "thread-1" (ai:jget resume "threadId"))
+            (is string= "read-only" (ai:jget resume "sandbox"))
+            (is string= "never" (ai:jget resume "approvalPolicy")))
+          (is string= "never" (ai:jget (second (fake-requests directory "turn/start")) "approvalPolicy"))
+          ;; Cleared: back to the permission's sandbox, same thread.
+          (let ((read-only (ai::codex-agent-server agent)))
+            (setf (ai:agent-read-only-p agent) nil)
+            (turn "fix")
+            (isnt eq read-only (ai::codex-agent-server agent))
+            (let ((resume (second (fake-requests directory "thread/resume"))))
+              (is string= "thread-1" (ai:jget resume "threadId"))
+              (is string= "workspace-write" (ai:jget resume "sandbox"))
+              (is string= "untrusted" (ai:jget resume "approvalPolicy")))
+            (is string= "untrusted" (ai:jget (third (fake-requests directory "turn/start")) "approvalPolicy"))
+            (is = 1 (length (fake-requests directory "thread/start")))))))))
 
 (define-test codex-read-only-declines-approvals
     :parent agent-duet
-  (if (python-missing-p)
-      (skip "python3 is needed for the fake Codex" (true t))
-      (with-fake-codex (agent directory)
-        (let ((results nil) (approvals nil))
-          (setf (ai:agent-permission agent) :ask
-                (ai:agent-read-only-p agent) t
-                (ai:agent-listener agent)
-                (lambda (agent kind &rest plist)
-                  (declare (ignore agent plist))
-                  (when (eq kind :approval) (push kind approvals))))
-          (touch directory "request-approval")
-          (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () results)))
-          (is string= "decline" (uiop:read-file-string (merge-pathnames "approval-decision" directory)))
-          (false approvals)
-          (false (ai::agent-approvals agent))))))
+  (with-fake-codex (agent directory)
+    (let ((results nil) (approvals nil))
+      (setf (ai:agent-permission agent) :ask
+            (ai:agent-read-only-p agent) t
+            (ai:agent-listener agent)
+            (lambda (agent kind &rest plist)
+              (declare (ignore agent plist))
+              (when (eq kind :approval) (push kind approvals))))
+      (touch directory "request-approval")
+      (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () results)))
+      (is string= "decline" (uiop:read-file-string (merge-pathnames "approval-decision" directory)))
+      (false approvals)
+      (false (ai::agent-approvals agent)))))
 
 (define-test codex-read-only-refuses-steering-writable-turn
     :parent agent-duet
@@ -276,74 +263,105 @@
 
 (define-test read-only-hook-enforcement
     :parent agent-duet
-  (unless (python-missing-p)
-    (dolist (name '("Write" "Agent" "Task" "Skill" "mcp__files__write"))
-      (is string= "deny" (ai:jget (run-review-hook name (ai:jobj))
-                                 "hookSpecificOutput" "permissionDecision") "~a" name))
-    (dolist (command '("git diff --out'put'=review.patch" "git diff --out=review.patch"
-                       "git diff --ext-diff" "git show --textconv HEAD:README.md"
-                       "git cat-file --filters HEAD:README.md" "rm -rf build"
-                       "git log --show-signature" "git diff --submodule=diff" "git diff *"))
-      (is string= "deny" (ai:jget (run-review-hook "Bash" (ai:jobj "command" command))
-                                 "hookSpecificOutput" "permissionDecision") "~a" command))
-    (let* ((result (run-review-hook "Bash" (ai:jobj "command" "git diff HEAD -- shared.txt")))
-           (output (ai:jget result "hookSpecificOutput"))
-           (command (ai:jget output "updatedInput" "command")))
-      (is string= "allow" (ai:jget output "permissionDecision"))
-      (true (search "--no-ext-diff" command))
-      (true (search "--no-textconv" command))
-      (true (search "core.fsmonitor=false" command))
-      (true (search "GIT_NO_LAZY_FETCH=1" command)))
-    ;; Questions still reach our UI, not an auto-approval from the hook.
-    (false (ai:jget (run-review-hook "AskUserQuestion" (ai:jobj)) "hookSpecificOutput"))
-    (is = 2 (nth-value 1 (run-review-hook "Bash" (ai:jobj "command" "git diff 'unterminated"))))))
+  (dolist (name '("Write" "Agent" "Task" "Skill" "mcp__files__write"))
+    (is string= "deny" (ai:jget (run-review-hook name (ai:jobj))
+                               "hookSpecificOutput" "permissionDecision") "~a" name))
+  (dolist (command '("git diff --out'put'=review.patch" "git diff --out=review.patch"
+                     "git diff --ext-diff" "git show --textconv HEAD:README.md"
+                     "git cat-file --filters HEAD:README.md" "rm -rf build"
+                     "git log --show-signature" "git diff --submodule=diff" "git diff *"))
+    (is string= "deny" (ai:jget (run-review-hook "Bash" (ai:jobj "command" command))
+                               "hookSpecificOutput" "permissionDecision") "~a" command))
+  (let* ((result (run-review-hook "Bash" (ai:jobj "command" "git diff HEAD -- shared.txt")))
+         (output (ai:jget result "hookSpecificOutput"))
+         (command (ai:jget output "updatedInput" "command")))
+    (is string= "allow" (ai:jget output "permissionDecision"))
+    (true (search "--no-ext-diff" command))
+    (true (search "--no-textconv" command))
+    (true (search "core.fsmonitor=false" command))
+    (true (search "GIT_NO_LAZY_FETCH=1" command)))
+  ;; Questions still reach our UI, not an auto-approval from the hook.
+  (false (ai:jget (run-review-hook "AskUserQuestion" (ai:jobj)) "hookSpecificOutput"))
+  (is string= "deny" (ai:jget (run-review-hook "Bash" (ai:jobj "command" "git diff 'unterminated")) "hookSpecificOutput" "permissionDecision")))
 
 (define-test claude-review-overrides-inherited-allow
     :parent agent-duet
-  (unless (python-missing-p)
-    (dolist (tool '("Bash" "mcp__files__write"))
-      (with-fake-claude (agent directory notes)
-        (let ((results nil))
-          (setf (ai:agent-read-only-p agent) t (ai:agent-permission agent) :full)
-          (touch directory "inherited-allow")
-          (touch directory "execute-command")
-          (write-file (merge-pathnames "permission-request" directory)
-                      (ai:json-string (ai:jobj "tool_name" tool "input"
-                                               (ai:jobj "command" "git diff --out'put'=escaped.patch"))))
-          (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () results)))
-          (is equal '("fresh reply (deny)" nil) (first results))
-          (false (probe-file (merge-pathnames "escaped.patch" directory)))
-          (is string= "deny" (ai:jget (ai:parse-json (first (uiop:read-file-lines (merge-pathnames "hook-decisions" directory))))
-                                     "permissionDecision")))))))
-
-(define-test claude-review-disables-configured-git-helpers
-    :parent agent-duet
-  (unless (python-missing-p)
+  (dolist (tool '("Bash" "mcp__files__write"))
     (with-fake-claude (agent directory notes)
       (let ((results nil))
-        (ai::worktree-git directory "init")
-        (ai::worktree-git directory "config" "user.name" "Test")
-        (ai::worktree-git directory "config" "user.email" "test@example.invalid")
-        (ai::worktree-git directory "config" "commit.gpgsign" "false")
-        (write-file (merge-pathnames "file.txt" directory) "before")
-        (write-file (merge-pathnames ".gitattributes" directory) "file.txt diff=review-test")
-        (ai::worktree-git directory "add" "file.txt" ".gitattributes")
-        (ai::worktree-git directory "commit" "-m" "initial")
-        (write-file (merge-pathnames "file.txt" directory) "after")
-        ;; These helpers would create marker files if Git ran them.
-        (ai::worktree-git directory "config" "diff.external" "touch external-ran")
-        (ai::worktree-git directory "config" "diff.review-test.textconv" "touch textconv-ran")
-        (ai::worktree-git directory "config" "core.fsmonitor" "touch fsmonitor-ran")
-        (setf (ai:agent-read-only-p agent) t)
+        (setf (ai:agent-read-only-p agent) t (ai:agent-permission agent) :full)
         (touch directory "inherited-allow")
         (touch directory "execute-command")
         (write-file (merge-pathnames "permission-request" directory)
-                    (ai:json-string (ai:jobj "tool_name" "Bash" "input"
-                                             (ai:jobj "command" "git diff HEAD -- file.txt"))))
+                    (ai:json-string (ai:jobj "tool_name" tool "input"
+                                             (ai:jobj "command" "git diff --out'put'=escaped.patch"))))
         (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
         (true (wait-until (lambda () results)))
-        (is equal '("fresh reply (allow)" nil) (first results))
-        (true (search "+after" (uiop:read-file-string (merge-pathnames "command-output" directory))))
-        (dolist (name '("external-ran" "textconv-ran" "fsmonitor-ran"))
-          (false (probe-file (merge-pathnames name directory)) "~a" name))))))
+        (is equal '("fresh reply (deny)" nil) (first results))
+        (false (probe-file (merge-pathnames "escaped.patch" directory)))
+        (is string= "deny" (ai:jget (ai:parse-json (first (uiop:read-file-lines (merge-pathnames "hook-decisions" directory))))
+                                   "permissionDecision"))))))
+
+(define-test claude-review-disables-configured-git-helpers
+    :parent agent-duet
+  (with-fake-claude (agent directory notes)
+    (let ((results nil))
+      (ai::worktree-git directory "init")
+      (ai::worktree-git directory "config" "user.name" "Test")
+      (ai::worktree-git directory "config" "user.email" "test@example.invalid")
+      (ai::worktree-git directory "config" "commit.gpgsign" "false")
+      (write-file (merge-pathnames "file.txt" directory) "before")
+      (write-file (merge-pathnames ".gitattributes" directory) "file.txt diff=review-test")
+      (ai::worktree-git directory "add" "file.txt" ".gitattributes")
+      (ai::worktree-git directory "commit" "-m" "initial")
+      (write-file (merge-pathnames "file.txt" directory) "after")
+      ;; These helpers would create marker files if Git ran them.
+      (ai::worktree-git directory "config" "diff.external" "touch external-ran")
+      (ai::worktree-git directory "config" "diff.review-test.textconv" "touch textconv-ran")
+      (ai::worktree-git directory "config" "core.fsmonitor" "touch fsmonitor-ran")
+      (setf (ai:agent-read-only-p agent) t)
+      (touch directory "inherited-allow")
+      (touch directory "execute-command")
+      (write-file (merge-pathnames "permission-request" directory)
+                  (ai:json-string (ai:jobj "tool_name" "Bash" "input"
+                                           (ai:jobj "command" "git diff HEAD -- file.txt"))))
+      (ai:agent-submit agent "review" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () results)))
+      (is equal '("fresh reply (allow)" nil) (first results))
+      (true (search "+after" (uiop:read-file-string (merge-pathnames "command-output" directory))))
+      (dolist (name '("external-ran" "textconv-ran" "fsmonitor-ran"))
+        (false (probe-file (merge-pathnames name directory)) "~a" name)))))
+
+(define-test read-only-saved-image-hook
+    :parent agent-duet
+  ;; The installed app must use its own image, without Python, a separate
+  ;; Lisp installation, Quicklisp, or access to the source checkout.
+  (let ((directory (merge-pathnames (format nil "duet-hook-image-~d/" (random 1000000))
+                                    (uiop:temporary-directory))))
+    (ensure-directories-exist directory)
+    (unwind-protect
+        (dolist (executable '(nil t))
+          (let* ((image (merge-pathnames (if executable "hook" "hook.core") directory))
+                 (runtime (namestring sb-ext:*runtime-pathname*))
+                 (arguments
+                   (append (list runtime "--noinform" "--no-sysinit" "--no-userinit" "--non-interactive"
+                                 "--eval" "(require :asdf)")
+                           (loop for file in '("src/package.lisp" "src/json.lisp" "src/read-only.lisp")
+                                 append (list "--load" (namestring (asdf:system-relative-pathname "agent-duet/core" file))))
+                           (list "--eval"
+                                 (format nil "(sb-ext:save-lisp-and-die ~s :executable ~s :toplevel (lambda () (if (member \"--review-hook\" (rest sb-ext:*posix-argv*) :test #'string=) (agent-duet::run-review-hook) (progn (write-line (agent-duet::review-hook-command)) (uiop:quit)))))"
+                                         (namestring image) executable)))))
+            (uiop:run-program arguments :output nil :error-output :string)
+            (let* ((command (string-trim '(#\Newline #\Return)
+                                         (uiop:run-program
+                                          (if executable (list (namestring image) "--noinform")
+                                              (list runtime "--core" (namestring image) "--noinform"))
+                                          :output :string)))
+                   (result (ai:parse-json
+                            (uiop:run-program (list "/bin/sh" "-c" command)
+                                              :input (make-string-input-stream "{\"tool_name\":\"Read\",\"tool_input\":{}}")
+                                              :output :string :error-output :string))))
+              (false (search "--load" command))
+              (true (search (namestring image) command))
+              (is string= "allow" (ai:jget result "hookSpecificOutput" "permissionDecision")))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

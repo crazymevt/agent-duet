@@ -105,6 +105,8 @@ environment. Returns the number of variables set."
 (defun app-main ()
   "Run as an application: from the Finder, with the log and the login
 shell's environment; with a folder from the command line, if given."
+  (when (member "--review-hook" (rest sb-ext:*posix-argv*) :test #'string=)
+    (run-review-hook))
   (setf *random-state* (make-random-state t))
   (unless (uiop:getenv "TERM")
     (redirect-output-to-log)

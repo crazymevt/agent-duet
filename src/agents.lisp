@@ -406,140 +406,14 @@ Running a command may need the user's approval; if one is denied, carry on witho
   '("Bash(git diff:*)" "Bash(git status:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(ls:*)")
   "Commands Claude may run without asking: enough to review.")
 
-(defparameter *claude-edit-tools* '("Edit" "MultiEdit" "Write" "NotebookEdit")
-  "The tools Claude changes files with, taken away when read-only.")
-
-(defparameter *claude-read-only-tools* '("Read" "Glob" "Grep" "LS")
-  "Claude's tools that only read, allowed anywhere when read-only.")
-
-(defparameter *read-only-commands* '("ls" "pwd" "cat" "head" "tail" "wc" "grep")
-  "Commands that only read, given safe arguments (see READ-ONLY-COMMAND-P).")
-
-(defparameter *read-only-git-commands*
-  '("diff" "status" "log" "show" "merge-base" "rev-parse" "rev-list" "blame" "ls-files"
-    "cat-file" "shortlog" "describe" "name-rev")
-  "Git subcommands that only read (but see READ-ONLY-COMMAND-P for --output).")
-
-(defparameter *read-only-blocked-options*
-  '("--output" "--ext-diff" "--textconv" "--filters" "--show-signature" "--submodule"))
-
-(defun read-only-command-words (command)
-  "A small, deliberately restricted shell grammar. Quotes group literal text;
-expansion, escaping, globbing, redirection and command composition are refused."
-  (when (and (stringp command)
-             (not (find-if (lambda (c)
-                             (or (and (< (char-code c) 32) (not (char= c #\Tab)))
-                                 (find c ";&|<>`$(){}\\*?[]!"))) command)))
-    (let ((words nil) (word nil) (started nil) (quote nil))
-      (labels ((flush-word ()
-                 (when started
-                   (push (coerce (nreverse word) 'string) words)
-                   (setf word nil started nil))))
-        (loop for c across command do
-          (cond (quote (if (char= c quote) (setf quote nil) (push c word)))
-                ((find c "'\"") (setf quote c started t))
-                ((find c '(#\Space #\Tab)) (flush-word))
-                (t (setf started t) (push c word))))
-        (unless quote
-          (flush-word)
-          (nreverse words))))))
-
-(defun read-only-option-p (word)
-  ;; Git accepts abbreviated long options. Check normalized arguments, not
-  ;; raw shell text, including prefixes such as --out and --textc.
-  (let ((option (subseq word 0 (position #\= word))))
-    (not (and (> (length option) 2) (uiop:string-prefix-p "--" option)
-              (some (lambda (blocked) (uiop:string-prefix-p option blocked))
-                    *read-only-blocked-options*)))))
-
-(defun read-only-command-p (command)
-  "Whether COMMAND is admissible to the read-only hook. Git still requires
-its helper-disabling rewrite; never use this predicate to approve raw Bash."
-  (let ((words (read-only-command-words command)))
-    (and words
-         (or (member (first words) *read-only-commands* :test #'string=)
-             (and (equal (first words) "git")
-                  (member (second words) *read-only-git-commands* :test #'string=)
-                  (every #'read-only-option-p (cddr words))))
-         t)))
-
-;;; The hook runs before inherited/session allow rules, unlike permission
-;;; requests. Its source is saved in the Lisp image so the app needs no checkout.
-(defparameter *claude-read-only-hook-program*
-  "import json, os, shlex, shutil, sys
-
-def main():
-    policy = json.loads(sys.argv[1])
-    event = json.load(sys.stdin)
-    name = event.get('tool_name')
-    inp = event.get('tool_input', {})
-    result = {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
-              'permissionDecisionReason': 'Review only: this tool or command may write files.'}
-    if name == 'AskUserQuestion':
-        return {}  # Leave interaction to Agent Duet's permission host.
-    if name in policy['tools']:
-        result['permissionDecision'] = 'allow'
-    elif name == 'Bash':
-        command = inp.get('command')
-        forbidden = ';&|<>`$(){}\\\\*?[]!'
-        if not isinstance(command, str) or any(c in forbidden or (ord(c) < 32 and c != '\\t') for c in command):
-            return {'hookSpecificOutput': result}
-        words = shlex.split(command, posix=True)
-        if not words:
-            return {'hookSpecificOutput': result}
-        git = words[0] == 'git' and len(words) > 1 and words[1] in policy['git']
-        if words[0] not in policy['commands'] and not git:
-            return {'hookSpecificOutput': result}
-        if git:
-            for word in words[2:]:
-                option = word.split('=', 1)[0]
-                if len(option) > 2 and option.startswith('--') and any(b.startswith(option) for b in policy['blocked']):
-                    return {'hookSpecificOutput': result}
-        program = shutil.which(words[0])
-        if not program or not os.path.isabs(program):
-            return {'hookSpecificOutput': result}
-        subcommand = words[1] if git else None
-        words[0] = program
-        if git:
-            # Avoid helpers (including fsmonitor and lazy object fetching), pager
-            # programs, and the optional index refresh done by git status.
-            words[1:1] = ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'log.showSignature=false', '-c', 'diff.submodule=short']
-            if subcommand in ('diff', 'log', 'show'):
-                end = next((i for i, w in enumerate(words) if w in ('--', '--end-of-options')), len(words))
-                words[end:end] = ['--no-ext-diff', '--no-textconv']
-            prefix = 'GIT_OPTIONAL_LOCKS=0 GIT_NO_LAZY_FETCH=1 '
-        else:
-            prefix = ''
-        result['permissionDecision'] = 'allow'
-        result['updatedInput'] = dict(inp, command=prefix + shlex.join(words))
-    return {'hookSpecificOutput': result}
-
-try:
-    print(json.dumps(main()))
-except Exception:
-    print('Review-only policy could not validate this tool call.', file=sys.stderr)
-    sys.exit(2)
-")
-
+;;; The hook runs before inherited/session allow rules. Saved applications
+;;; invoke their own Lisp image; development uses the already-required SBCL.
 (defun claude-read-only-settings ()
-  (let* ((python (string-trim '(#\Space #\Newline #\Return)
-                             (uiop:run-program '("/bin/sh" "-c" "command -v python3")
-                                               :output :string :ignore-error-status t)))
-         (policy (json-string (jobj "tools" (coerce *claude-read-only-tools* 'vector)
-                                   "commands" (coerce *read-only-commands* 'vector)
-                                   "git" (coerce *read-only-git-commands* 'vector)
-                                   "blocked" (coerce *read-only-blocked-options* 'vector)))))
-    (unless (and (plusp (length python)) (uiop:absolute-pathname-p python) (probe-file python))
-      (error "Review-only Claude requires python3 to enforce its tool policy."))
-    (json-string
-     (jobj "hooks" (jobj "PreToolUse"
-                         (vector (jobj "matcher" "*" "hooks"
-                                       (vector (jobj "type" "command" "timeout" 10
-                                                     "command"
-                                                     (format nil "~a -I -c ~a ~a || exit 2"
-                                                             (shell-quote python)
-                                                             (shell-quote (format nil "exec(~a)" (json-string *claude-read-only-hook-program*)))
-                                                             (shell-quote policy)))))))))))
+  (json-string
+   (jobj "hooks" (jobj "PreToolUse"
+                       (vector (jobj "matcher" "*" "hooks"
+                                     (vector (jobj "type" "command" "timeout" 10
+                                                   "command" (review-hook-command)))))))))
 
 (defparameter *claude-efforts* '("low" "medium" "high" "xhigh" "max"))
 

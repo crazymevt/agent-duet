@@ -1233,7 +1233,7 @@ deleted ones onto DELETED. While FAIL (a place) is true, taking one fails."
     (ai:agent-submit agent "work" (lambda (text error) (declare (ignore text error))))
     (false (ai::agent-out-until agent))))
 
-;;; Codex against a fake app-server (tests/fake-codex, which needs python3)
+;;; Codex against a fake app-server (tests/fake-codex, using SBCL)
 
 (defun fake-codex-program ()
   (namestring (asdf:system-relative-pathname "agent-duet" "tests/fake-codex")))
@@ -1263,35 +1263,31 @@ deleted ones onto DELETED. While FAIL (a place) is true, taking one fails."
 
 (define-test codex-stop-while-starting
     :parent agent-duet
-  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
-      (skip "python3 is needed for the fake Codex" (true t))
-      (with-fake-codex (agent directory)
-        (let ((result nil))
-          ;; Hold the app-server in initialize, stop the turn, then let it go.
-          (touch directory "hold")
-          (ai:agent-submit agent "do it" (lambda (text error) (setf result (list text error))))
-          (true (wait-until (lambda () (member "initialize" (fake-log directory) :test #'string=))))
-          (ai:agent-cancel agent)
-          (delete-file (merge-pathnames "hold" directory))
-          (true (wait-until (lambda () (not (ai:agent-busy agent)))))
-          (sleep 0.3)
-          (false (member "turn/start" (fake-log directory) :test #'string=))
-          (true (second result))))))
+  (with-fake-codex (agent directory)
+    (let ((result nil))
+      ;; Hold the app-server in initialize, stop the turn, then let it go.
+      (touch directory "hold")
+      (ai:agent-submit agent "do it" (lambda (text error) (setf result (list text error))))
+      (true (wait-until (lambda () (member "initialize" (fake-log directory) :test #'string=))))
+      (ai:agent-cancel agent)
+      (delete-file (merge-pathnames "hold" directory))
+      (true (wait-until (lambda () (not (ai:agent-busy agent)))))
+      (sleep 0.3)
+      (false (member "turn/start" (fake-log directory) :test #'string=))
+      (true (second result)))))
 
 (define-test codex-retry-after-failed-start
     :parent agent-duet
-  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
-      (skip "python3 is needed for the fake Codex" (true t))
-      (with-fake-codex (agent directory)
-        (let ((results '()))
-          (touch directory "fail-thread-once")
-          (ai:agent-submit agent "first" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () (= 1 (length results)))))
-          (true (second (first results)))       ; failed
-          (ai:agent-submit agent "second" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () (= 2 (length results)))))
-          (is equal '("hi" nil) (first results))
-          (is = 2 (count "thread/start" (fake-log directory) :test #'string=))))))
+  (with-fake-codex (agent directory)
+    (let ((results '()))
+      (touch directory "fail-thread-once")
+      (ai:agent-submit agent "first" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () (= 1 (length results)))))
+      (true (second (first results)))       ; failed
+      (ai:agent-submit agent "second" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () (= 2 (length results)))))
+      (is equal '("hi" nil) (first results))
+      (is = 2 (count "thread/start" (fake-log directory) :test #'string=)))))
 
 (define-test queueing
     :parent agent-duet
@@ -1433,68 +1429,60 @@ tests/fake-claude, its notes pushed onto NOTES."
   (let ((event (first (ai::parse-claude-event
                        "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"gone\",\"errors\":[\"No conversation found with session ID: gone\"]}"))))
     (is string= "No conversation found with session ID: gone" (ai::event-text event)))
-  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
-      (skip "python3 is needed for the fake Claude" (true t))
-      (with-fake-claude (agent directory notes)
-        (let ((results nil))
-          (ai::agent-resume-conversation agent "gone")
-          (ai:agent-submit agent "the task" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () results)))
-          ;; It says so, and the same task carries on in a new conversation.
-          (is equal '(("fresh reply" nil)) results)
-          (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
-          (let ((handle (ai::agent-conversation-handle agent)))
-            (true handle)
-            (isnt equal "gone" handle))
-          (is = 2 (length (uiop:read-file-lines (merge-pathnames "args" directory))))))))
+  (with-fake-claude (agent directory notes)
+    (let ((results nil))
+      (ai::agent-resume-conversation agent "gone")
+      (ai:agent-submit agent "the task" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () results)))
+      ;; It says so, and the same task carries on in a new conversation.
+      (is equal '(("fresh reply" nil)) results)
+      (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
+      (let ((handle (ai::agent-conversation-handle agent)))
+        (true handle)
+        (isnt equal "gone" handle))
+      (is = 2 (length (uiop:read-file-lines (merge-pathnames "args" directory)))))))
 
 (define-test claude-resume-missing-session-steered
     :parent agent-duet
-  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
-      (skip "python3 is needed for the fake Claude" (true t))
-      (with-fake-claude (agent directory notes)
-        (let ((results nil))
-          (touch directory "expect-steer")
-          (ai::agent-resume-conversation agent "gone")
-          (ai:agent-submit agent "the task" (lambda (text error) (push (list text error) results)))
-          ;; Sent while the resume is still pending: the new conversation gets it too.
-          (ai:agent-send-now agent "and this")
-          (true (wait-until (lambda () results)))
-          (is equal '(("fresh reply: the task + and this" nil)) results)))))
+  (with-fake-claude (agent directory notes)
+    (let ((results nil))
+      (touch directory "expect-steer")
+      (ai::agent-resume-conversation agent "gone")
+      (ai:agent-submit agent "the task" (lambda (text error) (push (list text error) results)))
+      ;; Sent while the resume is still pending: the new conversation gets it too.
+      (ai:agent-send-now agent "and this")
+      (true (wait-until (lambda () results)))
+      (is equal '(("fresh reply: the task + and this" nil)) results))))
 
 (define-test codex-resume-conversation
     :parent agent-duet
-  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
-      (skip "python3 is needed for the fake Codex" (true t))
-      (with-fake-codex (agent directory)
-        (let ((results nil))
-          (ai::agent-resume-conversation agent "thread-old")
-          (is equal "thread-old" (ai::agent-conversation-handle agent))
-          (ai:agent-submit agent "carry on" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () results)))
-          (is equal '(("hi" nil)) results)
-          (true (member "thread/resume" (fake-log directory) :test #'string=))
-          (false (member "thread/start" (fake-log directory) :test #'string=))
-          (is equal "thread-old" (ai::agent-conversation-handle agent))))))
+  (with-fake-codex (agent directory)
+    (let ((results nil))
+      (ai::agent-resume-conversation agent "thread-old")
+      (is equal "thread-old" (ai::agent-conversation-handle agent))
+      (ai:agent-submit agent "carry on" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () results)))
+      (is equal '(("hi" nil)) results)
+      (true (member "thread/resume" (fake-log directory) :test #'string=))
+      (false (member "thread/start" (fake-log directory) :test #'string=))
+      (is equal "thread-old" (ai::agent-conversation-handle agent)))))
 
 (define-test codex-resume-missing-thread
     :parent agent-duet
-  (if (null (ignore-errors (uiop:run-program '("python3" "--version") :output :string)))
-      (skip "python3 is needed for the fake Codex" (true t))
-      (with-fake-codex (agent directory)
-        (let ((results nil) (notes nil))
-          (setf (ai:agent-listener agent)
-                (lambda (agent kind &key text &allow-other-keys)
-                  (declare (ignore agent))
-                  (when (eq kind :note) (push text notes))))
-          (touch directory "fail-resume")
-          (ai::agent-resume-conversation agent "thread-gone")
-          (ai:agent-submit agent "carry on" (lambda (text error) (push (list text error) results)))
-          (true (wait-until (lambda () results)))
-          ;; It says so, and carries on in a new thread.
-          (is equal '(("hi" nil)) results)
-          (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
-          (is equal "thread-1" (ai::agent-conversation-handle agent))))))
+  (with-fake-codex (agent directory)
+    (let ((results nil) (notes nil))
+      (setf (ai:agent-listener agent)
+            (lambda (agent kind &key text &allow-other-keys)
+              (declare (ignore agent))
+              (when (eq kind :note) (push text notes))))
+      (touch directory "fail-resume")
+      (ai::agent-resume-conversation agent "thread-gone")
+      (ai:agent-submit agent "carry on" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () results)))
+      ;; It says so, and carries on in a new thread.
+      (is equal '(("hi" nil)) results)
+      (true (find-if (lambda (n) (search "Couldn't resume" n)) notes))
+      (is equal "thread-1" (ai::agent-conversation-handle agent)))))
 
 ;;; Separate worktrees, in a real repository
 

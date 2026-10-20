@@ -2384,6 +2384,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
   "Run the application; returns when its window closes. DIRECTORY is where
 the agents work (by default, the last folder used, or else the current
 directory). On macOS it must run on the first thread: in Cadre, use Run GTK App."
+  (when (member "--review-hook" (rest sb-ext:*posix-argv*) :test #'string=)
+    (run-review-hook))
   (load-settings)
   (setf *directory* (and directory (uiop:ensure-directory-pathname directory)))
   (let ((app (adw:application-new "org.example.agent_duet" '(:default-flags))))
