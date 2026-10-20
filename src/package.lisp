@@ -10,7 +10,7 @@
    ;; workflows
    #:workflow #:start-workflow #:stop-workflow #:workflow-state #:workflow-loops
    #:workflow-continuable-p #:continue-workflow #:approve-plan #:workflow-pending-plan
-   #:review-verdict #:parse-plan
+   #:review-verdict #:parse-plan #:workflow-completion #:commit-workflow-changes
    ;; settings
    #:*claude-program* #:*claude-model* #:*codex-program* #:*codex-model* #:*default-max-rounds*
    ;; snapshots and changes window

@@ -60,7 +60,12 @@
 (defparameter *default-max-rounds* 3)
 
 (defclass workflow ()
-  ((check-command :initarg :check-command :initform nil :reader workflow-check-command)
+  ((completion :initform nil :accessor workflow-completion-data)
+   (completion-state :initform nil :accessor workflow-completion-state)
+   (repository-start :initform nil :accessor workflow-repository-start)
+   (completion-error :initform nil :accessor workflow-completion-error)
+   (commit-hash :initform nil :accessor workflow-commit-hash)
+   (check-command :initarg :check-command :initform nil :reader workflow-check-command)
    (mode :initarg :mode :initform :review :reader workflow-mode)
    (lead :initarg :lead :reader workflow-lead)
    (partner :initarg :partner :reader workflow-partner)
@@ -162,7 +167,9 @@ and the agents are still where it finished."
 unapproved has its author address the last review. True if it carried on."
   (when (workflow-continuable-p workflow)
     (let ((loops (remove-if-not #'continuable-loop-p (workflow-loops workflow))))
-      (setf (workflow-state workflow) :running)
+      (setf (workflow-state workflow) :running
+            (workflow-completion-data workflow) nil
+            (workflow-completion-error workflow) nil)
       (incf (workflow-max-rounds workflow) rounds)
       (note workflow "Carrying on for up to ~d more round~:p." rounds)
       ;; All are set working before any starts, so the first to finish
@@ -574,7 +581,12 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
 ;;; Running
 
 (defun start-workflow (workflow)
-  (setf (workflow-state workflow) :running)
+  (setf (workflow-state workflow) :running
+        (workflow-completion-data workflow) nil
+        (workflow-completion-error workflow) nil
+        (workflow-commit-hash workflow) nil
+        (workflow-repository-start workflow)
+        (ignore-errors (repository-state (agent-directory (workflow-lead workflow)))))
   (let ((lead (workflow-lead workflow))
         (partner (workflow-partner workflow))
         (request (workflow-request workflow)))
@@ -867,6 +879,7 @@ still open, and is asked once to settle them (that's no new round)."
            (loop-work workflow loop (fix-prompt loop text))))))
 
 (defun loop-failed (workflow loop why)
+  (setf (workflow-completion-error workflow) why)
   (update-loop-state workflow loop :failed)
   (note workflow "~a" why)
   (check-finished workflow))
@@ -905,15 +918,18 @@ still open, and is asked once to settle them (that's no new round)."
               collect (format nil "~@[~a ~]~a~[~:;, ~:*~d finding~:p open~]" (loop-label l)
                               (loop-outcome l) (count-findings (loop-findings l) :open))))
   (note-retained-worktrees workflow)
+  (capture-workflow-completion workflow)
   (when (workflow-on-finish workflow)
     (funcall (workflow-on-finish workflow) workflow)))
 
 (defun fail (workflow fmt &rest args)
   (cancel-workflow-checks workflow)
+  (setf (workflow-completion-error workflow) (apply #'format nil fmt args))
   (apply #'note workflow fmt args)
   (leave-worktrees workflow)
   (setf (workflow-state workflow) :finished)
   (note-retained-worktrees workflow)
+  (capture-workflow-completion workflow)
   (when (workflow-on-finish workflow)
     (funcall (workflow-on-finish workflow) workflow)))
 
@@ -932,6 +948,7 @@ still open, and is asked once to settle them (that's no new round)."
     (note workflow "Stopped.")
     (leave-worktrees workflow)
     (note-retained-worktrees workflow)
+    (capture-workflow-completion workflow)
     (when (workflow-on-finish workflow)
       (funcall (workflow-on-finish workflow) workflow))))
 
@@ -1232,3 +1249,108 @@ worktrees are kept, with their branches."
 the worktrees are kept: ~{~a~^, ~}."
         why (and trees (ignore-errors (worktree-branch (first trees))))
         (mapcar (lambda (e) (namestring (cdr e))) (reverse (workflow-trees workflow)))))
+
+;;; Completion cards and explicit user commits. The callback remains (WORKFLOW).
+(defun capture-workflow-completion (workflow)
+  (let* ((loops (workflow-loops workflow))
+         (final (or (and (workflow-merged-loop workflow)
+                        (list (workflow-merged-loop workflow))) loops))
+         (outcome (cond ((eq (workflow-state workflow) :stopped) :stopped)
+                        ((or (workflow-completion-error workflow)
+                             (some (lambda (l) (eq (loop-state l) :failed)) loops)
+                             (null final)) :failed)
+                        ((every (lambda (l) (eq (loop-state l) :approved)) final) :approved)
+                        ((some (lambda (l) (eq (loop-state l) :unresolved)) final) :unresolved)
+                        (t :unreviewed))))
+    (setf (workflow-completion-state workflow)
+          (ignore-errors (repository-state
+                          (or (workflow-home workflow)
+                              (agent-directory (workflow-lead workflow)))))
+          (workflow-completion-data workflow)
+          (list :outcome outcome :review-status outcome
+                :summary (or (workflow-completion-error workflow)
+                             (let ((summaries (remove-if
+                                               (lambda (text) (or (null text) (zerop (length text))))
+                                               (mapcar #'loop-summary final))))
+                               (if summaries (format nil "~{~a~^~%~%~}" summaries)
+                                   (if (eq outcome :stopped) "Work was stopped."
+                                       "No work summary was returned."))))
+                :check-status (cond ((some #'loop-check-failed loops) :failed)
+                                    ((some #'loop-check-report loops) :passed)
+                                    (t :not-run))))))
+
+(defun workflow-commit-reason (workflow)
+  "NIL when eligible; otherwise a user-facing reason. Always rechecks Git."
+  (let* ((start (workflow-repository-start workflow))
+         (end (workflow-completion-state workflow))
+         (root (getf end :root)))
+    (cond
+      ((not (eq (workflow-state workflow) :finished)) "The work is not finished.")
+      ((workflow-commit-hash workflow) "These changes have already been committed.")
+      ((not (eq (getf (workflow-completion-data workflow) :outcome) :approved))
+       "The work has not been approved.")
+      ((eq (getf (workflow-completion-data workflow) :check-status) :failed)
+       "The configured checks failed.")
+      ((or (agent-busy (workflow-lead workflow)) (agent-busy (workflow-partner workflow)))
+       "An agent is still working.")
+      ((or (null start) (null end)) "No supported Git repository was captured.")
+      ((not (equal (getf start :root) root)) "The repository changed during the work.")
+      ((plusp (length (getf start :status))) "The repository had tracked edits or untracked files before this work. Start with a clean repository to use this commit action.")
+      ((repository-operation-p root) "Finish the repository's merge, rebase or other Git operation first.")
+      ((not (equal end (repository-state root)))
+       "The repository changed after completion. Review the current changes before committing.")
+      ((zerop (length (getf end :status))) "There are no uncommitted changes.")
+      (t nil))))
+
+(defun workflow-completion (workflow)
+  "Completion plist for the UI, or NIL before completion. Eligibility is live.
+Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
+:CAN-COMMIT, :COMMIT-REASON, :CLEAN and :COMMIT-HASH. Does not stage or commit."
+  (when (workflow-completion-data workflow)
+    (let ((reason (handler-case (workflow-commit-reason workflow)
+                    (error (e) (format nil "Cannot inspect the repository: ~a" e)))))
+      (append (copy-list (workflow-completion-data workflow))
+              (list :repository (getf (workflow-completion-state workflow) :root)
+                    :can-commit (null reason) :commit-reason reason
+                    :clean (let ((root (getf (workflow-completion-state workflow) :root)))
+                             (and root (ignore-errors
+                                         (zerop (length (worktree-git root "status" "--porcelain=v1"
+                                                                      "--untracked-files=all"))))))
+                    :commit-hash (workflow-commit-hash workflow))))))
+
+(defun commit-workflow-changes (workflow &key message)
+  "User action only. Commit the captured approved edits if still current.
+Return a plist with :STATUS (:COMMITTED, :CLEAN or :ERROR), :MESSAGE and :COMMIT.
+Git hook/identity errors are returned; a failed commit restores the prior index."
+  (handler-case
+      (let* ((reason (workflow-commit-reason workflow))
+             (end (workflow-completion-state workflow))
+             (root (getf end :root)))
+        (when reason
+          (return-from commit-workflow-changes
+            (list :status (if (and root (not (workflow-commit-hash workflow))
+                                  (eq (workflow-state workflow) :finished)
+                                  (equal end (repository-state root))
+                                  (zerop (length (getf end :status)))) :clean :error)
+                  :message reason :commit nil)))
+        (let ((message (or message (format nil "Agent Duet: ~a" (workflow-request workflow)))))
+          (when (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) message)))
+            (error "The commit message must not be empty."))
+          ;; Explicit action, after comparing HEAD, branch, index and file contents.
+          (let ((index-tree (worktree-git-line root "write-tree"))
+                (head (getf end :head))
+                (committed nil))
+            (unwind-protect
+                 (progn (worktree-git root "add" "-A")
+                        (worktree-git root "commit" "-m" message)
+                        (setf committed t))
+              ;; Restore staging after hook/identity/signing failures. Keep any
+              ;; hook edits in the working tree. Never reset an advanced HEAD.
+              (when (and (not committed)
+                         (string= head (worktree-git-line root "rev-parse" "HEAD")))
+                (worktree-git root "read-tree" index-tree))))
+          (let ((hash (worktree-git-line root "rev-parse" "HEAD")))
+            (setf (workflow-commit-hash workflow) hash)
+            (list :status :committed :message (format nil "Committed changes (~a)." (subseq hash 0 12))
+                  :commit hash))))
+    (error (e) (list :status :error :message (format nil "Could not commit changes: ~a" e) :commit nil))))

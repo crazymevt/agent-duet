@@ -145,3 +145,63 @@ Each ref is deleted only if unchanged since read. Return the number deleted."
     (loop for (ref . object) in refs
           do (worktree-git repo-directory "update-ref" "-d" ref object))
     (length refs)))
+
+;;; Read-only state used to bind a user-triggered commit to completed work.
+(defun repository-file-state (root path)
+  (let* ((file (merge-pathnames (uiop:parse-native-namestring path) root))
+         (mode (sb-posix:stat-mode (sb-posix:lstat file)))
+         (type (logand mode sb-posix:s-ifmt)))
+    (list path mode
+          (cond ((= type sb-posix:s-iflnk) (sb-posix:readlink file))
+                ((= type sb-posix:s-ifreg) nil) ; filled by the batch hasher
+                (t (error "Cannot safely capture untracked file ~a." path))))))
+
+(defun git-input-path (path)
+  "C-quote PATH for Git's --stdin-paths, including embedded newlines."
+  (with-output-to-string (out)
+    (write-char #\" out)
+    (loop for char across path
+          do (cond ((find char '(#\\ #\")) (write-char #\\ out) (write-char char out))
+                   ((< (char-code char) 32) (format out "\\~3,'0o" (char-code char)))
+                   (t (write-char char out))))
+    (write-char #\" out)))
+
+(defun repository-untracked-state (root)
+  "One hash-object process for all regular untracked files; lstat keeps modes and links."
+  (let* ((files (loop for path in (uiop:split-string
+                                  (worktree-git root "ls-files" "--others" "--exclude-standard" "-z")
+                                  :separator '(#\Null))
+                      unless (string= path "") collect (repository-file-state root path)))
+         (regular (remove-if #'third files)))
+    (when regular
+      (multiple-value-bind (output errors status)
+          (uiop:run-program
+           (list "git" "-C" (namestring root) "hash-object" "--stdin-paths")
+           :input (make-string-input-stream
+                   (format nil "~{~a~%~}" (mapcar (lambda (file) (git-input-path (first file))) regular)))
+           :output :string :error-output :string :ignore-error-status t)
+        (unless (zerop status) (error "Cannot hash untracked files: ~a" errors))
+        (let ((hashes (remove "" (uiop:split-string output :separator '(#\Newline)) :test #'equal)))
+          (unless (= (length hashes) (length regular)) (error "Incomplete untracked file hashes."))
+          (loop for file in regular for hash in hashes do (setf (third file) hash)))))
+    files))
+
+(defun repository-state (directory)
+  "Capture HEAD, branch, index, tracked edits and untracked contents without staging."
+  (let ((root (uiop:ensure-directory-pathname
+               (uiop:parse-native-namestring (worktree-git-line directory "rev-parse" "--show-toplevel")))))
+    (list :root root
+          :head (worktree-git-line root "rev-parse" "HEAD")
+          :branch (worktree-git-line root "rev-parse" "--symbolic-full-name" "HEAD")
+          :status (worktree-git root "status" "--porcelain=v1" "-z" "--untracked-files=all")
+          :index (worktree-git root "diff" "--cached" "--binary" "HEAD" "--")
+          :working (worktree-git root "diff" "--binary" "--")
+          :untracked (repository-untracked-state root))))
+
+(defun repository-operation-p (directory)
+  (or (plusp (length (worktree-git directory "ls-files" "--unmerged")))
+      (some (lambda (name)
+              (probe-file (merge-pathnames
+                           (worktree-git-line directory "rev-parse" "--git-path" name)
+                           (uiop:ensure-directory-pathname directory))))
+            '("MERGE_HEAD" "CHERRY_PICK_HEAD" "REVERT_HEAD" "rebase-merge" "rebase-apply" "BISECT_LOG"))))
