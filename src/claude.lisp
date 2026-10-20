@@ -136,7 +136,8 @@ then the copy inside the Claude desktop app.")
 ;;; The command line
 
 (defun claude-arguments (&key session-id resume model effort mcp-config permission-tool permission-mode
-                              allowed-tools disallowed-tools system-prompt isolated)
+                              allowed-tools disallowed-tools system-prompt isolated
+                              tools settings setting-sources strict-mcp-config)
   "The arguments for a stream-json conversation (after the program name)."
   (append (list "-p" "--input-format" "stream-json" "--output-format" "stream-json"
                 "--verbose" "--include-partial-messages")
@@ -149,6 +150,10 @@ then the copy inside the Claude desktop app.")
           (and permission-tool (list "--permission-prompt-tool" permission-tool))
           (and disallowed-tools (list "--disallowedTools" (format nil "~{~a~^,~}" disallowed-tools)))
           (and allowed-tools (list "--allowedTools" (format nil "~{~a~^,~}" allowed-tools)))
+          (and tools (list "--tools" (format nil "~{~a~^,~}" tools)))
+          (and settings (list "--settings" settings))
+          (and setting-sources (list "--setting-sources" setting-sources))
+          (and strict-mcp-config (list "--strict-mcp-config"))
           (and system-prompt (list "--append-system-prompt" system-prompt))
           (and isolated (list "--strict-mcp-config" "--setting-sources" "project"))))
 
