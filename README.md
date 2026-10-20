@@ -129,25 +129,51 @@ If the window isn't in front, a desktop notification tells you when both
 agents finish, when one is waiting for your approval or an answer, when one
 runs out of usage, and when a plan is waiting for you.
 
-## Running out of usage
+## Pausing, stopping and recovering a task
 
-When an agent's account runs out partway through a task, its step pauses
-instead of failing, and a card in the middle pane offers:
+A step pauses, rather than failing the task, when its agent runs out of
+usage, when its turn fails, or when you pause that agent: during a task, the
+**Stop** button in an agent's pane is **Pause**, and pauses only that
+agent's part. Work that doesn't depend on it carries on; work that does
+waits. The middle pane's **Stop** stops both agents, but the task can still
+be carried on. A card in the middle pane offers:
 
-- **Wait until 3:05 PM** (when the reset time is known): it's sent to the
-  same agent again a minute after its usage resets. Leave the app open.
-- **Try again**: send it again now.
-- **Let ChatGPT take over** (or Claude): the other agent picks up the work
-  where it stopped. It won't be reviewed, since the reviewer is the one out,
-  and the conversation says so. If it was a review that paused, this button is
-  **Finish unreviewed**: that part is done, marked as not reviewed. If it was
-  a proposal, it's **Go without it**: the lead plans from the other proposal,
-  or, if the lead is the one out, the other carries out its own, unreviewed
-  (after you approve that, with *Approve plan*).
-- **Stop**.
+- **Wait until 3:05 PM** (out of usage, when the reset time is known): it's
+  sent to the same agent again a minute after its usage resets. Leave the
+  app open.
+- **Resume**: the agent carries on from where it stopped, shown first what
+  it had already done and what the folder looks like now.
+- **Retry step** (**Try again** when out of usage): give it the step again,
+  as it was first given.
+- **Hand off to ChatGPT** (or Claude): the other agent picks up the work
+  where it stopped. It won't be reviewed, and the conversation says so. If
+  it was a review that paused, this button is **Finish unreviewed**: that
+  part is done, marked as not reviewed. If it was a proposal, it's **Go
+  without it**.
+- **Stop task**.
 
-Nothing done so far is lost. While an agent is out, with a known reset time,
-it turns prompts away without trying; its status line says until when.
+Nothing done so far is lost: partial edits, written replies and worktrees
+stay. A hand-off or resume waits until the stopped turn, and any process it
+started, has been confirmed gone, so the same files are never edited twice;
+if that can't be confirmed within 30 seconds, nothing starts and the card
+says so.
+
+The task's state (mode, loops, rounds, findings, the steps under way,
+worktrees and merge progress) is saved with the conversation as it goes.
+Reopening a conversation whose task was interrupted (the app quit
+mid-task) or stopped shows a card with where it stopped, what had been done
+and written, each agent's availability, work no one has reviewed, and what
+the folder and worktrees look like now: changed files, new commits, a
+changed branch, a merge in progress, worktrees gone. Nothing runs until you
+choose: **Review what's there** (look again), **Resume**, **Redo the step**,
+**Hand off**, **Stop task**, or **Abandon** (it isn't offered again; nothing
+is deleted). With several steps waiting, a menu chooses which. Stopped while
+a plan waited for approval, it offers **Show the plan**; partway through
+merging the parts, **Carry on merging**, which doesn't repeat what's already
+committed or merged; with a worktree gone, **Restore worktrees** from its
+recovery refs. If the folder has changed since the task stopped, carrying
+on asks first (**Carry on anyway**). Starting a new task while one can still
+be recovered keeps the earlier one in its own conversation in History.
 
 ## A turn gone quiet
 
@@ -337,6 +363,9 @@ libraries used to build them.
   `--permission-prompt-tool stdio`, Codex through the app-server's approval
   requests).
 - `src/settings.lisp`: what's remembered between runs.
+- `src/history.lisp`: conversations kept as JSON, each with its task's last
+  checkpoint for recovery, and how a checkpoint reads on the recovery card.
+  No GTK. The checkpoint and recovery calls are in `docs/recovery-api.md`.
 - `src/usage.lisp`: both accounts' usage windows, and recognizing a turn that
   failed because one ran out.
 - `src/check.lisp`: running a folder's check command in the background.
