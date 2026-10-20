@@ -14,6 +14,13 @@ The window has three panes:
   report of work done, and each review, passed from one agent to the other.
 - **Right: ChatGPT.** The same, for Codex.
 
+**View** in the header switches to **Conversation only**: the side panes are
+hidden, and the middle pane shows each agent's approval cards and questions
+(answering one there answers that agent), with a line under its heading
+saying what each is doing: working, reviewing, running the check, waiting for
+the other or for you, paused. **All panes** brings the side panes back. The
+choice is remembered.
+
 Each side pane also has its own box for talking to that agent alone.
 While it works, press Return or **Send now** to send more instructions without
 stopping it. The agent picks them up when its protocol allows; a tool already
@@ -207,6 +214,15 @@ filter), and the one you pick's diff on the right. While a task runs, it
 shows the changes so far. It's for viewing only. The comparison is of the
 folder's contents, so edits you made in the folder while the task ran are in
 it too.
+
+When a task finishes, a summary card in the conversation gives its outcome
+(approved, not approved, done without review, failed), the check's result,
+the repository and the author's summary, with **Changes** and **Commit
+changes**. Nothing is committed until you click it, with the message in the
+box beside it (the request's first line to start with). The button is only
+enabled when the approved work's changes are still what's in the folder; when
+it isn't, the card says why (there's nothing to commit, say). The card then
+shows the commit, or why it failed.
 
 ## What they may do
 

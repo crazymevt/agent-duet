@@ -205,10 +205,13 @@
   (pane-scroll-to-end pane)
   widget)
 
+(defun pane-note-label (text &rest classes)
+  (make-instance 'gtk:label :label text :wrap t :xalign 0.0 :selectable t
+                            :wrap-mode :word-char
+                            :css-classes (or classes '("dim-label"))))
+
 (defun pane-note (pane text &rest classes)
-  (pane-append pane (make-instance 'gtk:label :label text :wrap t :xalign 0.0 :selectable t
-                                   :wrap-mode :word-char
-                                   :css-classes (or classes '("dim-label")))))
+  (pane-append pane (apply #'pane-note-label text classes)))
 
 (defun composer (input send)
   (gtk:build
@@ -259,7 +262,7 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   chips                                       ; the box showing them
   (stream-box nil) (stream-label nil) (stream-text "")
   (tools (make-hash-table :test 'equal))
-  (approvals (make-hash-table :test 'equal))  ; approval id → its card's button row
+  (approvals (make-hash-table :test 'equal))  ; approval id → its cards: (button row . widgets to disable)s
   (ready "Checking…")                         ; what the status says when the agent is idle
   (version nil)
   model-dropdown effort-dropdown
@@ -395,7 +398,7 @@ for Codex, the one marked as the default)."
       (flet ((send-it ()
                (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text input)))
                      (attachments (agent-pane-attachments pane)))
-                 (when (or (plusp (length text)) attachments)
+                 (when (and (or (plusp (length text)) attachments) (not (committing-p pane)))
                    (handler-case
                        (progn (agent-send-now agent (if (plusp (length text)) text "Take a look at these.")
                                               attachments)
@@ -485,7 +488,8 @@ for Codex, the one marked as the default)."
                                          (loop for w in windows
                                                when (window-resets-at w)
                                                collect (format nil "~a resets ~a" (window-label w)
-                                                               (format-reset-time (window-resets-at w))))))))
+                                                               (format-reset-time (window-resets-at w)))))))
+  (refresh-activity))
 
 (defun pane-set-busy (pane busy)
   (let ((agent (agent-pane-agent pane)))
@@ -506,9 +510,9 @@ for Codex, the one marked as the default)."
         (:always "Allowed for the rest of this conversation")
         (:deny "Denied"))))
 
-(defun pane-approval (pane id title text)
-  (let* ((agent (agent-pane-agent pane))
-         (buttons (make-instance 'gtk:box :spacing 6 :halign :end)))
+(defun approval-buttons (agent id)
+  "Deny, Always allow and Allow, answering AGENT's approval request ID."
+  (let ((buttons (make-instance 'gtk:box :spacing 6 :halign :end)))
     (flet ((choice (label decision classes tooltip)
              (let ((button (make-instance 'gtk:button :label label :css-classes classes :tooltip-text tooltip)))
                (gobject:connect button :clicked
@@ -517,23 +521,41 @@ for Codex, the one marked as the default)."
       (choice "Deny" :deny '("destructive-action") "Don't run it; the agent carries on without it")
       (choice "Always allow" :always '() "Allow this, and things like it, for the rest of this conversation")
       (choice "Allow" :allow '("suggested-action") "Run it this once"))
-    (pane-finish-stream pane)
-    (setf (gethash id (agent-pane-approvals pane)) buttons)
-    (pane-append pane (gtk:build
-                       (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
-                                (gtk:label :label (format nil "~a asks to run:" (agent-name agent))
-                                           :xalign 0.0 :css-classes '("heading"))
-                                (gtk:label :label title :xalign 0.0 :wrap t :wrap-mode :char :selectable t
-                                           :css-classes '("monospace"))
-                                (gtk:label :label (or text "") :xalign 0.0 :wrap t :visible (and text (plusp (length text)) t)
-                                           :css-classes '("dim-label"))
-                                buttons)))
-    (pane-update-status pane)
-    (attention (format nil "~a needs your approval" (agent-name agent)) title :sound t)
-    (when (workflow-running-p)
-      (pane-note *middle* (format nil "~a is waiting for you to approve a command (~a pane)." (agent-name agent)
-                                  (if (eq (agent-id agent) :claude) "left" "right"))
-                 "warning" "duet-note"))))
+    buttons))
+
+(defun approval-heading (agent text)
+  "A card's heading, saying which agent it's for (in its color, in the conversation)."
+  (make-instance 'gtk:label :label text :xalign 0.0 :css-classes (list "heading" (agent-css-class agent))))
+
+(defun pane-approval (pane id title text)
+  "The approval card, in the agent's pane and, for the conversation-only
+view, in the conversation; either answers it, and both show the answer."
+  (let ((agent (agent-pane-agent pane)))
+    (flet ((card ()
+             (let ((buttons (approval-buttons agent id)))
+               (push (list buttons) (gethash id (agent-pane-approvals pane)))
+               (gtk:build
+                (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                         (approval-heading agent (format nil "~a asks to run:" (agent-name agent)))
+                         (gtk:label :label title :xalign 0.0 :wrap t :wrap-mode :char :selectable t
+                                    :css-classes '("monospace"))
+                         (gtk:label :label (or text "") :xalign 0.0 :wrap t :visible (and text (plusp (length text)) t)
+                                    :css-classes '("dim-label"))
+                         buttons)))))
+      (pane-finish-stream pane)
+      (pane-append pane (card))
+      (pane-append *middle* (view-only :conversation (card)))
+      (pane-update-status pane)
+      (attention (format nil "~a needs your approval" (agent-name agent)) title :sound t)
+      (when (workflow-running-p)
+        (pane-append *middle*
+                     (view-only :panes
+                                (pane-note-label (format nil "~a is waiting for you to approve a command (~a pane)."
+                                                         (agent-name agent) (agent-side agent))
+                                                 "warning" "duet-note")))))))
+
+(defun agent-side (agent)
+  (if (eq (agent-id agent) :claude) "left" "right"))
 
 (defun question-choices (question)
   "Widgets for one of AskUserQuestion's QUESTIONS, and a function giving the
@@ -578,15 +600,16 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
                 (cons other (mapcar #'car checks))
                 entry)))))
 
-(defun pane-question (pane id questions)
+(defun question-card (pane id questions)
+  "A card for AGENT's QUESTIONS, registered with PANE's approvals so the
+answer settles it, wherever it was given."
   (let* ((agent (agent-pane-agent pane))
          (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
          (submit (make-instance 'gtk:button :label "Submit" :css-classes '("suggested-action") :sensitive nil))
          (skip (make-instance 'gtk:button :label "Skip" :tooltip-text "Don't answer; the agent carries on without it"))
          (card (gtk:build (gtk:box :orientation :vertical :spacing 10 :css-classes '("duet-approval")
-                                   (gtk:label :label (format nil "~a has ~:[a question~;questions~]:" (agent-name agent)
-                                                             (rest questions))
-                                              :xalign 0.0 :css-classes '("heading")))))
+                                   (approval-heading agent (format nil "~a has ~:[a question~;questions~]:"
+                                                                   (agent-name agent) (rest questions))))))
          (answers '())
          (boxes '()))
     (labels ((answers ()
@@ -599,7 +622,6 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
                (declare (ignore ignore))
                (gtk:widget-set-sensitive submit (and (answers) t)))
              (finish (decision)
-               (dolist (box boxes) (gtk:widget-set-sensitive box nil))
                (agent-answer-approval agent id decision)))
       (dolist (question questions)
         (multiple-value-bind (box answer checks entry) (question-choices question)
@@ -617,23 +639,33 @@ answer chosen (nil when none): the chosen labels, or what was typed in Other."
     (gtk:box-append buttons skip)
     (gtk:box-append buttons submit)
     (gtk:box-append card buttons)
+    (push (cons buttons boxes) (gethash id (agent-pane-approvals pane)))
+    card))
+
+(defun pane-question (pane id questions)
+  (let ((agent (agent-pane-agent pane)))
     (pane-finish-stream pane)
-    (setf (gethash id (agent-pane-approvals pane)) buttons)
-    (pane-append pane card)
+    (pane-append pane (question-card pane id questions))
+    (pane-append *middle* (view-only :conversation (question-card pane id questions)))
     (pane-update-status pane)
     (attention (format nil "~a has a question" (agent-name agent)) "It's waiting for your answer." :sound t)
     (when (workflow-running-p)
-      (pane-note *middle* (format nil "~a is waiting for you to answer a question (~a pane)." (agent-name agent)
-                                  (if (eq (agent-id agent) :claude) "left" "right"))
-                 "warning" "duet-note"))))
+      (pane-append *middle*
+                   (view-only :panes
+                              (pane-note-label (format nil "~a is waiting for you to answer a question (~a pane)."
+                                                       (agent-name agent) (agent-side agent))
+                                               "warning" "duet-note"))))))
 
 (defun pane-approval-answered (pane id decision)
-  (let ((buttons (gethash id (agent-pane-approvals pane))))
-    (when buttons
+  "Settle every card for approval ID: the buttons give way to the answer."
+  (let ((cards (gethash id (agent-pane-approvals pane))))
+    (when cards
       (remhash id (agent-pane-approvals pane))
-      (clear-box buttons)
-      (gtk:box-append buttons (make-instance 'gtk:label :label (decision-text decision)
-                                             :css-classes (if (eq decision :deny) '("error") '("dim-label"))))
+      (loop for (buttons . boxes) in cards
+            do (dolist (box boxes) (gtk:widget-set-sensitive box nil))
+               (clear-box buttons)
+               (gtk:box-append buttons (make-instance 'gtk:label :label (decision-text decision)
+                                                      :css-classes (if (eq decision :deny) '("error") '("dim-label")))))
       (pane-update-status pane))))
 
 (defun pane-finish-stream (pane)
@@ -1074,6 +1106,8 @@ comes without one (a turn stopped as the folder changes) isn't kept."
      ;; A snapshot of the loop's tasks and findings; replay also accepts
      ;; earlier conversations' "Review checklist".
      (show-checklist text)
+     ;; A loop's state has changed: working, checking, reviewing…
+     (refresh-activity)
      (record :middle :text (format nil "Task checklist~%~%~a" text))
      (save-current-history))
     ((eq kind :check)
@@ -1133,7 +1167,110 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                                 (t (format nil "Working · ~{~a~^, ~}"
                                            (or (loop for a in (list *claude* *codex*)
                                                      when (agent-busy a) collect (agent-name a))
-                                               '("waiting")))))))))
+                                               '("waiting")))))))
+    (refresh-activity)))
+
+;;; The view: all three panes, or the conversation alone
+
+(defvar *view* :panes
+  ":panes shows each agent's pane beside the conversation; :conversation
+shows the conversation alone, with the agents' approvals and questions in it,
+and a line saying what each is doing.")
+
+(defparameter *views* '((:panes "All panes") (:conversation "Conversation only")))
+
+(defvar *view-only* '() "(widget . view)s: shown only in that view.")
+
+(defun view-only (view widget)
+  "Show WIDGET only in VIEW. Returns WIDGET."
+  ;; Widgets gone from their pane (a new conversation) are forgotten.
+  (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
+  (push (cons widget view) *view-only*)
+  (gtk:widget-set-visible widget (eq view *view*))
+  widget)
+
+(defun set-view (view)
+  "Show VIEW (see *VIEW*), and remember it."
+  (let ((view (if (assoc view *views*) view :panes))
+        (claude (control :claude-widget))
+        (codex (control :codex-widget))
+        (agent-split (control :agent-split))
+        (conversation-split (control :conversation-split)))
+    (setf (setting :view) view)
+    (unless (eq view *view*)
+      (when (and agent-split (eq view :conversation))
+        ;; Where the dividers were, to put them back.
+        (setf (getf *controls* :pre-view-positions)
+              (list (gtk:paned-get-position agent-split) (gtk:paned-get-position conversation-split))))
+      (setf *view* view)
+      (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
+      (loop for (widget . only) in *view-only*
+            do (gtk:widget-set-visible widget (eq only view)))
+      (when claude
+        (gtk:widget-set-visible claude (eq view :panes))
+        (gtk:widget-set-visible codex (eq view :panes))
+        (when (eq view :panes)
+          (let ((saved (control :pre-view-positions))
+                (width (gtk:widget-get-width agent-split)))
+            (cond (saved
+                   (gtk:paned-set-position agent-split (first saved))
+                   (gtk:paned-set-position conversation-split (second saved)))
+                  ;; Started in the conversation-only view: no layout yet.
+                  ((plusp width)
+                   (gtk:paned-set-position agent-split (round (* width 0.30)))
+                   (gtk:paned-set-position conversation-split (round (* width 0.42))))))
+          (remf *controls* :pre-view-positions)))
+      (let ((strip (control :activity)))
+        (when strip (gtk:widget-set-visible strip (eq view :conversation))))
+      (refresh-activity))))
+
+(defun agent-activity (agent)
+  "What AGENT is doing, in a few words, for the conversation-only view:
+its part in the task (working, reviewing, waiting…), or its own status."
+  (let* ((pane (agent-pane-of agent))
+         (workflow (and (workflow-agent-p *workflow* agent) *workflow*))
+         (loops (and workflow (workflow-loops workflow))))
+    (flet ((in (role state)
+             (find-if (lambda (l) (and (eq (loop-state l) state) (eq (funcall role l) agent))) loops)))
+      (let ((working (in #'loop-author :working)))
+        (cond ((not workflow) (gtk:label-get-text (pane-status pane)))
+              ((plusp (hash-table-count (agent-pane-approvals pane))) "Waiting for you")
+              ((find agent (workflow-paused workflow) :key #'step-agent) "Paused: out of usage")
+              ((in #'loop-reviewer :reviewing) "Reviewing")
+              (working (if (plusp (loop-round working)) "Addressing the review" "Working"))
+              ((in #'loop-author :checking) "Running the check")
+              ((agent-busy agent) (if loops "Working" "Planning"))
+              ((workflow-pending-plan workflow) "Waiting for you to approve the plan")
+              (t (let ((other (other-agent workflow agent)))
+                   (if (agent-busy other) (format nil "Waiting for ~a" (agent-name other)) "Waiting"))))))))
+
+(defun refresh-activity ()
+  "Bring the conversation-only view's status line up to date."
+  (when (and (eq *view* :conversation) (control :claude-activity) *panes*)
+    (loop for (agent . name) in (list (cons *claude* :claude-activity) (cons *codex* :codex-activity))
+          for label = (control name)
+          for text = (agent-activity agent)
+          do (gtk:label-set-text label text)
+             (gtk:widget-set-tooltip-text label (gtk:widget-get-tooltip-text (pane-status (agent-pane-of agent))))
+             (gtk:widget-set-css-classes label (if (or (search "Waiting for you" text) (search "usage" text))
+                                                   '("warning") '("dim-label"))))))
+
+(defun make-activity-strip ()
+  "The line under the conversation's heading saying what each agent is
+doing, shown in the conversation-only view."
+  (let ((claude (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")))
+        (codex (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label"))))
+    (let ((strip (gtk:build
+                  (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-bottom 6 :homogeneous t
+                           (gtk:box :spacing 6
+                                    (gtk:label :label (agent-name *claude*) :css-classes (list "caption-heading" (agent-css-class *claude*)))
+                                    claude)
+                           (gtk:box :spacing 6
+                                    (gtk:label :label (agent-name *codex*) :css-classes (list "caption-heading" (agent-css-class *codex*)))
+                                    codex)))))
+      (gtk:widget-set-visible strip (eq *view* :conversation))
+      (setf *controls* (list* :activity strip :claude-activity claude :codex-activity codex *controls*))
+      strip)))
 
 ;;; A step paused because its agent ran out of usage
 
@@ -1287,7 +1424,7 @@ event or Codex's stderr too) clears the stall, so a card can't outlive it."
 Interrupt and retry, or Stop. In the conversation during a task, in the
 agent's pane otherwise."
   (let* ((workflow (and (workflow-agent-p *workflow* agent) *workflow*))
-         (pane (if workflow *middle* (agent-pane-of agent)))
+         (pane (if (or workflow (eq *view* :conversation)) *middle* (agent-pane-of agent)))
          (token (agent-turn-token agent))
          (name (agent-name agent))
          (buttons (make-instance 'gtk:box :spacing 6 :halign :end))
@@ -1405,33 +1542,186 @@ that's still waiting (its agents have stopped by now)."
       (when (finish-task-end task)
         (glib:timeout-add-seconds glib:+priority-default+ 1 (lambda () (finish-task-end task)))))))
 
-(defun show-task-changes ()
-  "The Changes window for the latest task: from its start to its end, or
-to now while it runs (or is still stopping)."
-  (let ((task *task-changes*))
-    (if (null task)
-        (pane-note *middle* "No task has run yet. Changes shows what the latest task changed in the folder."
-                   "dim-label" "duet-note")
-        (let ((directory (task-changes-directory task)))
-          (multiple-value-bind (kind start end) (task-changes-range task)
-            (ecase kind
-              (:unrecorded
-               (pane-note *middle* "The latest task's changes weren't recorded: its folder isn't a git repository with a commit, or recording failed."
-                          "dim-label" "duet-note"))
-              (:failed
-               (pane-note *middle* "The latest task's final state couldn't be recorded, so its changes can't be shown."
-                          "dim-label" "duet-note"))
-              (:final
-               (show-changes-window directory start end :title (format nil "Changes · ~a" (folder-label directory))))
-              (:live
-               ;; Recorded off the GTK thread; the window has read what it
-               ;; shows once it's closed.
-               (show-changes-window directory start
-                                    (lambda () (task-snapshot task (format nil "now-~a" (subseq (make-uuid) 0 8))))
-                                    :title (format nil "Changes so far · ~a" (folder-label directory))
-                                    :on-close (lambda (now)
-                                                (when now
-                                                  (ignore-errors (funcall *task-snapshot-delete* directory now))))))))))))
+(defun show-task-changes (&optional (task *task-changes*))
+  "The Changes window for TASK (TASK-CHANGES), by default the latest: from
+its start to its end, or to now while it runs (or is still stopping)."
+  (if (null task)
+      (pane-note *middle* "No task has run yet. Changes shows what the latest task changed in the folder."
+                 "dim-label" "duet-note")
+      (let ((directory (task-changes-directory task)))
+        (multiple-value-bind (kind start end) (task-changes-range task)
+          (ecase kind
+            (:unrecorded
+             (pane-note *middle* "The latest task's changes weren't recorded: its folder isn't a git repository with a commit, or recording failed."
+                        "dim-label" "duet-note"))
+            (:failed
+             (pane-note *middle* "The latest task's final state couldn't be recorded, so its changes can't be shown."
+                        "dim-label" "duet-note"))
+            (:final
+             (show-changes-window directory start end :title (format nil "Changes · ~a" (folder-label directory))))
+            (:live
+             ;; Recorded off the GTK thread; the window has read what it
+             ;; shows once it's closed.
+             (show-changes-window directory start
+                                  (lambda () (task-snapshot task (format nil "now-~a" (subseq (make-uuid) 0 8))))
+                                  :title (format nil "Changes so far · ~a" (folder-label directory))
+                                  :on-close (lambda (now)
+                                              (when now
+                                                (ignore-errors (funcall *task-snapshot-delete* directory now)))))))))))
+
+;;; The summary card: how a task ended, and Commit (workflow.lisp's
+;;; WORKFLOW-COMPLETION and COMMIT-WORKFLOW-CHANGES)
+
+(defparameter *summary-expanded-length* 1500
+  "A summary longer than this many characters starts folded.")
+
+(defun outcome-text (outcome)
+  (case outcome
+    (:approved "Approved")
+    (:unresolved "Not approved")
+    (:unreviewed "Done without review")
+    (:stopped "Stopped")
+    (t "Failed")))
+
+(defun check-status-text (status)
+  (case status
+    (:passed "Check passed")
+    (:failed "Check failed")
+    (t nil)))
+
+(defun default-commit-message (workflow)
+  "The request's first line, short enough for a commit's subject."
+  (let* ((request (string-trim '(#\Space #\Tab #\Newline) (workflow-request workflow)))
+         (line (string-trim " " (subseq request 0 (or (position #\Newline request) (length request))))))
+    (if (> (length line) 72)
+        (format nil "~a…" (string-right-trim " " (subseq line 0 71)))
+        line)))
+
+(defvar *committing* nil
+  "True while a summary card's commit runs: no agent work starts meanwhile,
+so none of it can get into the commit.")
+
+(defun committing-p (pane)
+  "True, saying so in PANE, while a commit runs."
+  (when *committing*
+    (pane-note pane "Wait for the commit to finish first." "error")
+    t))
+
+(defun in-background (name work done)
+  "Call WORK off the GTK thread (it runs git), then DONE with its value, or
+nil and the error's message, back on it."
+  (sb-thread:make-thread
+   (lambda ()
+     (multiple-value-bind (value why)
+         (handler-case (values (funcall work) nil)
+           (error (e) (values nil (princ-to-string e))))
+       (deliver (lambda () (funcall done value why)))))
+   :name name))
+
+(defun show-summary-card (workflow)
+  "A card in the conversation saying how WORKFLOW ended: its outcome, check
+and summary, with Changes and, when the work can be committed, Commit changes."
+  (let* ((heading (make-instance 'gtk:label :label "Work finished" :xalign 0.0 :css-classes '("heading")))
+         (facts (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("dim-label") :label "Checking the repository…"))
+         (body (make-instance 'gtk:box :orientation :vertical :spacing 6))
+         (status (make-instance 'gtk:label :xalign 0.0 :wrap t :wrap-mode :word-char :selectable t :visible nil))
+         (message-entry (make-instance 'gtk:entry :hexpand t :visible nil :text (default-commit-message workflow)
+                                 :placeholder-text "Commit message"
+                                 :tooltip-text "The commit's message"))
+         (commit (make-instance 'gtk:button :label "Commit changes" :sensitive nil :css-classes '("suggested-action")))
+         (changes (make-instance 'gtk:button :label "Changes" :tooltip-text "What this task changed, file by file"))
+         ;; This task's, not whichever is latest when the button is clicked.
+         (task (and *task-changes* (eq (task-changes-workflow *task-changes*) workflow) *task-changes*))
+         (history *history*)
+         (buttons (gtk:build (gtk:box :spacing 6 :halign :end message-entry changes commit))))
+    (labels ((say (text &optional (class "dim-label"))
+               (gtk:label-set-text status text)
+               (gtk:widget-set-css-classes status (list class))
+               (gtk:widget-set-visible status (plusp (length text))))
+             (show (completion keep-status)
+               ;; The card as COMPLETION has it; nil once the task has carried on.
+               ;; KEEP-STATUS: leave what the card says (a commit's error) as it is.
+               (if (null completion)
+                   (progn (gtk:widget-set-sensitive commit nil)
+                          (gtk:widget-set-visible message-entry nil)
+                          (say "This task has carried on since; see the newer summary."))
+                   (destructuring-bind (&key outcome summary check-status repository can-commit commit-reason
+                                          commit-hash &allow-other-keys)
+                       completion
+                     (gtk:label-set-text heading (if (eq outcome :approved)
+                                                     "Work complete"
+                                                     (format nil "Work finished: ~(~a~)" (outcome-text outcome))))
+                     (gtk:label-set-text facts (format nil "~a~@[  ·  ~a~]  ·  ~a"
+                                                       (outcome-text outcome) (check-status-text check-status)
+                                                       (if repository (folder-label repository) "Not a git repository")))
+                     (clear-box body)
+                     (let ((summary (string-trim '(#\Space #\Newline) (or summary ""))))
+                       (when (plusp (length summary))
+                         (gtk:box-append body (make-instance 'gtk:expander :label "Summary" :child (markdown-box summary)
+                                                                           :expanded (<= (length summary) *summary-expanded-length*)))))
+                     (gtk:widget-set-visible message-entry (and can-commit t))
+                     (gtk:widget-set-sensitive commit (and can-commit t))
+                     (gtk:widget-set-tooltip-text commit (if can-commit
+                                                             (format nil "Commit everything changed in ~a, with this message"
+                                                                     (folder-label repository))
+                                                             commit-reason))
+                     (cond (commit-hash
+                            (gtk:widget-set-visible commit nil)
+                            (gtk:widget-set-visible message-entry nil)
+                            (say (format nil "Committed as ~a." (subseq commit-hash 0 (min 12 (length commit-hash))))))
+                           (keep-status)
+                           ((and (not can-commit) commit-reason (eq outcome :approved))
+                            (say commit-reason))
+                           (t (say ""))))))
+             (refresh (&optional keep-status)
+               (in-background "task completion" (lambda () (workflow-completion workflow))
+                              (lambda (completion why)
+                                (if why
+                                    (progn (gtk:label-set-text facts "Couldn't read the task's outcome.")
+                                           (say why "error"))
+                                    (show completion keep-status)))))
+             (commit-it ()
+               (let ((text (string-trim '(#\Space #\Tab #\Newline) (gtk:editable-get-text message-entry))))
+                 (cond ((zerop (length text)) (say "Give the commit a message." "error"))
+                       (*committing* (say "Another commit is running; try again once it's done." "error"))
+                       ((workflow-running-p) (say "Wait for the running task to end before committing." "error"))
+                       (t
+                        (gtk:widget-set-sensitive commit nil)
+                        (gtk:widget-set-sensitive message-entry nil)
+                        (say "Committing…")
+                        (setf *committing* t)
+                        (in-background "commit" (lambda () (commit-workflow-changes workflow :message text))
+                                       (lambda (result why)
+                                         (setf *committing* nil)
+                                         (gtk:widget-set-sensitive message-entry t)
+                                         (destructuring-bind (&key status message &allow-other-keys) result
+                                           (let ((text (or why message "")))
+                                             ;; In the task's conversation, even if another is open by now.
+                                             (cond ((and history (eq history *history*))
+                                                    (record :middle :note text)
+                                                    (save-current-history))
+                                                   (history
+                                                    (history-add-entry history :middle :note text)
+                                                    (save-history history)))
+                                             (case status
+                                               (:committed
+                                                (gtk:widget-set-visible commit nil)
+                                                (gtk:widget-set-visible message-entry nil)
+                                                (say text))
+                                               (:clean (say (format nil "Nothing to commit: ~a" text)))
+                                               (t (say text "error"))))
+                                           ;; What can be done now (a failed commit may have staged the edits).
+                                           (unless (eq status :committed) (refresh t))))))))))
+      (gobject:connect commit :clicked (lambda (b) (declare (ignore b)) (commit-it)))
+      (gobject:connect changes :clicked
+                       (lambda (b) (declare (ignore b))
+                         (if task
+                             (show-task-changes task)
+                             (say "This task's changes weren't recorded."))))
+      (pane-append *middle* (gtk:build
+                             (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-summary")
+                                      heading facts body status buttons)))
+      (refresh))))
 
 ;;; A workflow stopped at its last round, unapproved
 
@@ -1444,6 +1734,8 @@ to now while it runs (or is still stopping)."
                        (or (loop for l in (workflow-loops workflow)
                                  collect (format nil "~@[~a: ~]~a" (loop-label l) (loop-outcome l)))
                            '("It stopped before any work was done")))))
+  (when (eq (workflow-state workflow) :finished)
+    (show-summary-card workflow))
   (when (workflow-continuable-p workflow)
     (show-continue-card workflow))
   (update-controls))
@@ -1507,6 +1799,7 @@ to now while it runs (or is still stopping)."
              (carry-on ()
                (cond ((not (eq workflow *workflow*))
                       (settled "A newer task has started"))
+                     ((committing-p *middle*))
                      ((or (agent-busy *claude*) (agent-busy *codex*))
                       (pane-note *middle* "Wait for both agents to finish, or stop them, before continuing." "error"))
                      ((continue-workflow workflow (gtk:spin-button-get-value-as-int rounds))
@@ -1534,6 +1827,7 @@ to now while it runs (or is still stopping)."
             (problem nil))
         (when (plusp (length text))
           (cond
+            ((committing-p *middle*))
             ((or (agent-busy *claude*) (agent-busy *codex*))
              (pane-note *middle* "Wait for both agents to finish, or stop them, before starting." "error"))
             ((and (worktrees-wanted-p) (setf problem (worktrees-problem *directory*)))
@@ -1600,6 +1894,7 @@ to now while it runs (or is still stopping)."
                 (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-top 6 :margin-bottom 6
                          (gtk:label :label "Conversation" :css-classes '("heading"))
                          status)
+                (make-activity-strip)
                 (gtk:separator)
                 scroller
                 (gtk:separator)
@@ -1780,6 +2075,13 @@ to now while it runs (or is still stopping)."
                            (setf (setting :checklist-visible) visible)
                            (set-checklist-visible visible))))
       (gtk:header-bar-pack-start header checklist))
+    (let ((view (gtk:drop-down-new-from-strings (mapcar #'second *views*))))
+      (gtk:drop-down-set-selected view (or (position *view* *views* :key #'first) 0))
+      (gtk:widget-set-tooltip-text view "All panes: each agent's own pane beside the conversation. Conversation only: just the conversation, with the agents' approvals and questions in it and what each is doing.")
+      (gobject:connect view "notify::selected"
+                       (lambda (d pspec) (declare (ignore pspec))
+                         (set-view (first (nth (gtk:drop-down-get-selected d) *views*)))))
+      (gtk:header-bar-pack-start header view))
     (gtk:header-bar-pack-end header theme)
     (gtk:header-bar-pack-end header permission)
     header))
@@ -1864,6 +2166,8 @@ to now while it runs (or is still stopping)."
     (".duet-codex" :color "#19b98f")
     (".duet-note" :font-size "smaller")
     (".duet-chip" :background-color "alpha(@view_fg_color, 0.08)" :border-radius "12px")
+    (".duet-summary" :background-color "alpha(@success_bg_color, 0.14)" :border-radius "8px" :padding "10px"
+     :border "1px solid alpha(@success_color, 0.45)")
     (".duet-checklist" :background-color "alpha(@view_fg_color, 0.05)" :border-radius "8px" :padding ("8px" "12px"))
     (".duet-terminal-panel" :background-color "@view_bg_color")
     (".duet-terminal" :padding ("2px" "6px") :font-family "Menlo, Monaco, monospace")))
@@ -1904,7 +2208,9 @@ to now while it runs (or is still stopping)."
   (apply-theme (setting :theme :dark))
   (setf *controls* '()
         *permission* (or (setting :permission) :ask)
-        *shared-notes* (setting :shared-notes t))
+        *shared-notes* (setting :shared-notes t)
+        *view* (if (assoc (setting :view) *views*) (setting :view) :panes)
+        *view-only* '())
   (let ((window (make-instance 'gtk:application-window
                                :application app :title "Agent Duet"
                                :default-width 1440 :default-height 900)))
@@ -1936,7 +2242,12 @@ to now while it runs (or is still stopping)."
                                         :resize-end-child nil)))
             (setf (getf *controls* :checklist-split) content
                   (getf *controls* :agent-split) outer
-                  (getf *controls* :conversation-split) inner)
+                  (getf *controls* :conversation-split) inner
+                  (getf *controls* :claude-widget) claude-widget
+                  (getf *controls* :codex-widget) codex-widget)
+            (unless (eq *view* :panes)
+              (gtk:widget-set-visible claude-widget nil)
+              (gtk:widget-set-visible codex-widget nil))
             (gtk:paned-set-start-child content outer)
             (gtk:paned-set-end-child content (make-checklist-panel))
             ;; The Terminal panel below the panes, hidden until asked for.
