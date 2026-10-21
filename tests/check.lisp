@@ -31,16 +31,21 @@
 
 (define-test check-fixed :parent agent-duet
   (with-check-workflow (workflow author reviewer directory "test -f done-marker"
-                                (list (says "Done")
+                                (list (says "Suggested commit: Implement workflow colors")
                                       (lambda (prompt)
                                         (true (search "exit code 1" prompt))
                                         (true (search (format nil "```~%") prompt))
+                                        (true (search "Suggested commit:" prompt))
+                                        (true (search "whole task's completed changes" prompt))
                                         (write-file-text directory "done-marker" "ok")
-                                        "Fixed")))
+                                        (format nil "Fixed the fixture.~%Suggested commit: Implement workflow colors and fix fixtures"))))
     (ai:start-workflow workflow)
     (true (wait-until (lambda () (eq :finished (ai:workflow-state workflow)))))
     (is = 2 (length (fake-prompts author)))
     (is = 1 (ai::loop-round (first (ai:workflow-loops workflow))))
+    (is string= "Implement workflow colors and fix fixtures" (ai::default-commit-message workflow))
+    (is string= "Fixed the fixture." (getf (ai:workflow-completion workflow) :summary))
+    (true (search "Suggested commit:" (ai::loop-summary (first (ai:workflow-loops workflow)))))
     (true (search "passed" (first (fake-prompts reviewer))))))
 
 (define-test check-exhausted :parent agent-duet

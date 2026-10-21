@@ -2168,14 +2168,6 @@ its start to its end, or to now while it runs (or is still stopping)."
     (:failed "Check failed")
     (t nil)))
 
-(defun default-commit-message (workflow)
-  "The request's first line, short enough for a commit's subject."
-  (let* ((request (string-trim '(#\Space #\Tab #\Newline) (workflow-request workflow)))
-         (line (string-trim " " (subseq request 0 (or (position #\Newline request) (length request))))))
-    (if (> (length line) 72)
-        (format nil "~a…" (string-right-trim " " (subseq line 0 71)))
-        line)))
-
 (defvar *committing* nil
   "True while a summary card's commit runs: no agent work starts meanwhile,
 so none of it can get into the commit.")
@@ -2206,7 +2198,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (status (make-instance 'gtk:label :xalign 0.0 :wrap t :wrap-mode :word-char :selectable t :visible nil))
          (message-entry (make-instance 'gtk:entry :hexpand t :visible nil :text (default-commit-message workflow)
                                  :placeholder-text "Commit message"
-                                 :tooltip-text "The commit's message"))
+                                 :tooltip-text "Suggested from the completed work; edit before committing"))
          (commit (make-instance 'gtk:button :label "Commit changes" :sensitive nil :css-classes '("suggested-action")))
          (changes (make-instance 'gtk:button :label "Changes" :tooltip-text "What this task changed, file by file"))
          ;; This task's, not whichever is latest when the button is clicked.

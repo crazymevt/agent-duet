@@ -512,10 +512,22 @@ Read the files there; here is everything it changed, against where it started~:[
             (agent-name (loop-author loop)) (namestring tree)
             (> (length diff) *review-diff-limit*) (subseq diff 0 (min (length diff) *review-diff-limit*)))))
 
+(defparameter *commit-suggestion-instruction*
+  "If files changed during this task, end your report with one line:
+Suggested commit: <a short imperative commit subject describing the actual completed changes, at most 72 characters>
+Cover the whole task's completed changes, including earlier work, not just this correction or the original request. This is a suggestion only, not an instruction to commit.")
+
+(defun with-commit-suggestion-instruction (prompt)
+  "Add the reply instruction once, including when a takeover reuses a prompt."
+  (if (search *commit-suggestion-instruction* prompt)
+      prompt
+      (format nil "~a~%~%~a" prompt *commit-suggestion-instruction*)))
+
 (defun work-reply-instruction (loop)
-  (if (loop-combined-result loop)
-      "Then provide the full revised combined answer to the overall request, preserving useful results from both parts; a summary of edits alone is not sufficient."
-      "Then summarize what you changed."))
+  (with-commit-suggestion-instruction
+   (if (loop-combined-result loop)
+       "Then provide the full revised combined answer to the overall request, preserving useful results from both parts; a summary of edits alone is not sufficient."
+       "Then summarize what you changed.")))
 
 (defun fix-prompt (loop review)
   (let ((open (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq)))
@@ -1109,7 +1121,8 @@ ready waits for it in any case."
   (setf (loop-check-report loop) nil
         (loop-check-failed loop) nil)
   (update-loop-state workflow loop :working)
-  (let ((step (make-step :agent (loop-author loop) :prompt prompt :role :work :loop loop
+  (let* ((prompt (with-commit-suggestion-instruction prompt))
+         (step (make-step :agent (loop-author loop) :prompt prompt :role :work :loop loop
                          :then (lambda (text error)
                                  (cond (error
                                         (loop-failed workflow loop (format nil "~a's turn failed: ~a"
@@ -1795,7 +1808,9 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
   (when (workflow-completion-data workflow)
     (let ((reason (handler-case (workflow-commit-reason workflow)
                     (error (e) (format nil "Cannot inspect the repository: ~a" e)))))
-      (append (copy-list (workflow-completion-data workflow))
+      (append (let ((data (copy-list (workflow-completion-data workflow))))
+                (setf (getf data :summary) (report-without-commit-suggestion (getf data :summary)))
+                data)
               (list :repository (getf (workflow-completion-state workflow) :root)
                     :can-commit (null reason) :commit-reason reason
                     :clean (let ((root (getf (workflow-completion-state workflow) :root)))
@@ -1803,6 +1818,54 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                          (zerop (length (worktree-git root "status" "--porcelain=v1"
                                                                       "--untracked-files=all"))))))
                     :commit-hash (workflow-commit-hash workflow))))))
+
+(defun commit-subject (text)
+  "One plain, bounded subject from an agent's completed-work report."
+  (let* ((line (first (uiop:split-string (or text "") :separator '(#\Newline #\Return))))
+         (subject (string-trim '(#\Space #\Tab #\* #\_ #\` #\# #\> #\- #\") (or line ""))))
+    (when (plusp (length subject))
+      (if (> (length subject) 72)
+          (concatenate 'string (string-right-trim " " (subseq subject 0 71)) "…")
+          subject))))
+
+(defun suggested-commit-line (line)
+  "Return the metadata value, or NIL for an ordinary report line."
+  (let ((plain (string-left-trim '(#\Space #\Tab #\* #\# #\>) line))
+        (prefix "Suggested commit:"))
+    (when (and (<= (length prefix) (length plain))
+               (string-equal prefix plain :end2 (length prefix)))
+      (subseq plain (length prefix)))))
+
+(defun report-without-commit-suggestion (report)
+  "Hide commit metadata in the completion card, retaining the original report."
+  (when report
+    (string-trim '(#\Space #\Tab #\Newline #\Return)
+                 (format nil "~{~a~^~%~}"
+                         (remove-if #'suggested-commit-line
+                                    (uiop:split-string report :separator '(#\Newline)))))))
+
+(defun report-commit-suggestion (report)
+  "Prefer the author's explicit suggestion; tolerate older reports without one."
+  (let ((lines (uiop:split-string (or report "") :separator '(#\Newline #\Return))))
+    (or (loop for line in (reverse lines)
+              for suggestion = (suggested-commit-line line)
+              thereis (and suggestion (commit-subject suggestion)))
+        (loop for line in lines
+              for subject = (commit-subject line)
+              when (and subject (>= (length subject) 12)
+                        (not (find #\: subject))
+                        (not (member subject '("Implemented the request" "No work summary was returned."
+                                               "Work was stopped.") :test #'string-equal)))
+                return subject))))
+
+(defun default-commit-message (workflow)
+  "Suggest a subject from completed work, never from the user's request."
+  (let* ((final (or (and (workflow-merged-loop workflow) (list (workflow-merged-loop workflow)))
+                    (workflow-loops workflow)))
+         (suggestions (remove nil (mapcar (lambda (loop) (report-commit-suggestion (loop-summary loop))) final))))
+    (or (and suggestions (commit-subject (format nil "~{~a~^; ~}" suggestions)))
+        (report-commit-suggestion (getf (workflow-completion-data workflow) :summary))
+        "Update completed workflow changes")))
 
 (defun commit-workflow-changes (workflow &key message)
   "User action only. Commit the captured approved edits if still current.
@@ -1819,7 +1882,7 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                                   (equal end (repository-state root))
                                   (zerop (length (getf end :status)))) :clean :error)
                   :message reason :commit nil)))
-        (let ((message (or message (format nil "Agent Duet: ~a" (workflow-request workflow)))))
+        (let ((message (or message (default-commit-message workflow))))
           (when (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) message)))
             (error "The commit message must not be empty."))
           ;; Explicit action, after comparing HEAD, branch, index and file contents.

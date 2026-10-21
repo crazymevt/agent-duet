@@ -155,6 +155,61 @@
                                       :summary "Implemented the request")))
     workflow))
 
+(define-test working-agent-suggests-commit-subject :parent agent-duet
+  (multiple-value-bind (workflow messages author reviewer)
+      (run-fake :review (list (says "Suggested commit: Color workflow stages"))
+                        (list (says "VERDICT: APPROVED")))
+    (declare (ignore messages reviewer))
+    (is eq :finished (ai:workflow-state workflow))
+    (true (search "Suggested commit:" (first (fake-prompts author))))
+    (true (search "actual completed changes" (first (fake-prompts author))))
+    (is string= "Color workflow stages" (ai::default-commit-message workflow))))
+
+(define-test commit-suggestion-correction-prompts :parent agent-duet
+  (let* ((author (make-instance 'fake-agent :id :claude :name "Claude" :directory (uiop:temporary-directory)))
+         (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory (uiop:temporary-directory)))
+         (loop (ai::make-review-loop :author author :reviewer reviewer :task "Implement colors"))
+         (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Implement colors"))
+         (reply (ai::work-reply-instruction loop))
+         (takeover (ai::takeover-prompt author reply)))
+    (is string= takeover (ai::with-commit-suggestion-instruction takeover))
+    (let* ((prompt (ai::fix-prompt loop "Changes requested"))
+           (at (search "Suggested commit:" prompt)))
+      (true at)
+      (false (search "Suggested commit:" prompt :start2 (+ at 1))))
+    ;; The paused merge's replacement author report needs a whole-task subject.
+    (setf (ai:workflow-state workflow) :running)
+    (ai::prerequisite-unmerged workflow loop "Finish merging the prerequisite" 0)
+    (let ((prompt (ai::step-prompt (first (ai::workflow-paused workflow)))))
+      (true (search "Suggested commit:" prompt))
+      (true (search "whole task's completed changes" prompt)))
+    (ai::await-recovery-captures workflow)
+    (is string= "Implemented colors."
+        (ai::report-without-commit-suggestion
+         (format nil "Implemented colors.~%~%**Suggested commit:** Color workflow stages~%")))
+    (is string= "Normal summary" (ai::report-without-commit-suggestion "Normal summary"))))
+
+(define-test completed-work-commit-suggestion :parent agent-duet
+  (let* ((workflow (make-instance 'ai:workflow :request "Please fix the thing I mentioned yesterday"))
+         (part (ai::make-review-loop :summary "Added colors and removed inert buttons.")))
+    (setf (ai:workflow-loops workflow) (list part))
+    (is string= "Added colors and removed inert buttons." (ai::default-commit-message workflow))
+    (setf (ai::loop-summary part)
+          (format nil "Done.~%~%**Suggested commit:** Color workflow stages and remove inert buttons"))
+    (is string= "Color workflow stages and remove inert buttons" (ai::default-commit-message workflow))
+    ;; The combined report takes precedence over the two parts' suggestions.
+    (setf (ai::workflow-merged-loop workflow)
+          (ai::make-review-loop :summary "Suggested commit: Equalize agent panels and preserve custom splits"))
+    (is string= "Equalize agent panels and preserve custom splits" (ai::default-commit-message workflow))
+    (is = 72 (length (ai::commit-subject (make-string 100 :initial-element #\a))))
+    (is string= "Fix layout" (ai::commit-subject (format nil "  `Fix layout`~%ignored body")))
+    (is string= "Use the final combined changes"
+        (ai::report-commit-suggestion
+         (format nil "Suggested commit: Old partial suggestion~%Suggested commit: Use the final combined changes")))
+    (setf (ai::workflow-merged-loop workflow) nil
+          (ai::loop-summary part) "")
+    (is string= "Update completed workflow changes" (ai::default-commit-message workflow))))
+
 (define-test completion-user-commit :parent agent-duet
   (with-worktree-repository (repo trees)
     (let* ((workflow (completed-test-workflow repo))
@@ -243,7 +298,11 @@
       (is equal (ai::workflow-completion-state workflow) (ai::repository-state repo))
       (true (getf (ai:workflow-completion workflow) :can-commit))
       (delete-file (merge-pathnames ".git/hooks/pre-commit" repo))
-      (is eq :committed (getf (ai:commit-workflow-changes workflow) :status)))))
+      (setf (ai::loop-summary (first (ai:workflow-loops workflow)))
+            "Suggested commit: Preserve staging after failed commit hooks")
+      (is eq :committed (getf (ai:commit-workflow-changes workflow) :status))
+      (is string= "Preserve staging after failed commit hooks"
+          (ai::worktree-git-line repo "log" "-1" "--format=%s")))))
 
 (define-test completion-native-paths-and-batched-hashes :parent agent-duet
   (with-worktree-repository (repo trees)
