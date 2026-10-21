@@ -1408,18 +1408,32 @@ and a line saying what each is doing.")
   (gtk:widget-set-visible widget (visible-in-view-p view *view*))
   widget)
 
+(defun remember-window-geometry (window)
+  "Persist the normal window size and maximized state only when changed."
+  (let ((size (multiple-value-list (gtk:window-get-default-size window)))
+        (maximized (gtk:window-is-maximized window))
+        (changed nil))
+    ;; GTK retains the normal size while maximized.
+    (when (and (every #'plusp size) (not (equal size (setting :window-size))))
+      (setf (getf *settings* :window-size) size changed t))
+    (unless (eql maximized (setting :window-maximized))
+      (setf (getf *settings* :window-maximized) maximized changed t))
+    (when changed (save-settings))))
+
 (defun remember-layout ()
   "Remember divider positions for the current layout, independently of other views."
   (when (and (control :agent-split) (not (control :narrow-layout))
              (not (control :equalize-agent-panels)) (not (eq *view* :conversation)))
-    (setf (setting (layout-position-key *view*))
-          (agent-layout-preference
-           (or (control :restore-checklist-positions)
-              (control :pre-checklist-positions)
-              (control :pending-layout-positions)
-              (list (gtk:paned-get-position (control :agent-split))
-                    (gtk:paned-get-position (control :conversation-split))))
-           (agent-layout-custom-p)))))
+    (let ((positions
+            (agent-layout-preference
+             (or (control :restore-checklist-positions)
+                 (control :pre-checklist-positions)
+                 (control :pending-layout-positions)
+                 (list (gtk:paned-get-position (control :agent-split))
+                       (gtk:paned-get-position (control :conversation-split))))
+             (agent-layout-custom-p))))
+      (unless (equal positions (layout-positions *view*))
+        (setf (setting (layout-position-key *view*)) positions)))))
 
 (defun arrange-conversation (view)
   "Reuse the live widgets: changing layout never restarts an agent or a stream."
@@ -3184,11 +3198,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        ;; The last checkpoint saved stands: a task under way
                        ;; now is found interrupted when reopened.
                        (remember-layout)
-                       ;; GTK retains the normal size while maximized.
-                       (multiple-value-bind (width height) (gtk:window-get-default-size window)
-                         (when (and (plusp width) (plusp height))
-                           (setf (setting :window-size) (list width height))))
-                       (setf (setting :window-maximized) (gtk:window-is-maximized window))
+                       (remember-window-geometry window)
+                       (when (control :layout-save-timeout)
+                         (glib:source-remove (control :layout-save-timeout))
+                         (remf *controls* :layout-save-timeout))
                        (setf *closing* t)
                        (dolist (agent (list *claude* *codex*))
                          (ignore-errors (agent-cancel agent))

@@ -3544,3 +3544,29 @@ VERDICT: APPROVED" nil)
     (is string= "medium" (ai::agent-effort agent))
     (false (ai::catalog-effort "max" (cons nil (ai::codex-model-efforts model)) t))
     (false (ai::catalog-effort nil '(nil "medium") t))))
+
+(defclass settings-print-failure () ())
+
+(defmethod print-object ((object settings-print-failure) stream)
+  (declare (ignore object))
+  (write-string "partial value" stream)
+  (error "Simulated settings serialization failure"))
+
+(define-test settings-write-failure-preserves-preferences
+    :parent agent-duet
+  (uiop:with-temporary-file (:pathname file)
+    (let ((ai::*settings* '(:view :sidebar :sidebar-positions (700 250)
+                            :recent-folders ("/tmp/project/"))))
+      (ai::save-settings file)
+      (let ((original (uiop:read-file-string file)))
+        (setf ai::*settings* (list :view :panes :broken (make-instance 'settings-print-failure)))
+        (false (ai::save-settings file))
+        (is string= original (uiop:read-file-string file))
+        (ai::load-settings file)
+        (is equal '(700 250) (ai::layout-positions :sidebar))
+        (is equal '("/tmp/project/") (ai::setting :recent-folders))
+        ;; A subsequent successful replacement remains readable.
+        (setf (getf ai::*settings* :sidebar-positions) '(800 300))
+        (ai::save-settings file)
+        (ai::load-settings file)
+        (is equal '(800 300) (ai::layout-positions :sidebar))))))

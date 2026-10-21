@@ -55,15 +55,20 @@ Entries with circular values are dropped, keeping the rest."
             '())))
 
 (defun save-settings (&optional (file (settings-file)))
+  "Replace FILE atomically, leaving existing preferences intact on write errors."
   (ignore-errors
-   (ensure-directories-exist file)
-   (with-open-file (out file :direction :output :if-exists :supersede)
-     (with-standard-io-syntax
-       ;; Not readably: that would write base strings as #A(…) arrays.
-       (let ((*package* (find-package '#:agent-duet))
-             (*print-readably* nil))
-         (prin1 *settings* out)
-         (terpri out))))))
+    (ensure-directories-exist file)
+    (uiop:with-temporary-file (:stream out :pathname temp
+                              :directory (uiop:pathname-directory-pathname file)
+                              :prefix ".settings-" :type "tmp")
+      (with-standard-io-syntax
+        ;; Not readably: that would write base strings as #A(…) arrays.
+        (let ((*package* (find-package '#:agent-duet))
+              (*print-readably* nil))
+          (prin1 *settings* out)
+          (terpri out)))
+      :close-stream
+      (uiop:rename-file-overwriting-target temp file))))
 
 (defun setting (key &optional default)
   (getf *settings* key default))

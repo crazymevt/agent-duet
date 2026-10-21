@@ -226,6 +226,39 @@
             (gtk:widget-queue-allocate (control :agent-split)))))
     (setf (getf *controls* :agent-layout-size) size)))
 
+(defun window-layout-snapshot ()
+  "Geometry and restoration state used to debounce persistence."
+  (list *view* (agent-layout-size)
+        (gtk:paned-get-position (control :agent-split))
+        (gtk:paned-get-position (control :conversation-split))
+        (multiple-value-list (gtk:window-get-default-size *window*))
+        (gtk:window-is-maximized *window*)
+        (mapcar #'control '(:narrow-layout :pre-checklist-positions
+                            :restore-checklist-positions :pending-layout-positions
+                            :equalize-agent-panels))))
+
+(defun schedule-window-layout-save ()
+  "Save only after geometry has stopped changing for 300 milliseconds."
+  (let ((snapshot (window-layout-snapshot)))
+    (unless (equal snapshot (control :layout-save-snapshot))
+      (when (control :layout-save-timeout)
+        (glib:source-remove (control :layout-save-timeout)))
+      (setf (getf *controls* :layout-save-snapshot) snapshot)
+      (let ((window *window*) (outer (control :agent-split)))
+        (setf (getf *controls* :layout-save-timeout)
+              (glib:timeout-add glib:+priority-default+ 300
+                (lambda ()
+                  ;; An old window's callback must not save a replacement window.
+                  (when (and (eq window *window*) (eq outer (control :agent-split)) (not *closing*))
+                    (remf *controls* :layout-save-timeout)
+                    (when (equal snapshot (window-layout-snapshot))
+                      (unless (some #'control '(:narrow-layout :pre-checklist-positions
+                                               :restore-checklist-positions :pending-layout-positions
+                                               :equalize-agent-panels))
+                        (remember-layout))
+                      (remember-window-geometry window)))
+                  nil)))))))
+
 (defun watch-conversation-allocation (widget)
   "Observe rendered allocations; queue another only for staged restoration."
   (dolist (split (list widget (control :conversation-split)))
@@ -249,6 +282,7 @@
             (declare (ignore clock))
             (unless *closing*
               (observe-agent-layout-size)
+              (schedule-window-layout-save)
               ;; Orientation changes queue another allocation. Set positions
               ;; only after that allocation, or GtkPaned scales them using the
               ;; previous axis and loses the user's wide divider positions.
