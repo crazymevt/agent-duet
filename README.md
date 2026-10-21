@@ -386,7 +386,7 @@ libraries used to build them.
 
 ```sh
 make test
-make test-parallel              # four isolated workers
+make test-parallel              # eight isolated workers
 make test-parallel TEST_JOBS=2  # reduce memory/CPU usage
 ```
 

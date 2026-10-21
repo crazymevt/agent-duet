@@ -1,7 +1,7 @@
 # Makefile for agent-duet. Needs Quicklisp, loaded from your Lisp's init file.
 
 LISP ?= sbcl
-TEST_JOBS ?= 4
+TEST_JOBS ?= 8
 # Compiling the generated GTK bindings exceeds Ubuntu SBCL's default heap.
 LISP_FLAGS ?= --dynamic-space-size 2048
 RUN = $(LISP) $(LISP_FLAGS) --non-interactive --eval '(require :asdf)' --eval '(push (truename ".") asdf:*central-registry*)'
