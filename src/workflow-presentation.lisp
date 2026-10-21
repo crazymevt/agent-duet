@@ -13,6 +13,8 @@
 ;;;;   :label       a few words: "Reviewing"
 ;;;;   :detail      a string or nil: "Claude's part · round 2 of 3"
 ;;;;   :attention-p true when the user is to do something
+;;;; (WORKFLOW-PRESENTATION-TONE presentation) groups its :state for color:
+;;;;   :working :review :success :attention :error or :idle.
 ;;;;
 ;;;; (WORKFLOW-PROGRESS-PRESENTATION workflow) is a plist:
 ;;;;   :label       the task as a whole: "2 parts in progress"
@@ -228,6 +230,21 @@ plist of :state, :label, :detail and :attention-p."
                 (result :waiting "Waiting for plan approval"))
                (t (let ((p (presentation-idle-in-workflow workflow agent)))
                     (result (getf p :state) (getf p :label) (getf p :detail))))))))))))
+
+;;; An agent panel's status pill
+
+(defun workflow-presentation-tone (presentation)
+  "PRESENTATION's (from WORKFLOW-AGENT-PRESENTATION) color group: an error or
+anything the user is to do outranks its state."
+  (let ((state (getf presentation :state)))
+    (cond ((eq state :error) :error)
+          ((or (getf presentation :attention-p)
+               (member state '(:needs-input :awaiting-approval :paused :out-of-usage)))
+           :attention)
+          ((member state '(:reviewing :waiting)) :review)
+          ((eq state :complete) :success)
+          ((member state '(:working :planning :proposing :fixing :checking :resolving)) :working)
+          (t :idle))))
 
 (defun workflow-agent-member-p (workflow agent)
   (or (eq agent (workflow-lead workflow)) (eq agent (workflow-partner workflow))))

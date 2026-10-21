@@ -743,3 +743,25 @@
         ;; Busy, it isn't idle: a turn may have started as usage came back.
         (setf (ai:agent-busy partner) t)
         (false (search "Out of usage" (or (getf (ai::workflow-agent-presentation nil partner) :detail) "")))))))
+
+(define-test presentation-tone :parent agent-duet
+  (flet ((tone (state &optional attention)
+           (ai::workflow-presentation-tone (list :state state :label "x" :attention-p attention))))
+    (dolist (state '(:working :planning :proposing :fixing :checking :resolving))
+      (is eq :working (tone state)))
+    (is eq :review (tone :reviewing))
+    (is eq :review (tone :waiting))
+    (is eq :success (tone :complete))
+    (dolist (state '(:needs-input :awaiting-approval :paused :out-of-usage))
+      (is eq :attention (tone state)))
+    ;; Whatever the state, the user's turn shows; an error shows over that.
+    (is eq :attention (tone :waiting t))
+    (is eq :error (tone :error t))
+    (is eq :idle (tone :idle))
+    (is eq :idle (tone :stopped))
+    (is eq :idle (ai::workflow-presentation-tone nil)))
+  (multiple-value-bind (lead partner) (presented-agents)
+    (declare (ignore partner))
+    (is eq :idle (ai::workflow-presentation-tone (ai::workflow-agent-presentation nil lead)))
+    (setf (ai:agent-busy lead) t)
+    (is eq :working (ai::workflow-presentation-tone (ai::workflow-agent-presentation nil lead)))))
