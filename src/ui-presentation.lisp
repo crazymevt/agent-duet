@@ -47,9 +47,49 @@
              (label (and agent (control (agent-setting-key agent "WORKFLOW-ACTIVITY"))))
              (presentation (and pane (workflow-agent-presentation *workflow* agent))))
         (when label
+          (ensure-pill-css)
           (gtk:label-set-text label (getf presentation :label))
-          (gtk:widget-set-tooltip-text label (getf presentation :detail))
-          (gtk:widget-set-css-classes label (if (getf presentation :attention-p) '("caption" "warning") '("caption")))))))
+          (gtk:widget-set-halign label :start)
+          (gtk:widget-set-tooltip-text label
+                                       (format nil "~a~@[~%~a~]" (getf presentation :label) (getf presentation :detail)))
+          (gtk:widget-set-css-classes label (activity-pill-classes agent presentation))))))
+
+;;; Agent status pills: orange Claude, teal ChatGPT; blue review, green done,
+;;; amber for the user's turn, red errors. A provider of their own, so the
+;;; window's stylesheet needn't know them.
+
+(defparameter *pill-css*
+  '((".duet-pill" :border-radius "999px" :padding ("2px" "10px") :font-weight "600"
+     :border "1px solid transparent")
+    (".duet-pill-idle" :background-color "alpha(@view_fg_color, 0.08)"
+     :color "alpha(@view_fg_color, 0.75)" :border-color "alpha(@view_fg_color, 0.18)")
+    (".duet-pill-working" :background-color "alpha(@accent_bg_color, 0.18)"
+     :color "mix(@view_fg_color, @accent_color, 0.7)" :border-color "alpha(@accent_color, 0.6)")
+    (".duet-pill-working.duet-pill-claude" :background-color "alpha(#d97757, 0.18)"
+     :color "mix(@view_fg_color, #e8875f, 0.7)" :border-color "alpha(#d97757, 0.65)")
+    (".duet-pill-working.duet-pill-codex" :background-color "alpha(#14b8a6, 0.18)"
+     :color "mix(@view_fg_color, #2dd4bf, 0.7)" :border-color "alpha(#14b8a6, 0.65)")
+    (".duet-pill-review" :background-color "alpha(#3b82f6, 0.18)"
+     :color "mix(@view_fg_color, #60a5fa, 0.7)" :border-color "alpha(#3b82f6, 0.65)")
+    (".duet-pill-success" :background-color "alpha(#22c55e, 0.16)"
+     :color "mix(@view_fg_color, #4ade80, 0.65)" :border-color "alpha(#22c55e, 0.6)")
+    (".duet-pill-attention" :background-color "alpha(#f59e0b, 0.2)"
+     :color "mix(@view_fg_color, #fbbf24, 0.7)" :border-color "alpha(#f59e0b, 0.7)")
+    (".duet-pill-error" :background-color "alpha(#ef4444, 0.18)"
+     :color "mix(@view_fg_color, #f87171, 0.7)" :border-color "alpha(#ef4444, 0.7)")))
+
+(defvar *pill-css-provider* nil)
+
+(defun ensure-pill-css ()
+  "Install the pill stylesheet once, for the default display."
+  (unless *pill-css-provider*
+    (setf *pill-css-provider* (gtk:add-css *pill-css*))))
+
+(defun activity-pill-classes (agent presentation)
+  (list "caption" "duet-pill"
+        (if (eq (agent-id agent) :claude) "duet-pill-claude" "duet-pill-codex")
+        (format nil "duet-pill-~(~a~)" (workflow-presentation-tone presentation))
+        (format nil "duet-state-~(~a~)" (getf presentation :state))))
 
 (defun adapt-conversation-width ()
   "Stack the conversation above the agents when the sidebar would be too narrow."
