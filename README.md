@@ -386,7 +386,13 @@ libraries used to build them.
 
 ```sh
 make test
+make test-parallel              # four isolated workers
+make test-parallel TEST_JOBS=2  # reduce memory/CPU usage
 ```
 
 They run without GTK or the CLIs: the workflows are driven by scripted agents.
 The fake CLIs and review enforcement use Lisp; Python is not required.
+
+The parallel target compiles the suite once before starting workers, then splits
+the registered tests evenly across processes. Each worker has its own temporary
+directory; output is grouped by worker, and any worker failure fails the target.

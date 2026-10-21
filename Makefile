@@ -1,11 +1,12 @@
 # Makefile for agent-duet. Needs Quicklisp, loaded from your Lisp's init file.
 
 LISP ?= sbcl
+TEST_JOBS ?= 4
 # Compiling the generated GTK bindings exceeds Ubuntu SBCL's default heap.
 LISP_FLAGS ?= --dynamic-space-size 2048
 RUN = $(LISP) $(LISP_FLAGS) --non-interactive --eval '(require :asdf)' --eval '(push (truename ".") asdf:*central-registry*)'
 
-.PHONY: load test run dev build app install-app clean
+.PHONY: load test test-parallel run dev build app install-app clean
 
 # Load the system, fetching its dependencies
 load:
@@ -15,6 +16,11 @@ load:
 test:
 	$(RUN) --eval '(ql:quickload :agent-duet/tests)' \
 		--eval '(uiop:quit (if (eq :passed (parachute:status (parachute:test :agent-duet/tests))) 0 1))'
+
+# Warm the compilation cache before starting independent Lisp workers.
+test-parallel:
+	$(RUN) --eval '(ql:quickload :agent-duet/tests)'
+	sh scripts/test-parallel.sh $(TEST_JOBS) $(RUN) --eval '(ql:quickload :agent-duet/tests)'
 
 # Run the program (on the first thread, as GTK needs on macOS)
 run:
