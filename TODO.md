@@ -3,12 +3,11 @@
 For the current redesign checkpoint, acceptance checks, and remaining milestone
 sequence, see [the implementation plan](docs/implementation-plan.md).
 
-- [ ] **Redesign milestone 1 acceptance:** Combined UI and CLI results were
-  reconciled on 2026-10-21. Layout/checklist restoration, presentation fixes,
-  and substantial real CLI checks passed. Claude reply attribution and saved
-  Codex thinking-level restoration now have fixes and regression coverage.
-  Physical divider drags and the remaining live-window checks
-  are still unverified. See the plan for evidence and limits.
+- [x] **Redesign milestone 1 acceptance:** Signed off on 2026-10-21.
+  Automated headless/GTK and live CLI checks passed; the user confirmed physical
+  divider dragging works. Programmatic allocation/checklist checks cover 1000px
+  and minimum widths. Usage exhaustion display was simulated. See the plan for
+  evidence and limits.
 
 - [x] **Structured review checklist:** Track each review finding as open, fixed, or dismissed, with file locations, so unresolved findings remain visible across review rounds.
 - [x] **Plan approval before coding:** Offer an optional pause after the lead proposes a plan, allowing the user to edit the scope or assignments before implementation starts.
@@ -23,12 +22,11 @@ sequence, see [the implementation plan](docs/implementation-plan.md).
 
 ## Next (agreed by Claude and ChatGPT)
 
-Agreed priorities now, in order:
+Review-only mode and restart recovery are complete. The task summary card is
+implemented for review. Remaining agreed priorities, in order:
 
-1. **Review-only mode** (below).
-2. **Restart recovery** (below), using the recovery refs for parts whose worktrees are gone.
-3. **End-of-task summary card** (below), with whatever usage and time data the CLIs report.
-4. **Commit at the end**, then **Undo a task** (below).
+1. **Commit at the end**, completing the selection and preview flow below.
+2. **Undo a task** (below).
 
 The earlier top five, and the rest:
 
@@ -56,8 +54,8 @@ Later:
 
 - [ ] **Undo a task:** Revert what changed in the folder during the task, building on the changes view: apply the reverse of the task's diff (start → end snapshot) to the current tree, as a three-way merge, so edits made after the task are kept. Files where they conflict are listed and left untouched, not overwritten. Shows the reverse diff before applying. The start → end diff can't tell the agents' changes from edits the user made in the folder while the task ran, so those are reversed too: the confirmation says so, and lets files be left out. (Telling them apart would need per-turn snapshots or the agents' own edit events, which is not planned here.)
 - [ ] **Commit at the end:** After an approved task outside *Own worktrees*, offer **Commit**: the task's changed files (from the changes view) are preselected, files that were already changed before the task are unselected and marked, the user can change the selection, and the staged diff is shown with a message drafted by the lead (editable) before committing.
-- [ ] **Cost and time per task:** Claude's result carries `total_cost_usd` and duration; Codex reports token usage. Per-turn and per-task totals in the status lines and the end-of-task note.
-- [ ] **End-of-task summary card:** Files changed (linked to the changes view), rounds per loop, check result, open findings, time and cost, in one card.
+- [ ] **Cost and time in status lines:** Turn records and per-task CLI metric totals are implemented in the completion card. Showing per-turn totals in status lines remains open.
+- [x] **End-of-task summary card:** Files changed (linked to the changes view), rounds per loop, check result, open findings, elapsed time and available per-agent CLI metrics in one card. Unknown/partial values are explicit and turn records survive recovery.
 - [ ] **Search** in a pane (⌘F) and in the conversation list.
 - [ ] **Export a task as Markdown:** request, plans, reviews and checklist, for a PR description or notes.
 - [ ] **Artifact creation and viewing:** Support deliverables created by either CLI as local files (HTML, Markdown, images, PDFs, spreadsheets, presentations, and other documents), using available tools and dependencies rather than assuming a shared native artifact protocol. Define how agents report artifact paths and metadata; discover outputs from structured events where supported and explicit file references otherwise. Show per-task artifact cards with creator, type, creation/update status, preview, open externally, and save/export actions. Extend the existing Markdown Documents viewer with suitable previews and an external-app fallback; isolate active HTML content. Preserve artifacts and their history links across restart, handoff, and worktree cleanup, and make them available to the other agent for review. Detect supported CLI output types and capabilities by version, including generated-image events where available, and clearly report missing generation tools or unsupported preview formats.

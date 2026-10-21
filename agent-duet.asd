@@ -60,5 +60,6 @@
                              (:file "worktree")
                              (:file "snapshot")
                              (:file "read-only")
-                             (:file "workflow-presentation"))))
+                             (:file "workflow-presentation")
+                             (:file "task-summary"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))

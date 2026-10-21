@@ -8,6 +8,11 @@
 
 (in-package #:agent-duet)
 
+(defconstant +conversation-chat-head-size+ 28)
+(defconstant +conversation-chat-head-spacing+ 10)
+(defconstant +conversation-gutter+
+  (+ +conversation-chat-head-size+ +conversation-chat-head-spacing+))
+
 (defvar *window* nil)
 (defvar *claude* nil)
 (defvar *codex* nil)
@@ -941,6 +946,7 @@ answer settles it, wherever it was given."
               (agent-pane-activity-title pane) "")
         (gtk:label-set-text activity "")
         (gtk:widget-set-visible activity nil)
+        (gtk:widget-set-margin-start activity +conversation-gutter+)
         (gtk:box-append bubble activity)
         (setf (agent-pane-conversation-activity pane) activity))
       (setf (agent-pane-conversation-box pane) body
@@ -1515,19 +1521,38 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                                   (gtk:label :label "Check" :xalign 0.0 :css-classes '("caption-heading"))
                                   (markdown-box text)))))
 
+(defun conversation-heading-label (bubble)
+  "The speaker label beside BUBBLE's chat head."
+  (gtk:widget-get-last-child (gtk:widget-get-first-child bubble)))
+
 (defun middle-bubble (side header text)
-  "A message in the conversation, from SIDE: :user, :claude or :codex."
-  (pane-append *middle*
-               (gtk:build
-                (gtk:box :orientation :vertical :spacing 8
-                         :hexpand t
-                         :css-classes (list "duet-message" (ecase side
-                                                             (:user "duet-from-user")
-                                                             (:claude "duet-from-claude")
-                                                             (:codex "duet-from-codex")))
-                         :halign :fill
-                         (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
-                         (markdown-box text)))))
+  "A message with an original initial badge and a compact left gutter."
+  (let* ((identity (ecase side
+                     (:user "duet-from-user")
+                     (:claude "duet-from-claude")
+                     (:codex "duet-from-codex")))
+         ;; Plain letters and CSS circles: no downloaded artwork or brand logos.
+         (head (make-instance 'gtk:label
+                             :label (ecase side (:user "Y") (:claude "C") (:codex "G"))
+                             :width-request +conversation-chat-head-size+
+                             :height-request +conversation-chat-head-size+
+                             ;; Decorative initial; the adjacent heading names the speaker.
+                             :accessible-role :none
+                             :halign :center :valign :start
+                             :tooltip-text (ecase side (:user "You") (:claude "Claude") (:codex "ChatGPT"))
+                             :css-classes '("duet-chat-head")))
+         (body (markdown-box text)))
+    (gtk:widget-set-margin-start body +conversation-gutter+)
+    (pane-append *middle*
+                 (gtk:build
+                  (gtk:box :orientation :vertical :spacing 8 :hexpand t :halign :fill
+                           :css-classes (list "duet-message" identity)
+                           (gtk:box :orientation :horizontal :spacing +conversation-chat-head-spacing+
+                                    head
+                                    (gtk:label :label header :xalign 0.0 :wrap t
+                                               :wrap-mode :word-char :hexpand t
+                                               :css-classes '("caption-heading")))
+                           body)))))
 
 (defun middle-agent-message (agent header text)
   "Promote an existing live reply to a handoff instead of repeating it."
@@ -1548,7 +1573,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (when pane (clear-conversation-placeholder pane))
     (if (and bubble (eq (gtk:widget-get-parent bubble) (pane-messages *middle*)))
         (progn
-          (gtk:label-set-text (gtk:widget-get-first-child bubble) header)
+          (gtk:label-set-text (conversation-heading-label bubble) header)
           ;; A fallback may contain only the last block of a longer result.
           ;; Show the authoritative handoff without disturbing its command.
           (let ((body (gtk:widget-get-next-sibling (gtk:widget-get-first-child bubble))))
@@ -2688,6 +2713,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
   (let* ((heading (make-instance 'gtk:label :label "Work finished" :xalign 0.0 :css-classes '("heading")))
          (facts (make-instance 'gtk:label :xalign 0.0 :wrap t :css-classes '("dim-label") :label "Checking the repository…"))
          (body (make-instance 'gtk:box :orientation :vertical :spacing 6))
+         (files-label (make-instance 'gtk:label :xalign 0.0 :wrap t))
          (status (make-instance 'gtk:label :xalign 0.0 :wrap t :wrap-mode :word-char :selectable t :visible nil))
          (message-entry (make-instance 'gtk:entry :hexpand t :visible nil :text (default-commit-message workflow)
                                  :placeholder-text "Commit message"
@@ -2719,6 +2745,11 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                                        (outcome-text outcome) (check-status-text check-status)
                                                        (if repository (folder-label repository) "Not a git repository")))
                      (clear-box body)
+                     (dolist (line (task-summary-lines completion))
+                       (gtk:box-append body (make-instance 'gtk:label :label line :xalign 0.0 :wrap t
+                                                                 :selectable t :css-classes '("dim-label"))))
+                     (update-files (getf completion :files) (getf completion :files-known))
+                     (gtk:box-append body files-label)
                      (let ((summary (string-trim '(#\Space #\Newline) (or summary ""))))
                        (when (plusp (length summary))
                          (gtk:box-append body (make-instance 'gtk:expander :label "Summary" :child (markdown-box summary)
@@ -2737,13 +2768,36 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                            ((and (not can-commit) commit-reason (eq outcome :approved))
                             (say commit-reason))
                            (t (say ""))))))
+             (update-files (files known)
+               (gtk:button-set-label changes (if known (format nil "Files changed (~d)" (length files)) "Changes"))
+               (gtk:label-set-text files-label (summary-files-text files known)))
+             (poll-files ()
+               ;; Waiting for writers needs no Git call and must not rebuild
+               ;; the summary, expander, or selectable metric labels.
+               (when (and task (workflow-completion-data workflow))
+                 (if (eq :pending (task-changes-final task))
+                     (glib:timeout-add-seconds glib:+priority-default+ 1
+                                              (lambda () (poll-files) nil))
+                     (in-background "task completion files"
+                                    (lambda ()
+                                      (when (and (eq :taken (task-changes-final task))
+                                                 (task-changes-start task))
+                                        (list :known t
+                                              :files (mapcar #'snapshot-change-path
+                                                             (snapshot-changes (task-changes-directory task)
+                                                                               (task-changes-start task)
+                                                                               (task-changes-end task))))))
+                                    (lambda (result why)
+                                      (when (workflow-completion-data workflow)
+                                        (update-files (getf result :files) (and (not why) (getf result :known)))))))))
              (refresh (&optional keep-status)
                (in-background "task completion" (lambda () (workflow-completion workflow))
                               (lambda (completion why)
                                 (if why
                                     (progn (gtk:label-set-text facts "Couldn't read the task's outcome.")
                                            (say why "error"))
-                                    (show completion keep-status)))))
+                                    (progn (show completion keep-status)
+                                           (when completion (poll-files)))))))
              (commit-it ()
                (let ((text (string-trim '(#\Space #\Tab #\Newline) (gtk:editable-get-text message-entry))))
                  (cond ((zerop (length text)) (say "Give the commit a message." "error"))

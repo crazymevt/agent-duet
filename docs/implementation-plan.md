@@ -45,7 +45,7 @@ Live GTK allocation checks toggled the checklist at requested window widths
 of 1440, 1000, and 720 pixels. Panels remained nonzero; minimum sizes can
 force a narrow window larger than its requested width.
 
-## Milestone 1: finish redesign acceptance and commit
+## Milestone 1: redesign acceptance (signed off 2026-10-21)
 
 Automated coverage added in this step (headless; GTK widgets are untested):
 
@@ -134,7 +134,8 @@ Verified in that fixture:
   passed assertions across eight workers, zero failed/skipped), and
   `git diff --check` passed after the UI fixes.
 
-Still required before milestone 1 sign-off:
+Historical outstanding checks before the continuations below (resolved by the
+2026-10-21 sign-off unless explicitly retained as an evidence limit):
 
 - [x] Reviewed the combined diff, settings regression coverage, and refreshed
   screenshot after integration. `make load` and `make test-parallel` (eight
@@ -298,20 +299,110 @@ After the initial review fixes, `make load` and `make test-parallel` passed:
 process-wide-index correction, both passed again: 281 selected tests, 2466
 passed assertions across eight workers, zero failed or skipped. Working-tree and full baseline `git diff --check` also passed.
 
+### Sign-off continuation, 2026-10-21 (current checkout)
+
+Acceptance was rerun at `7b6e0cf` in a separate **Divider acceptance —
+isolated** app using `/tmp/duet-signoff/project/` and temporary XDG config
+and data directories. Real authenticated CLI calls consumed usage; normal
+application preferences and conversations were not used. Test drivers lived
+under `/tmp/duet-signoff/` rather than adding a permanent integration harness.
+
+- `make test-parallel` passed across eight workers: 2,789 assertions, zero
+  failures or skips. `make test-ui` passed, including layout restart,
+  checklist, shortcut and conversation checks.
+- Both real model catalogs arrived. The seeded Codex `gpt-6-luna` / `medium`
+  preference survived discovery, including both dropdown instances.
+- Both CLIs streamed while layouts changed; a second, longer Codex run
+  remained active through all four layouts with the same stream widget.
+  An unsent Codex draft survived the first two layout cycles.
+- Claude accepted a mid-turn PINEAPPLE instruction. After that turn became
+  idle, the next request received SECOND; a later question received Blue.
+  Rendered replies showed the expected subsequent answers. The existing
+  process-index regression tests remain the more exhaustive attribution
+  coverage.
+- A real Claude AskUserQuestion card survived all layouts. Selecting Blue
+  and emitting the visible Submit button's clicked signal completed the
+  request with Blue. This was programmatic GTK interaction, not a native
+  pointer test of the question controls.
+- A real Claude approval card requested a Python command writing only
+  `/tmp/duet-signoff/project/approval.txt`. A native pointer click on Allow
+  executed it, the file appeared, and both rendered cards showed Allowed.
+  Earlier combined acceptance already verified Codex's real approval path
+  and missing/signed-out CLI behavior; those checks were not repeated here.
+- Changing the real dropdowns selected Claude sonnet and Codex high effort.
+  Subsequent requests completed; Claude retained the earlier Blue answer
+  across its model-triggered process restart.
+- Calling `agent-ran-out` on the live Codex agent changed its status and
+  Conversation only strip to Out of usage; `agent-has-usage` restored Ready
+  and real usage percentages. Exhaustion itself was simulated, not induced
+  on the account.
+- The isolated window was closed through its normal close-request handler
+  and reopened in a fresh process. Agents on left, Claude sonnet and Codex
+  high effort restored with real catalogs enabled.
+
+**Milestone 1 signed off, 2026-10-21.** The user confirmed that physical
+divider dragging has been working. This supplies the manual physical-input
+evidence missing from automation; the inconclusive automated attempts above
+are retained as historical limits. Checklist restoration at 1000px and minimum
+widths is covered by the earlier programmatic allocation matrix, rather than
+a new claim of user verification of every layout/width combination. Combined
+with the automated and live CLI checks, this closes redesign acceptance.
+No later milestone work or commit was started.
+
 ## Milestone 2: task summary, usage, and time
 
-The existing agreed priority after review-only and restart recovery is an
-end-of-task summary. Those preceding features are already marked complete
-in `TODO.md`.
+Implemented for review, extending the existing completion card:
 
-- [ ] Inventory actual CLI usage, duration, and cost events; retain missing
+- [x] Inventory actual CLI usage, duration, and cost events; retain missing
   values as unknown instead of deriving unsupported prices or totals.
-- [ ] Store per-turn and per-task totals in history/checkpoints as needed.
-- [ ] Add one end-of-task card with changed files linked to Changes, rounds
-  per loop, recorded check outcome, open findings, duration, and available
-  usage/cost data. Include text-only tasks and incomplete/unreviewed results.
-- [ ] Test success, failure, stop, restart, handoff, parallel loops, and absent
-  metrics without double counting repeated or stale events.
+- [x] Store per-turn records and task aggregates in workflow checkpoints,
+  saved through the existing history checkpoint path. Pending submissions
+  remain unknown after a crash instead of disappearing from coverage. Start
+  and completion timestamps preserve elapsed time for completed tasks; an
+  explicit continuation clears the completion timestamp.
+- [x] Extend the end-of-task card with changed files linked to Changes, rounds
+  per loop, recorded check outcome, open findings, elapsed wall time, and
+  per-agent usage/cost data. Text-only and incomplete/unreviewed results use
+  the same card. Elapsed time includes pauses and time between restarts.
+- [x] Cover lifecycle, interruption, retry, restart, handoff, parallel agents,
+  unknown metrics, duplicate Claude result indexes and stale/repeated Codex
+  usage snapshots. GTK checks exercise the text-only completion card.
+
+Claude result events provide cost, duration, input/output and cache tokens.
+Indexed results are counted once per process; distinct results from mid-turn
+messages accumulate. A two-turn live probe confirmed Claude cost is cumulative
+within its CLI process, so cost deltas are taken against that process's previous
+result, while duration and token usage remain per result. A new process resets
+the cost baseline; absent cost fields and result-index gaps leave affected
+cost deltas unknown. Indexless CLI results cannot establish whether a result
+was missed. Missing fields make that turn's field unknown. Codex's
+`thread/tokenUsage/updated` schema was generated from the installed CLI:
+`last` describes the most recent model request, so thread `total` differences
+from the first update's pre-request baseline accumulate a tool-using turn.
+Thread and turn IDs reject stale usage updates; repeated snapshots replace
+rather than add. Codex cost and CLI duration are not reported and remain
+unknown. Cancellation/failure records are marked incomplete; late results
+cannot publish them twice. Raw turn records are checkpoint data, not billing
+records. The separate backlog item for per-turn metrics in status lines is
+not included in this card change.
+
+A live authenticated smoke test in `/tmp/duet-signoff/project/` returned OK
+from both agents and captured real metrics: Claude cost/duration/token fields,
+Codex token fields. It consumed real usage without editing project files.
+No model prices were inferred. Final validation: `make load`,
+`make test-parallel` (2,838 assertions across eight workers, zero failures or
+skips), `make test-ui` (including task summary checks), and `git diff --check`
+passed.
+
+Review corrections (F1, F2, F3 and F6): pending-snapshot polling now waits
+without querying Git, then reads the final file list once and updates only
+its label and Changes button. The summary expander and selectable labels
+retain their widget identities. The preview shows at most ten paths plus an
+omitted count, with Changes retaining the full list. Claude input is labelled
+uncached; Codex input is labelled as including cache. Cost index gaps reset
+the cumulative baseline and make the affected cost unknown; a subsequent
+contiguous result can be measured again. Regression checks cover these
+behaviors, including the GTK polling path. F4 and F5 remain dismissed.
 
 ## Milestone 3: finish the commit-at-end flow
 
@@ -362,6 +453,7 @@ A third agent remains outside the current plan.
    `lisp-edit` and is not the base for these changes.
 2. Read `AGENTS.md`, this file, `TODO.md`, and the working-tree diff/status.
    Preserve existing uncommitted changes; do not re-copy old worktree files.
-3. Finish milestone 1 before adding more workflow or product scope.
+3. Milestone 1 is signed off and milestone 2 is implemented for review.
+   Review the current diff before starting milestone 3.
 4. Update this file and `TODO.md` as milestones are completed. Add user-visible
    changes to `CHANGELOG.md` under Unreleased before committing.

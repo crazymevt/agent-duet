@@ -18,18 +18,25 @@
     (".duet-codex" :color "@duet_codex_text")
     (".duet-panel-claude" :border-top "3px solid alpha(@duet_claude, 0.85)")
     (".duet-panel-codex" :border-top "3px solid alpha(@duet_codex, 0.85)")
-    ;; Conversation messages: a quiet card, its author's accent on the left
+    ;; Conversation messages and original letter badges in the left gutter
     (".duet-message" :border-radius "10px" :padding ("10px" "14px")
      :margin-top "3px" :margin-bottom "3px")
-    (".duet-message > label.caption-heading" :font-weight "700")
+    (".duet-message > box > label.caption-heading" :font-weight "700")
     (".duet-from-user" :background-color "alpha(@view_fg_color, 0.06)"
      :border "1px solid alpha(@view_fg_color, 0.10)")
     (".duet-from-claude" :background-color "alpha(@duet_claude, 0.07)"
      :border "1px solid alpha(@duet_claude, 0.22)" :border-left "3px solid alpha(@duet_claude, 0.85)")
     (".duet-from-codex" :background-color "alpha(@duet_codex, 0.07)"
      :border "1px solid alpha(@duet_codex, 0.22)" :border-left "3px solid alpha(@duet_codex, 0.85)")
-    (".duet-from-claude > label.caption-heading" :color "@duet_claude_text")
-    (".duet-from-codex > label.caption-heading" :color "@duet_codex_text")
+    (".duet-from-claude > box > label.caption-heading" :color "@duet_claude_text")
+    (".duet-from-codex > box > label.caption-heading" :color "@duet_codex_text")
+    (".duet-chat-head" :border-radius "999px" :font-weight "700"
+     :font-size "12px" :background-color "alpha(@view_fg_color, 0.10)"
+     :color "@view_fg_color")
+    (".duet-from-claude .duet-chat-head" :background-color "alpha(@duet_claude, 0.20)"
+     :color "@duet_claude_text")
+    (".duet-from-codex .duet-chat-head" :background-color "alpha(@duet_codex, 0.20)"
+     :color "@duet_codex_text")
     (".duet-prompt" :background-color "alpha(@view_fg_color, 0.06)" :border-radius "10px"
      :border "1px solid alpha(@view_fg_color, 0.10)" :padding ("7px" "11px"))
     (".duet-checklist" :background-color "alpha(@view_fg_color, 0.05)" :border-radius "9px"

@@ -27,6 +27,8 @@ conversation. The keys the UI reads (`checkpoint-summary`):
 | `"version"` | `1` |
 | `"state"` | `"running"`, `"paused"`, `"stopped"`, `"finished"`, `"abandoned"` |
 | `"mode"`, `"request"` | strings |
+| `"started-at"`, `"ended-at"` | task creation and completion times (Common Lisp universal time), or null when unknown/still running |
+| `"metrics"` | `[{"id", "agent", "role", "incomplete", "values"}]`; submitted turn records, with numeric measurements or null for unknown fields |
 | `"agents"` | `[{"id", "directory", "conversation", "unavailable"}]`, lead first; `unavailable` the out-of-usage time, or null |
 | `"loops"` | `[{"label", "author", "reviewer", "state", "round", "skip-review", "dependencies", "revision", "prerequisite-revisions", …}]`; `dependencies` loop indices, `prerequisite-revisions` `[{"loop", "revision"}]` |
 | `"steps"` | `[{"id", "agent", "role", "loop", "state", "reason", "progress", "prompt"}]` |
@@ -34,6 +36,14 @@ conversation. The keys the UI reads (`checkpoint-summary`):
 | `"integration"`, `"integration-journal"` | `"committing"`, `"merging"`, `"merged"`, `"interrupted"` or null; `[{"path", "head"}]` merged so far |
 | `"prerequisite-merges"` | `[{"path", "from", "head"}]`: prerequisite work (`head`, from the worktree `from`) merged into a dependent part's worktree (`path`) |
 | `"repositories"` | each folder and worktree as it was (`inspect-recovery-repository`) |
+
+Metric `values` use `elapsed-seconds`, `duration-ms`, `cost-usd`,
+`input-tokens`, `output-tokens`, `cache-read-tokens`, `cache-write-tokens`,
+`reasoning-tokens` and `total-tokens`. Empty records preserve pending attempts
+across a crash. Reported turn IDs replace the pending entry once; duplicate
+reports are ignored. `incomplete` marks interrupted/failed measurements. Task
+aggregates retain known-field coverage, so missing turns remain visibly partial.
+Older checkpoints load with unknown start time and no recorded metrics.
 
 `history-interrupted-p`: the state is `"running"`, `"paused"` or
 `"interrupted"`, or `"finished"` with integration still `"committing"`,

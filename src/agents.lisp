@@ -50,7 +50,13 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
 ;;; whose CLI was started otherwise is refused.
 
 (defclass agent ()
-  ((id :initarg :id :reader agent-id :documentation ":claude or :codex")
+  ((metrics :initform nil :accessor agent-metrics)
+   (metrics-id :initform nil :accessor agent-metrics-id)
+   (metrics-start :initform nil :accessor agent-metrics-start)
+   (metrics-reporter :initform nil :accessor agent-metrics-reporter)
+   (metrics-seen :initform nil :accessor agent-metrics-seen)
+   (metrics-missing :initform nil :accessor agent-metrics-missing)
+   (id :initarg :id :reader agent-id :documentation ":claude or :codex")
    (name :initarg :name :reader agent-name)
    (partner-name :initarg :partner-name :accessor agent-partner-name)
    (directory :initarg :directory :initform nil :accessor agent-directory)
@@ -145,12 +151,13 @@ then :sent; :dropped if cancelled first")))
   (when (agent-listener agent)
     (apply (agent-listener agent) agent kind plist)))
 
-(defun agent-submit (agent prompt &optional callback attachments)
+(defun agent-submit (agent prompt &optional callback attachments metrics-reporter)
   "Have AGENT work on PROMPT, now or after the turns before it. CALLBACK
 gets the final reply's text and whether the turn failed (then the text
 says why). ATTACHMENTS are the paths of files given with PROMPT (see
-PROMPT-WITH-ATTACHMENTS)."
-  (setf (agent-queue agent) (append (agent-queue agent) (list (list prompt callback attachments))))
+PROMPT-WITH-ATTACHMENTS). METRICS-REPORTER, when supplied, receives a unique
+turn ID and a metrics plist once, before CALLBACK (or at cancellation)."
+  (setf (agent-queue agent) (append (agent-queue agent) (list (list prompt callback attachments metrics-reporter))))
   (unless (agent-busy agent) (agent-next agent)))
 
 (defgeneric agent-steer (agent prompt &optional images)
@@ -177,9 +184,15 @@ Preserve the running callback."
     (when next
       (when (and (consp (agent-retry agent)) (eq next (second (agent-retry agent))))
         (setf (agent-retry agent) :sent))
-      (destructuring-bind (prompt callback attachments) next
+      (destructuring-bind (prompt callback attachments &optional metrics-reporter) next
         (let ((text (prompt-with-attachments prompt attachments)))
-          (setf (agent-partial-text agent) ""
+          (setf (agent-metrics agent) nil
+                (agent-metrics-seen agent) nil
+                (agent-metrics-missing agent) nil
+                (agent-metrics-id agent) (make-uuid)
+                (agent-metrics-start agent) (clock-seconds)
+                (agent-metrics-reporter agent) metrics-reporter
+                (agent-partial-text agent) ""
                 (agent-busy agent) t
                 (agent-turn agent) next
                 (agent-stall-noticed agent) nil
@@ -194,11 +207,39 @@ Preserve the running callback."
               (handler-case (agent-begin-turn agent text)
                 (error (e) (agent-turn-finished agent (princ-to-string e) t)))))))))
 
+(defun metric-number (value)
+  (and (realp value) (<= 0 value) value))
+
+(defun agent-add-metrics (agent metrics &key id replace)
+  "Accept each indexed result once; Codex snapshots replace rather than add."
+  (when (and (agent-busy agent) (agent-metrics-start agent)
+             (or (null id) (not (member id (agent-metrics-seen agent) :test #'equal))))
+    (when id (push id (agent-metrics-seen agent)))
+    (loop for (key value) on metrics by #'cddr
+          for number = (metric-number value)
+          do (cond (replace
+                    (if number (setf (getf (agent-metrics agent) key) number)
+                        (remf (agent-metrics agent) key)))
+                   ((null number)
+                    (pushnew key (agent-metrics-missing agent))
+                    (remf (agent-metrics agent) key))
+                   ((not (member key (agent-metrics-missing agent)))
+                    (incf (getf (agent-metrics agent) key 0) number))))))
+
+(defun report-agent-metrics (agent &key incomplete)
+  "Publish once, before the reply callback can start another turn."
+  (let ((reporter (shiftf (agent-metrics-reporter agent) nil)))
+    (when (and reporter (agent-metrics-start agent))
+      (funcall reporter (agent-metrics-id agent)
+               (append (list :incomplete-p (and incomplete t) :elapsed-seconds (max 0 (- (clock-seconds) (agent-metrics-start agent))))
+                       (copy-list (agent-metrics agent)))))))
+
 (defun agent-turn-finished (agent text error)
   "The running turn ended with TEXT, its final reply, or with an ERROR (true;
 :out-of-usage when the account ran out)."
   (unless error (agent-has-usage agent))
   (when (agent-busy agent)
+    (report-agent-metrics agent :incomplete error)
     (let ((callback (agent-callback agent)))
       (setf (agent-busy agent) nil (agent-callback agent) nil (agent-turn agent) nil)
       (agent-deny-approvals agent)
@@ -223,6 +264,7 @@ it would wait for ever."
     (setf (car (agent-turn-token agent)) nil)
     (agent-deny-approvals agent)
     (when (agent-busy agent)
+      (report-agent-metrics agent :incomplete t)
       (setf (agent-callback agent) nil)
       (ignore-errors (agent-interrupt agent)))
     (dolist (callback (remove nil (cons running waiting)))
@@ -431,7 +473,9 @@ Running a command may need the user's approval; if one is denied, carry on witho
 (defparameter *claude-efforts* '("low" "medium" "high" "xhigh" "max"))
 
 (defclass claude-agent (agent)
-  ((process :initform nil :accessor claude-agent-process)
+  ((cost-process :initform nil :accessor claude-agent-cost-process)
+   (cost-total :initform 0 :accessor claude-agent-cost-total)
+   (process :initform nil :accessor claude-agent-process)
    (config :initform nil :accessor claude-agent-config :documentation "What the process was started with")
    (session-id :initform nil :accessor claude-agent-session-id)
    (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume")
@@ -624,6 +668,22 @@ folder): carry on the turn in a new conversation."
                                                            :on-error (turn-failure agent))))
                  (error (e) (agent-turn-finished agent (princ-to-string e) t))))))))
 
+(defun claude-result-cost (agent total &optional index)
+  "Claude reports a process-cumulative cost, unlike its per-result usage."
+  (unless (eq (claude-agent-process agent) (claude-agent-cost-process agent))
+    (setf (claude-agent-cost-process agent) (claude-agent-process agent)
+          (claude-agent-cost-total agent) 0))
+  (let* ((previous (claude-agent-cost-total agent))
+         (current (metric-number total))
+         (gap (and (integerp index) (> index (claude-agent-next-result-index agent))))
+         (delta (and (not gap) previous current (>= current previous) (- current previous))))
+    ;; An index gap or an absent cost field prevents attributing the delta
+    ;; to one result. Reestablish the baseline, leaving that value unknown.
+    ;; Without indexes, a missing result cannot be detected.
+    (when (or (null previous) (null current) (>= current previous))
+      (setf (claude-agent-cost-total agent) current))
+    delta))
+
 (defun claude-agent-result (agent event)
   ;; Out of usage only on this turn's evidence (its rate_limit_event said
   ;; rejected, or its error says so), never on what an earlier turn left
@@ -631,7 +691,16 @@ folder): carry on the turn in a new conversation."
   (let* ((text (event-text event))
          (error (event-error event))
          (index (event-result-index event))
-         (hit (shiftf (claude-agent-limit-hit agent) nil)))
+         (hit (shiftf (claude-agent-limit-hit agent) nil))
+         (cost (claude-result-cost agent (event-cost event) index)))
+    (when (or (not (integerp index)) (>= index (claude-agent-turn-result-start agent)))
+      (agent-add-metrics agent
+                         (list :cost-usd cost :duration-ms (event-duration event)
+                             :input-tokens (jget (event-data event) "input_tokens")
+                             :output-tokens (jget (event-data event) "output_tokens")
+                             :cache-read-tokens (jget (event-data event) "cache_read_input_tokens")
+                             :cache-write-tokens (jget (event-data event) "cache_creation_input_tokens"))
+                       :id (and (integerp index) (list (claude-agent-process agent) index))))
     ;; Advance before publishing completion: its callback may start the next
     ;; turn immediately on this same process. Use the index, not a received
     ;; result count, so gaps in delivery do not shift subsequent turns.
@@ -780,7 +849,8 @@ unless that turn is over by then."
   (if (or (not catalog-ready-p) (member effort choices :test #'equal)) effort nil))
 
 (defclass codex-agent (agent)
-  ((server :initform nil :accessor codex-agent-server)
+  ((metrics-baseline :initform nil :accessor codex-agent-metrics-baseline)
+   (server :initform nil :accessor codex-agent-server)
    (config :initform nil :accessor codex-agent-config :documentation "What the server was started with")
    (program :initarg :program :initform nil :accessor codex-agent-program)
    (thread-id :initform nil :accessor codex-agent-thread-id)
@@ -890,6 +960,29 @@ rather than using a server with no thread."
                                  (lambda (decision)
                                    (when (codex-alive-p server)
                                      (codex-answer-approval server id decision)))))))
+      (:token-usage
+       (when (and (equal (codex-event-thread-id event) (codex-agent-thread-id agent))
+                  (equal (codex-event-turn-id event) (codex-turn-id server)))
+         (let* ((data (codex-event-data event))
+                (last (jget data "last")) (total (jget data "total"))
+                (mapping '((:input-tokens . "inputTokens") (:output-tokens . "outputTokens")
+                           (:cache-read-tokens . "cachedInputTokens")
+                           (:reasoning-tokens . "reasoningOutputTokens") (:total-tokens . "totalTokens"))))
+           ;; LAST is one model request, not necessarily the whole tool-using
+           ;; turn. Anchor the cumulative thread total at its first update.
+           ;; Subtracting LAST also excludes usage from a resumed conversation.
+           (unless (codex-agent-metrics-baseline agent)
+             (setf (codex-agent-metrics-baseline agent)
+                   (loop for (key . field) in mapping
+                         for now = (metric-number (jget total field))
+                         for previous = (metric-number (jget last field))
+                         collect (cons key (and now previous (>= now previous) (- now previous))))))
+           (agent-add-metrics agent
+                              (loop for (key . field) in mapping
+                                    for baseline = (cdr (assoc key (codex-agent-metrics-baseline agent)))
+                                    for now = (metric-number (jget total field))
+                                    append (list key (and baseline now (>= now baseline) (- now baseline))))
+                              :replace t))))
       (:rate-limits (setf (agent-usage agent) (merge-rate-limits (agent-usage agent) (codex-event-data event)))
        (codex-agent-usage-changed agent))
       ((:stderr :protocol-error) (agent-note-stderr agent (codex-event-text event)))
@@ -922,7 +1015,8 @@ rather than using a server with no thread."
                                   (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s))))))
 
 (defmethod agent-begin-turn ((agent codex-agent) prompt)
-  (setf (codex-agent-last-text agent) nil)
+  (setf (codex-agent-last-text agent) nil
+        (codex-agent-metrics-baseline agent) nil)
   (let ((deliver (agent-deliver agent))
         (model (agent-model agent))
         (effort (agent-effort agent))

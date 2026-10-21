@@ -368,7 +368,13 @@ it too.
 When a task finishes, a summary card in the conversation gives its outcome
 (approved, not approved, done without review, failed), the check's result,
 the repository and the author's summary, with **Changes** and **Commit
-changes**. Nothing is committed until you click it, with the message in the
+changes**. It also shows elapsed time (including pauses), review rounds, open
+findings and the recorded changed files. Per-agent totals include reported token
+usage, Claude cost and CLI duration where available. Unknown values stay unknown;
+partial measurements are marked, including interrupted attempts. Claude input
+counts exclude cached input; Codex input counts include it, as their labels say.
+The file preview lists up to ten paths; Changes has the full list. These are CLI
+measurements, not a billing estimate. Recovery preserves the recorded turns. Nothing is committed until you click it, with the message in the
 box beside it (the request's first line to start with). The button is only
 enabled when the approved work's changes are still what's in the folder; when
 it isn't, the card says why (there's nothing to commit, say). The card then

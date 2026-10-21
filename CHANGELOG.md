@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Task completion cards show elapsed time (including pauses), review rounds,
+  open findings, changed files linked to Changes, and available per-agent token,
+  cost and CLI duration totals. Missing measurements stay unknown, and partial
+  measurements are marked. Turn records survive restart recovery; retries and
+  repeated usage events do not duplicate totals. Waiting for the final snapshot
+  updates only the file widgets, preserving summary expansion and text selection.
+  File previews are capped at ten paths; token labels distinguish cached input,
+  and gaps in Claude result indexes leave affected cost deltas unknown.
+
 ## 1.2.0 - 2026-10-21
 
 - Local images an agent mentions or generates show in its reply as

@@ -72,7 +72,10 @@
 (defparameter *default-max-rounds* 3)
 
 (defclass workflow ()
-  ((review-target :initarg :review-target :initform :uncommitted :reader workflow-review-target)
+  ((started-at :initform (get-universal-time) :accessor workflow-started-at)
+   (ended-at :initform nil :accessor workflow-ended-at)
+   (metrics :initform nil :accessor workflow-metrics)
+   (review-target :initarg :review-target :initform :uncommitted :reader workflow-review-target)
    (review-base :initarg :review-base :initform "HEAD" :reader workflow-review-base)
    (review-branch :initarg :review-branch :initform nil :reader workflow-review-branch)
    (review-count :initarg :review-count :initform 1 :reader workflow-review-count)
@@ -188,6 +191,79 @@ preserve the step for explicit recovery (PAUSE-STEP)."
   (when (workflow-on-checkpoint workflow)
     (funcall (workflow-on-checkpoint workflow) workflow)))
 
+(defparameter *turn-metric-keys*
+  '(:elapsed-seconds :duration-ms :cost-usd :input-tokens :output-tokens
+    :cache-read-tokens :cache-write-tokens :reasoning-tokens :total-tokens))
+
+(defun workflow-agent-submit (workflow step agent prompt callback)
+  ;; Persist an unknown entry before dispatch: a crash must not make a
+  ;; partially measured task look complete. Retries can publish more than once.
+  (let ((pending (make-uuid)))
+    (push (list :id pending :agent (agent-id agent) :role (step-role step) :metrics nil)
+          (workflow-metrics workflow))
+    (checkpoint-changed workflow)
+    (agent-submit agent prompt callback nil
+                  (lambda (id metrics)
+                    (unless (find id (workflow-metrics workflow) :key (lambda (m) (getf m :id)) :test #'equal)
+                      (setf (workflow-metrics workflow)
+                            (remove pending (workflow-metrics workflow)
+                                    :key (lambda (m) (getf m :id)) :test #'equal))
+                      (push (list :id id :agent (agent-id agent) :role (step-role step) :metrics metrics)
+                            (workflow-metrics workflow))
+                      (checkpoint-changed workflow))))))
+
+(defun task-metric-totals (workflow)
+  "Known sums and their coverage, so partial measurements never look complete."
+  (loop for agent in (list (workflow-lead workflow) (workflow-partner workflow))
+        for records = (remove (agent-id agent) (workflow-metrics workflow)
+                              :key (lambda (m) (getf m :agent)) :test-not #'eq)
+        collect (list :agent (agent-name agent) :agent-id (agent-id agent) :turns (length records)
+                      :incomplete-p (some (lambda (m) (getf (getf m :metrics) :incomplete-p)) records)
+                      :values (loop for key in *turn-metric-keys*
+                                    for values = (loop for record in records
+                                                       for v = (getf (getf record :metrics) key)
+                                                       when (metric-number v) collect v)
+                                    collect (list key (and values (reduce #'+ values)) (length values))))))
+
+(defun summary-metric (totals key label &optional (format-control "~d"))
+  (destructuring-bind (key value count) (assoc key (getf totals :values))
+    (declare (ignore key))
+    (if value
+        (format nil "~a ~a~a" label (format nil format-control value)
+                (if (and (= count (getf totals :turns)) (not (getf totals :incomplete-p))) "" " (partial)"))
+        (format nil "~a unknown" label))))
+
+(defun summary-files-text (files known)
+  (cond ((not known) "Changed files unavailable; use Changes for recorded snapshots.")
+        ((null files) "No files changed.")
+        (t (let* ((count (length files)) (more (max 0 (- count 10))))
+             (format nil "Files: ~{~a~^, ~}~a. See Changes for the full list."
+                     (subseq files 0 (min count 10))
+                     (if (plusp more) (format nil ", and ~d more" more) ""))))))
+
+(defun task-summary-lines (completion)
+  "Plain text facts shared by the GTK card and headless tests."
+  (append
+   (list (format nil "Elapsed: ~a (includes pauses)"
+                 (let ((seconds (getf completion :elapsed-seconds)))
+                   (if seconds (format nil "~dm ~ds" (floor seconds 60) (mod seconds 60)) "unknown")))
+         (format nil "Open findings: ~d" (getf completion :open-findings 0)))
+   (loop for round in (getf completion :rounds)
+         collect (format nil "~a: ~d review round~:p" (first round) (second round)))
+   (loop for totals in (getf completion :metrics)
+         append
+         (list (format nil "~a: ~d submitted turn~:p · ~a · ~a · ~a"
+                       (getf totals :agent) (getf totals :turns)
+                       (summary-metric totals :input-tokens
+                                       (if (eq (getf totals :agent-id) :claude)
+                                           "Uncached input tokens" "Input tokens (including cache)"))
+                       (summary-metric totals :output-tokens "Output tokens")
+                       (summary-metric totals :cost-usd "Cost" "$~,4f"))
+               (format nil "~a · ~a · ~a"
+                       (summary-metric totals :duration-ms "CLI duration (ms)")
+                       (summary-metric totals :cache-read-tokens "Cache read tokens")
+                       (summary-metric totals :cache-write-tokens "Cache write tokens"))))))
+
 (defun submit-step (workflow step)
   ;; A per-submission generation also rejects callbacks captured before cancellation.
   (unless (step-original-prompt step) (setf (step-original-prompt step) (step-prompt step)))
@@ -204,7 +280,7 @@ preserve the step for explicit recovery (PAUSE-STEP)."
     (unless (and (workflow-live-p workflow) (eq (step-state step) :running)
                  (= generation (step-generation step)))
       (return-from submit-step nil))
-    (agent-submit (step-agent step) (step-prompt step)
+    (workflow-agent-submit workflow step (step-agent step) (step-prompt step)
                   (lambda (text error)
                     (when (and (workflow-live-p workflow)
                                (= generation (step-generation step))
@@ -258,7 +334,8 @@ unapproved has its author address the last review. True if it carried on."
   (when (and (workflow-continuable-p workflow)
              (every #'agent-quiescent-p (list (workflow-lead workflow) (workflow-partner workflow))))
     (let ((loops (remove-if-not #'continuable-loop-p (workflow-loops workflow))))
-      (setf (workflow-state workflow) :running
+      (setf (workflow-ended-at workflow) nil
+            (workflow-state workflow) :running
             (workflow-completion-data workflow) nil
             (workflow-completion-error workflow) nil)
       (incf (workflow-max-rounds workflow) rounds)
@@ -893,7 +970,8 @@ Accept older snapshots too, so replay uses the same grouped presentation."
 ;;; Running
 
 (defun start-workflow (workflow)
-  (setf (workflow-state workflow) :running
+  (setf (workflow-ended-at workflow) nil
+        (workflow-state workflow) :running
         (workflow-completion-data workflow) nil
         (workflow-completion-error workflow) nil
         (workflow-commit-hash workflow) nil
@@ -1775,6 +1853,8 @@ the worktrees are kept: ~{~a~^, ~}."
 
 ;;; Completion cards and explicit user commits. The callback remains (WORKFLOW).
 (defun capture-workflow-completion (workflow)
+  (unless (workflow-ended-at workflow)
+    (setf (workflow-ended-at workflow) (get-universal-time)))
   (let* ((loops (workflow-loops workflow))
          (final (or (and (workflow-merged-loop workflow)
                         (list (workflow-merged-loop workflow))) loops))
@@ -1796,6 +1876,12 @@ the worktrees are kept: ~{~a~^, ~}."
              :name "completion repository capture")))
     (setf (workflow-completion-data workflow)
           (list :outcome outcome :review-status outcome
+                :elapsed-seconds (and (workflow-started-at workflow)
+                                      (max 0 (- (workflow-ended-at workflow) (workflow-started-at workflow))))
+                :metrics (task-metric-totals workflow)
+                :rounds (mapcar (lambda (l) (list (or (loop-label l) "Work") (loop-round l))) loops)
+                :open-findings (reduce #'+ loops :key (lambda (l) (count-findings (loop-findings l) :open))
+                                       :initial-value 0)
                 :summary (or (workflow-completion-error workflow)
                              (let ((summaries (remove-if
                                                (lambda (text) (or (null text) (zerop (length text))))
@@ -2076,6 +2162,19 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                  "conversation" (agent-conversation-handle agent)
                  "unavailable" (agent-out-until agent))))
     (jobj "version" 1 "mode" (workflow-mode workflow) "state" (workflow-state workflow)
+          "ended-at" (when (member (workflow-state workflow) '(:finished :stopped))
+                       (or (workflow-ended-at workflow)
+                           (setf (workflow-ended-at workflow) (get-universal-time))))
+          "started-at" (workflow-started-at workflow)
+          "metrics" (coerce (mapcar (lambda (record)
+                                     (jobj "id" (getf record :id) "agent" (getf record :agent)
+                                           "role" (getf record :role)
+                                           "incomplete" (getf (getf record :metrics) :incomplete-p)
+                                           "values" (apply #'jobj
+                                                           (loop for key in *turn-metric-keys*
+                                                                 append (list (string-downcase key)
+                                                                              (getf (getf record :metrics) key))))))
+                                   (workflow-metrics workflow)) 'vector)
           "request" (workflow-request workflow) "max-rounds" (workflow-max-rounds workflow)
           "check-command" (workflow-check-command workflow)
           "review-target" (workflow-review-target workflow) "review-base" (workflow-review-base workflow)
@@ -2191,7 +2290,18 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
                (or (find (recovery-keyword id) (list lead partner) :key #'agent-id)
                    (error "Unknown checkpoint agent ~a" id)))
              (loop-for (index) (when (integerp index) (nth index (workflow-loops workflow)))))
-      (setf (workflow-state workflow) :paused
+      (setf (workflow-ended-at workflow) (metric-number (jget checkpoint "ended-at"))
+            (workflow-started-at workflow) (metric-number (jget checkpoint "started-at"))
+            (workflow-metrics workflow)
+            (loop for record in (jlist (jget checkpoint "metrics"))
+                  when (stringp (jget record "id"))
+                  collect (list :id (jget record "id") :agent (recovery-keyword (jget record "agent"))
+                                :role (recovery-keyword (jget record "role"))
+                                :metrics (append (list :incomplete-p (jtrue-p (jget record "incomplete")))
+                                                 (loop for key in *turn-metric-keys*
+                                                       for v = (metric-number (jget record "values" (string-downcase key)))
+                                                       when v append (list key v)))))
+            (workflow-state workflow) :paused
             (workflow-home workflow) (or (recovery-path (jget checkpoint "home"))
                                           (recovery-path (jget checkpoint "agents" 0 "directory")))
             ;; Raw PIDs from older checkpoints have no identity and cannot
@@ -2362,7 +2472,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
     ;; A part done against an earlier version of its prerequisite isn't merged.
     (when (some #'loop-stale-p (workflow-loops workflow))
       (return-from recover-integration :blocked))
-    (setf (workflow-state workflow) :running
+    (setf (workflow-ended-at workflow) nil
+          (workflow-state workflow) :running
           (workflow-completion-error workflow) nil)
     ;; Older checkpoints mark even commit failures :INTERRUPTED. Every
     ;; part needs a retained commit in the journal before we may merge.
@@ -2439,7 +2550,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
         (return-from recover-workflow :pending-shutdown))
       (return-from recover-workflow
         (cond ((workflow-pending-plan workflow)
-               (setf (workflow-state workflow) :running)
+               (setf (workflow-ended-at workflow) nil
+                     (workflow-state workflow) :running)
                (when (workflow-on-plan workflow)
                  (funcall (workflow-on-plan workflow) workflow
                           (getf (workflow-pending-plan workflow) :lead)
@@ -2467,7 +2579,8 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
         (unless (assoc agent (workflow-review-access workflow))
           (push (cons agent (agent-read-only-p agent)) (workflow-review-access workflow)))
         (setf (agent-read-only-p agent) t))
-      (setf (workflow-state workflow) :running
+      (setf (workflow-ended-at workflow) nil
+            (workflow-state workflow) :running
             (workflow-recovery-baseline workflow) (jget inspection "repositories")
             (workflow-recovery-capture workflow) nil
             (workflow-recovery-stale workflow) (remove :baseline (workflow-recovery-stale workflow)))
@@ -2865,7 +2978,8 @@ RECOVER-WORKFLOW has checked the repositories, INSPECTION."
            :pending-shutdown)
           ((and (eq action :revise-order) (agent-out-of-usage-p (workflow-lead workflow))) :unavailable)
           (t
-           (setf (workflow-state workflow) :running
+           (setf (workflow-ended-at workflow) nil
+                 (workflow-state workflow) :running
                  (workflow-recovery-baseline workflow) (jget inspection "repositories")
                  (workflow-recovery-capture workflow) nil
                  (workflow-recovery-stale workflow) (remove :baseline (workflow-recovery-stale workflow)))

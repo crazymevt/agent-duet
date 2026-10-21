@@ -276,6 +276,10 @@ the rest of the session) or :deny."
                                                                        (format nil "Turn ~a" status))))
                                                       :turn-id (jget turn "id") :thread-id thread-id
                                                       :data turn))))
+     ((equal method "thread/tokenUsage/updated")
+      (codex-deliver-event server (make-codex-event :kind :token-usage
+                                                   :thread-id thread-id :turn-id turn-id
+                                                   :data (jget params "tokenUsage"))))
      ((equal method "account/rateLimits/updated")
       (codex-deliver-event server (make-codex-event :kind :rate-limits :data (jget params "rateLimits"))))
      ((equal method "error")
