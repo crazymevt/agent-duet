@@ -204,6 +204,23 @@
                (assert (<= (gdk:paintable-get-intrinsic-height (gtk:picture-get-paintable picture)) 240)))
              (assert (search "Home screen" (gtk:label-get-text (first (find-widgets button 'gtk:label)))))
              (assert (string= "Next line" (gtk:label-get-text after))))
+           ;; Wrapped alt text uses the same normalized input for text and images.
+           (let ((children (rendered (format nil "Before ![Home~%screen](mock.png) after"))))
+             (assert (= 2 (length children)))
+             (assert (string= "Before  after" (gtk:label-get-text (first children))))
+             (assert (typep (second children) 'gtk:button)))
+           ;; Failed and size-limited previews are cached and remain openable.
+           (let ((*image-thumbnails* (make-hash-table :test #'equal)))
+             (let ((path (merge-pathnames "broken.png" root)))
+               (assert (null (image-thumbnail-texture path)))
+               (assert (eq :none (gethash (list (namestring path) (file-write-date path))
+                                          *image-thumbnails*)))))
+           (let ((*image-thumbnails* (make-hash-table :test #'equal))
+                 (*image-preview-max-pixels* 1))
+             (assert (null (image-thumbnail-texture (merge-pathnames "mock.png" root)))))
+           (let ((*image-thumbnails* (make-hash-table :test #'equal))
+                 (*image-preview-max-bytes* 1))
+             (assert (null (image-thumbnail-texture (merge-pathnames "mock.png" root)))))
            ;; An image alone leaves no empty label; <…> paths may hold spaces;
            ;; absolute paths and file URIs work without the project directory.
            (dolist (text (list "![](<mock ups/home 2.png>)"
@@ -236,11 +253,14 @@
              (pane-delta claude "Mockup: ![Home](mo")
              (assert (null (find-widgets (pane-messages *middle*) 'gtk:button)))
              (pane-delta claude "ck.png)")
-             (pane-text claude "Mockup: ![Home](mock.png)")
+             (setf (agent-directory *claude*) root)
+             (let ((*directory* (uiop:temporary-directory)))
+               (pane-text claude "Mockup: ![Home](mock.png)"))
              (assert (= 1 (length (find-widgets (pane-messages *middle*) 'gtk:picture))))
              (clear-agent-pane claude)
              (clear-box (pane-messages *middle*))
              ;; A restored conversation resolves against its own folder.
+             (setf (agent-directory *claude*) (uiop:temporary-directory))
              (let ((history (make-history root))
                    (*directory* (uiop:temporary-directory)))
                (history-add-entry history :claude :text "Saved ![Home](mock.png)")

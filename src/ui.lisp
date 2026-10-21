@@ -114,22 +114,29 @@ otherwise its description and where it was expected."
         (mapc #'walk (markdown-inlines line)))
       (nreverse found))))
 
+(defparameter *image-preview-max-bytes* (* 20 1024 1024))
+(defparameter *image-preview-max-pixels* 16000000)
+
 (defun image-thumbnail-texture (path)
-  "PATH's image, scaled down to fit *IMAGE-THUMBNAIL-SIZE*; nil if it can't be read."
+  "Return a bounded preview, caching failures too. Oversized files remain openable."
   (let ((key (list (namestring path) (ignore-errors (file-write-date path)))))
-    (or (gethash key *image-thumbnails*)
-        (let ((texture
-                (ignore-errors
-                 (let ((name (uiop:native-namestring path)))
-                   (multiple-value-bind (format width height) (gdk-pixbuf:pixbuf-get-file-info name)
-                     (when (and format (plusp width) (plusp height))
-                       (gdk:texture-new-for-pixbuf
-                        (gdk-pixbuf:pixbuf-new-from-file-at-scale
-                         name (min width (first *image-thumbnail-size*))
-                         (min height (second *image-thumbnail-size*)) t))))))))
-          (when texture
-            (when (>= (hash-table-count *image-thumbnails*) 64) (clrhash *image-thumbnails*))
-            (setf (gethash key *image-thumbnails*) texture))))))
+    (multiple-value-bind (cached present) (gethash key *image-thumbnails*)
+      (when present (return-from image-thumbnail-texture (unless (eq cached :none) cached))))
+    (let ((texture
+            (ignore-errors
+              (when (with-open-file (in path :element-type '(unsigned-byte 8))
+                      (<= (file-length in) *image-preview-max-bytes*))
+                (let ((name (uiop:native-namestring path)))
+                  (multiple-value-bind (format width height) (gdk-pixbuf:pixbuf-get-file-info name)
+                    (when (and format (plusp width) (plusp height)
+                               (<= (* width height) *image-preview-max-pixels*))
+                      (gdk:texture-new-for-pixbuf
+                       (gdk-pixbuf:pixbuf-new-from-file-at-scale
+                        name (min width (first *image-thumbnail-size*))
+                        (min height (second *image-thumbnail-size*)) t)))))))))
+      (when (>= (hash-table-count *image-thumbnails*) 64) (clrhash *image-thumbnails*))
+      (setf (gethash key *image-thumbnails*) (or texture :none))
+      texture)))
 
 (defun open-image-artifact (path widget)
   "Open the image file PATH in the system's viewer."
@@ -260,6 +267,18 @@ though labels show it. Text in markup is escaped, so each < starts a tag."
             (gtk:label-set-text label text))
         label))))
 
+(defun normalize-image-lines (text)
+  "Keep wrapped image syntax together for both prose and thumbnail parsing."
+  (let ((result (copy-seq text)))
+    (labels ((walk (node)
+               (if (eq (first node) :image)
+                   (loop for i from (second node) below (third node)
+                         when (char= (char result i) #\Newline)
+                           do (setf (char result i) #\Space))
+                   (mapc #'walk (sixth node)))))
+      (mapc #'walk (markdown-inlines text)))
+    result))
+
 (defun render-prose (box text)
   "Append TEXT's prose to BOX. A line showing local images ends its label,
 and the images follow it as thumbnails."
@@ -268,7 +287,7 @@ and the images follow it as thumbnails."
              (let ((label (and lines (prose-label (format nil "~{~a~^~%~}" (reverse lines))))))
                (when label (gtk:box-append box label)))
              (setf lines '())))
-      (dolist (line (split-lines text))
+      (dolist (line (split-lines (normalize-image-lines text)))
         (push line lines)
         (let ((images (line-images line)))
           (when images
@@ -941,20 +960,23 @@ Finished text, a new turn and clearing the pane explicitly discard that pending 
 
 (defun pane-text (pane text)
   "A finished block of a reply: rendered in place of what was streamed."
-  (ensure-conversation-reply pane)
-  (when (agent-pane-conversation-box pane)
-    (setf (agent-pane-conversation-placeholder-p pane) nil)
-    (clear-box (agent-pane-conversation-box pane))
-    (render-markdown (agent-pane-conversation-box pane) text)
-    (push (cons text (gtk:widget-get-parent (agent-pane-conversation-box pane)))
-          (agent-pane-conversation-replies pane))
-    (pane-scroll-to-end *middle*))
-  (let ((box (or (agent-pane-stream-box pane)
-                 (pane-append pane (make-instance 'gtk:box :orientation :vertical :spacing 6)))))
-    (clear-box box)
-    (render-markdown box text)
-    (pane-finish-stream pane nil)
-    (pane-scroll-to-end pane)))
+  (let ((*image-directory* (or *image-directory*
+                              (agent-directory (agent-pane-agent pane))
+                              *directory*)))
+    (ensure-conversation-reply pane)
+    (when (agent-pane-conversation-box pane)
+      (setf (agent-pane-conversation-placeholder-p pane) nil)
+      (clear-box (agent-pane-conversation-box pane))
+      (render-markdown (agent-pane-conversation-box pane) text)
+      (push (cons text (gtk:widget-get-parent (agent-pane-conversation-box pane)))
+            (agent-pane-conversation-replies pane))
+      (pane-scroll-to-end *middle*))
+    (let ((box (or (agent-pane-stream-box pane)
+                   (pane-append pane (make-instance 'gtk:box :orientation :vertical :spacing 6)))))
+      (clear-box box)
+      (render-markdown box text)
+      (pane-finish-stream pane nil)
+      (pane-scroll-to-end pane))))
 
 (defun set-agent-activity (pane text &optional error)
   "Keep the latest command/edit visible without adding transcript rows."
