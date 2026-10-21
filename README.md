@@ -14,16 +14,27 @@ The window has a shared conversation and a panel for each agent:
 - **The conversation between them.** Your request, each plan, each report of
   work done, and each review, passed from one agent to the other. Under its
   heading, a progress line says where the task has got to (planning,
-  working, in review, waiting for you, paused); **Workflow progress** expands
-  into its stages, with a split plan's parts side by side, each with its own
-  round. A plan is shown as approved only once you've approved it, and a
-  check is never shown as passed.
+  working, in review, waiting for you, paused) and, while one part is
+  current, its round (`Working · Round 1 of 3`). Below it, the stages read
+  as one compact row, `✓ Plan — ● Working — ○ Done`: ✓ done, ● in progress,
+  ! waiting for you, ✕ failed, – skipped, ○ not started. A split plan's parts
+  run side by side, so they share one step, stacked; the current, blocked or
+  failed stage says why underneath. Hover a stage for its state and detail,
+  or open **Stage details** for every stage's. A plan is shown as approved
+  only once you've approved it, and a check is never shown as passed.
 - **Claude's panel and ChatGPT's panel.** Everything each agent does: the
   prompts it gets, its reply as it streams, its tool calls (expand one to see
   its output). A line under each agent's name says what it is doing in the
   task (planning, working, reviewing, fixing, running the check, waiting,
   paused, out of usage) and is marked when it needs you. **Transcript**
   collapses or expands the stream; an approval or a question opens it.
+
+Claude is marked in peach and ChatGPT in teal throughout: their names, the
+edge of each message and of each agent's latest action, and their status
+pills. Approvals and questions are cards with a blue edge, set apart from the
+thread; tool calls and thinking are compact disclosures to expand. The colors
+follow the light or dark theme, and text on them keeps at least 4.5:1
+contrast in both.
 
 **Workspace › Layout** (top right) arranges them:
 
@@ -35,9 +46,12 @@ The window has a shared conversation and a panel for each agent:
 - **Three panes**: Claude on the left, the conversation in the middle,
   ChatGPT on the right.
 - **Conversation only**: the agents' panels are hidden, and the conversation
-  shows each agent's approval cards and questions (answering one there
-  answers that agent), with a line saying what each is doing, its CLI's
-  readiness and its remaining usage.
+  has a line saying what each agent is doing, its CLI's readiness and its
+  remaining usage.
+
+In every layout, each agent's approval cards and questions appear in the
+conversation as well as in its transcript. Answering either copy answers the
+agent, and both show the answer.
 
 Use **Cmd+Option** on macOS or **Ctrl+Alt** on Linux with these keys:
 
@@ -75,28 +89,51 @@ also enlarge the window to fit its controls; GTK may keep that larger window
 width after it closes. Resize the window to make it smaller again. Short
 transcripts scroll to keep attention controls reachable.
 
-Each agent's panel also has its own box for talking to that agent alone.
-While it works, press Return or **Send now** to send more instructions without
-stopping it. The agent picks them up when its protocol allows; a tool already
+Below the conversation, one box talks to the agents. Its menu chooses who
+gets the message:
+
+- **To both agents**: with no task running and neither agent busy, Return or
+  **Start collaboration** starts a task (see *Working together*); with no
+  task but an agent busy on a turn of its own, the message goes to both,
+  steering the busy one. During a
+  task, the message steers only the task's agents that are working on a
+  turn; an agent waiting for its next step isn't sent anything, so the task
+  stays in order. If neither is working, the message is kept until one is.
+- **To Claude** or **To ChatGPT**: the message goes to that agent alone,
+  steering it if it's working, or starting a turn of its own if not.
+
+Each message you send appears in the conversation as *You → Claude* or
+*You → ChatGPT*. If a delivery fails (an agent still stopping, say), the
+message and its attachments stay in the box, with the error shown; sending it
+again goes only to the agents that didn't get it.
+
+Each agent's panel puts its activity first: the latest action, then
+**Transcript**. Its model and thinking choices are under **Model & thinking**,
+and its own box is under **Message Claude directly** (or ChatGPT); whether
+each is expanded is remembered. From that box, while the agent works, press
+Return or **Send now** to send more instructions without stopping it. The agent picks them up when its protocol allows; a tool already
 running can finish first. **Stop** is a separate button. Messages sent while
 working use the current turn's model and permissions. If Codex is still starting,
 wait for it to begin responding and send again; a delivery failure is shown with
 the message text so you can retry.
 
-Drop files or images on an agent panel's message box to attach them to your next
-message to that agent. Each shows as a chip above the box (× takes it off).
+Drop files or images on the conversation's box, or on an agent panel's own
+box, to attach them to the next message sent from it. Each shows as a chip
+above the box (× takes it off).
 The message lists their paths, so the agent can read them, and images (PNG,
 JPEG, GIF, WebP, up to 3 MB) are also shown to it: as image blocks for Claude,
-as local images for Codex. Dropping files on the shared task box types
-their paths into the request instead.
+as local images for Codex. A task started with attachments lists their paths
+in its request.
 
 ## Working together
 
-Type a request in **Task for both agents**, under the conversation, and press
-Return or **Start collaboration**. Choose how they work with the controls
-above it (mode, lead and *Rounds*); **Workflow settings** expands to *Approve
-plan*, *Own worktrees*, the check command and the review-only choices. The
-mode, lead, rounds and whether the settings are expanded are remembered.
+With **To both agents** chosen, type a request in the box under the
+conversation and press Return or **Start collaboration**. A line above it sums
+up how they'll work (`Write & review · Claude leads · 3 rounds`).
+**Workflow settings** expands to the mode, lead and *Rounds*, *Approve plan*,
+*Own worktrees*, the check command and the review-only choices. The mode,
+lead, rounds and whether the settings are expanded are remembered.
+**Stop collaboration** ends the task.
 
 
 
@@ -443,8 +480,9 @@ libraries used to build them.
 - `src/workflow-presentation.lisp`: what a task and each agent are doing,
   as the progress line, its stages and the agents' panels show it. No GTK.
 - `src/ui.lisp`: the window, its layouts and message delivery.
-- `src/ui-presentation.lisp`: the progress and workflow-settings widgets,
-  transcripts, and the sidebar's narrow-window adaptation.
+- `src/ui-presentation.lisp`: the progress line and stage sequence, the
+  workflow-settings widgets, transcripts, the stylesheet for messages, cards,
+  composers and agent panels, and the sidebar's narrow-window adaptation.
 - `src/terminal.lisp`: the Terminal panel (VTE through CFFI, from Cadre).
 - `src/preview.lisp`: the Documents window (Cadre's Markdown preview, read-only).
 - `src/snapshot.lisp`: recording a folder's state as git commits, and the

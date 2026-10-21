@@ -196,3 +196,135 @@
         (gtk:window-destroy window)
         (setf *controls* nil)))))
 (format t "~&Checklist layout checks passed.~%")
+
+;; The presentation stylesheet parses cleanly, so no rule is silently dropped.
+(let ((provider (gtk:css-provider-new)) (errors '()))
+  (gobject:connect provider "parsing-error"
+                   (lambda (provider section error)
+                     (declare (ignore provider))
+                     (push (list section error) errors)))
+  (gtk:css-provider-load-from-string provider (gtk:css *presentation-css*))
+  (assert (null errors) () "Presentation CSS has ~d parsing errors" (length errors)))
+
+(defun layout-test-widgets (widget &optional class)
+  "WIDGET's descendants, depth first, with CSS CLASS if given."
+  (loop for child = (gtk:widget-get-first-child widget) then (gtk:widget-get-next-sibling child)
+        while child
+        when (or (null class) (gtk:widget-has-css-class child class)) collect child
+        append (layout-test-widgets child class)))
+
+(defun layout-test-texts (widget class)
+  (mapcar #'gtk:label-get-text (layout-test-widgets widget class)))
+
+;; A split task's stages: a compact, wrapping sequence with the current phase
+;; and round, parts side by side, and every stage's state in Stage details.
+(let* ((*settings* nil) (*controls* nil) (*panes* nil) (*workflow* nil)
+       (*claude* nil) (*codex* nil)
+       (stages (list (list :id :proposals :label "Proposals" :state :complete :detail nil)
+                     (list :id :plan :label "Plan" :state :complete :detail "Approved")
+                     (list :id :approval :label "Your approval" :state :skipped :detail nil)
+                     (list :id :lead-part :label "Claude's part" :state :active
+                           :detail "Working · round 2")
+                     (list :id :partner-part :label "ChatGPT's part" :state :pending
+                           :detail "Waits for Claude")
+                     (list :id :merge :label "Merge the parts" :state :error
+                           :detail "Stopped before all parts merged")
+                     (list :id :merged-result :label "The merged result" :state :active
+                           :detail "Paused: out of usage" :attention-p t)
+                     (list :id :finish :label "Done" :state :pending :detail nil)))
+       (presentation (list :label "Working" :round 2 :max-rounds 3 :concurrent-p nil :stages stages))
+       (original (symbol-function 'workflow-progress-presentation))
+       (progress (make-instance 'gtk:label))
+       (window (make-instance 'gtk:window :default-width 360 :default-height 400)))
+  (unwind-protect
+       (progn
+         (setf (symbol-function 'workflow-progress-presentation) (lambda (workflow)
+                                                                   (declare (ignore workflow))
+                                                                   presentation))
+         (setf (getf *controls* :progress) progress)
+         (let ((details (make-progress-details)))
+           (gtk:window-set-child window
+                                 (gtk:build (gtk:box :orientation :vertical :width-request 320
+                                                     progress details)))
+           (refresh-workflow-presentation)
+           (gtk:window-present window)
+           (settle-layout-test-window 300)
+           (assert (string= "Working · Round 2 of 3" (gtk:label-get-text progress)))
+           (assert (gtk:widget-has-css-class progress "duet-progress-label"))
+           (assert (search "ChatGPT's part: not started — Waits for Claude"
+                           (gtk:widget-get-tooltip-text progress)))
+           (let* ((sequence (control :progress-details))
+                  (flow (gtk:widget-get-first-child sequence)))
+             ;; Seven steps: the two parts share one, unordered.
+             (assert (= 7 (length (layout-test-widgets flow "duet-sequence-step"))))
+             (assert (= 6 (length (layout-test-widgets flow "duet-step-connector"))))
+             (assert (equal '("✓" "✓" "–" "●" "○" "✕" "!" "○")
+                            (layout-test-texts flow "duet-step-marker")))
+             (let ((group (layout-test-widgets flow "duet-step-group")))
+               (assert (= 1 (length group)))
+               (assert (equal '("Claude's part" "ChatGPT's part")
+                              (layout-test-texts (first group) "duet-step-label"))))
+             ;; Current, blocked and failed stages say why; the rest keep it in tooltips.
+             (assert (equal '("Working · round 2" "Stopped before all parts merged" "Paused: out of usage")
+                            (layout-test-texts flow "duet-step-detail")))
+             (assert (= 1 (length (layout-test-widgets flow "duet-step-error"))))
+             (assert (= 1 (length (layout-test-widgets flow "duet-step-attention"))))
+             (assert (= 2 (length (layout-test-widgets flow "duet-step-pending"))))
+             ;; Status, not controls: nothing in the row takes focus or
+             ;; activates, but every stage is under the pointer for its tooltip.
+             (assert (not (gtk:widget-get-can-focus flow)))
+             (assert (not (gtk:flow-box-get-activate-on-single-click flow)))
+             (loop for child = (gtk:widget-get-first-child flow) then (gtk:widget-get-next-sibling child)
+                   while child do (assert (not (gtk:widget-get-focusable child))))
+             (dolist (stage (layout-test-widgets flow "duet-step"))
+               (multiple-value-bind (ok x y)
+                   (gtk:widget-translate-coordinates stage window 2d0 2d0)
+                 (assert ok)
+                 (let ((picked (gtk:widget-pick window x y '(:default))))
+                   (assert (and picked (gtk:widget-is-ancestor picked stage)
+                                (gtk:widget-get-tooltip-text stage))
+                           () "~a can't be hovered" (gtk:widget-get-tooltip-text stage)))))
+             ;; It wraps to the conversation's 320px minimum.
+             (assert (<= (gtk:widget-measure details :horizontal -1) 320))
+             (assert (<= (gtk:widget-get-width details) 360)))
+           (let ((rows (layout-test-widgets (control :progress-stage-details) "duet-step-row")))
+             (assert (= 8 (length rows)))
+             (assert (string= "! The merged result: needs you — Paused: out of usage"
+                              (gtk:label-get-text (nth 6 rows))))
+             (assert (gtk:widget-has-css-class (nth 5 rows) "duet-step-error")))
+           (assert (gtk:widget-get-visible (control :progress-stage-expander)))
+           (gtk:expander-set-expanded (control :progress-stage-expander) t)
+           (assert (eq t (setting :workflow-progress-expanded)))
+           ;; Unchanged presentations keep their widgets; no task hides it all.
+           (let ((flow (gtk:widget-get-first-child (control :progress-details))))
+             (refresh-workflow-presentation)
+             (assert (eq flow (gtk:widget-get-first-child (control :progress-details)))))
+           (setf presentation (list :label "Not started" :round nil :max-rounds nil :stages '()))
+           (refresh-workflow-presentation)
+           (assert (string= "Not started" (gtk:label-get-text progress)))
+           (assert (null (gtk:widget-get-first-child (control :progress-details))))
+           (assert (not (gtk:widget-get-visible (control :progress-stage-expander))))))
+    (setf (symbol-function 'workflow-progress-presentation) original)
+    (gtk:window-destroy window)
+    (settle-layout-test-window 100)))
+(format t "~&Workflow progress UI checks passed.~%")
+
+;; Transcripts stay expandable and styled, and approvals reopen them.
+(let* ((*settings* nil) (*controls* nil) (*panes* nil) (*workflow* nil)
+       (*claude* (make-instance 'claude-agent :id :claude :name "Claude"))
+       (*codex* (make-instance 'codex-agent :id :codex :name "ChatGPT")))
+  (dolist (agent (list *claude* *codex*))
+    (push (cons (agent-id agent) (make-agent-pane agent)) *panes*))
+  (dolist (agent (list *claude* *codex*))
+    (let ((transcript (control (agent-setting-key agent "TRANSCRIPT"))))
+      (assert (gtk:widget-has-css-class transcript "duet-transcript"))
+      (gtk:expander-set-expanded transcript nil)
+      (assert (not (gtk:widget-get-vexpand transcript)))
+      (reveal-agent-transcript (agent-pane-of agent))
+      (assert (gtk:expander-get-expanded transcript))
+      (assert (gtk:widget-get-vexpand transcript))))
+  (refresh-workflow-presentation)
+  (let ((pill (control (agent-setting-key *claude* "WORKFLOW-ACTIVITY"))))
+    (assert (gtk:widget-has-css-class pill "duet-pill-claude"))
+    (assert (gtk:widget-has-css-class pill "duet-pill-idle"))))
+(format t "~&Transcript and pill UI checks passed.~%")
