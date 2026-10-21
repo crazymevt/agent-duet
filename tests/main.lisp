@@ -167,6 +167,11 @@
     (unwind-protect (is equal '() (ai::load-settings file))
       (ignore-errors (delete-file file)))))
 
+(defmacro finishes-in-time (&body body)
+  "BODY's value, or :hung if it runs for more than five seconds."
+  `(handler-case (sb-ext:with-timeout 5 ,@body)
+     (sb-ext:timeout () :hung)))
+
 (define-test settings-malformed-files
     :parent agent-duet
   ;; A file that reads but isn't a plist is no settings; read-time
@@ -175,10 +180,64 @@
         (ai::*settings* '(:theme :dark)))
     (unwind-protect
          (dolist (text '("42" "\"settings\"" "(:theme :dark :view)" "(:theme :dark . :light)"
-                         "#(:theme :dark)" "(:view #.(error \"evaluated\"))" ""))
+                         "#(:theme :dark)" "(:view #.(error \"evaluated\"))" ""
+                         ;; Circular top-level lists, which the reader accepts.
+                         "#1=(:theme :dark . #1#)" "#1=(:theme :dark :view :sidebar . #1#)"))
            (with-open-file (out file :direction :output :if-exists :supersede) (write-string text out))
-           (is equal '() (ai::load-settings file) "~s" text))
+           (is equal '() (finishes-in-time (ai::load-settings file)) "~s" text))
       (ignore-errors (delete-file file)))))
+
+(define-test settings-circular-values
+    :parent agent-duet
+  ;; Circular or dotted values are dropped on load, keeping the other
+  ;; settings, so reading, saving and updating them all finish.
+  (let* ((config (merge-pathnames (format nil "duet-config-~d/" (random 1000000)) (uiop:temporary-directory)))
+         (file (merge-pathnames "agent-duet/settings.lisp" config))
+         (old (uiop:getenv "XDG_CONFIG_HOME"))
+         (ai::*settings* '()))
+    (setf (uiop:getenv "XDG_CONFIG_HOME") (namestring config))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist file)
+           (with-open-file (out file :direction :output :if-exists :supersede)
+             (write-string "(:sidebar-positions #1=(700 . #1#) :agents-left-positions (480 420)
+                             :pane-positions #2=(300 900 . #2#) :view :agents-left
+                             :recent-folders #3=(\"/a/\" . #3#) :check-commands ((\"/b/\" . \"make\") . #4=(#4#))
+                             :workflow-mode (2 . 3) :shared-notes #5=#2A((#5#)) :theme :dark)" out))
+           (is equal '(:agents-left-positions (480 420) :view :agents-left :theme :dark)
+               (finishes-in-time (ai::load-settings file)))
+           (false (finishes-in-time (ai::layout-positions :sidebar)))
+           (is equal '(480 420) (finishes-in-time (ai::layout-positions :agents-left)))
+           (false (finishes-in-time (ai::layout-positions :panes)))
+           (is = 0 (ai::saved-choice-index :workflow-mode 4))
+           (false (finishes-in-time (ai::folder-check-command "/b/")))
+           (finishes-in-time (ai::note-recent-folder "/c/"))
+           (is equal '("/c/") (ai::setting :recent-folders))
+           (finishes-in-time (ai::load-settings file))
+           (is equal '("/c/") (ai::setting :recent-folders))
+           (is eq :dark (ai::setting :theme))
+           (is equal '(480 420) (ai::layout-positions :agents-left)))
+      (setf (uiop:getenv "XDG_CONFIG_HOME") (or old ""))
+      (uiop:delete-directory-tree config :validate t :if-does-not-exist :ignore)))
+  ;; Circular or dotted positions set in memory are ignored too, for each
+  ;; layout, without disturbing the others.
+  (let ((ai::*settings* '()))
+    (dolist (case '((:sidebar :sidebar-positions) (:agents-left :agents-left-positions) (:panes :pane-positions)))
+      (destructuring-bind (view key) case
+        (dolist (value (list (let ((l (list 700 360))) (setf (cddr l) l) l)
+                             (let ((l (list 700))) (setf (cdr l) l) l)
+                             '(700 360 . 200)))
+          (setf ai::*settings* (list key value :sidebar-positions '(950 400) :agents-left-positions '(480 420)
+                                     :pane-positions '(300 900)))
+          (false (finishes-in-time (ai::layout-positions view)) "~s" view)
+          (dolist (other '((:sidebar (950 400)) (:agents-left (480 420)) (:panes (300 900))))
+            (unless (eq (first other) view)
+              (is equal (second other) (ai::layout-positions (first other))))))))
+    ;; Malformed check commands and recent folders are skipped.
+    (setf ai::*settings* (list :check-commands '(("/a/" . "make") 42 ("/b/" . 7) nil) :recent-folders '(3 "/x/")))
+    (is equal "make" (ai::folder-check-command "/a/"))
+    (false (ai::folder-check-command "/b/"))
+    (is equal '(("/a/" . "make")) (ai::check-commands))))
 
 (define-test layout-preferences
     :parent agent-duet
