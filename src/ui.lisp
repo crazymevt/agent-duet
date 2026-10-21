@@ -1085,7 +1085,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
       (when visible
         (remember-layout)
         (setf (getf *controls* :pre-checklist-positions)
-              (unless (control :narrow-layout)
+              (unless (or (control :narrow-layout) (control :equalize-agent-panels))
                 (list (gtk:paned-get-position (control :agent-split))
                       (gtk:paned-get-position (control :conversation-split))))))
       (unless visible
@@ -1238,7 +1238,8 @@ and a line saying what each is doing.")
 
 (defun remember-layout ()
   "Remember divider positions for the current layout, independently of other views."
-  (when (and (control :agent-split) (not (control :narrow-layout)) (not (eq *view* :conversation)))
+  (when (and (control :agent-split) (not (control :narrow-layout))
+             (not (control :equalize-agent-panels)) (not (eq *view* :conversation)))
     (setf (setting (layout-position-key *view*))
           (or (control :restore-checklist-positions)
               (control :pre-checklist-positions)
@@ -1254,9 +1255,11 @@ and a line saying what each is doing.")
         (claude (control :claude-widget))
         (codex (control :codex-widget)))
     (when outer
+      (migrate-agent-panel-positions)
       (setf (getf *controls* :narrow-layout) nil)
       (remf *controls* :last-wide-positions)
       (remf *controls* :pending-layout-positions)
+      (remf *controls* :equalize-agent-panels)
       (gtk:orientable-set-orientation outer :horizontal)
       ;; The retained three-pane layout must respect each pane's minimum
       ;; size; otherwise dragging a divider can hide approvals and questions.
@@ -1286,8 +1289,19 @@ and a line saying what each is doing.")
       (unless (eq view :conversation)
         (let* ((saved (layout-positions view))
                (width (let ((width (gtk:widget-get-width outer))) (if (plusp width) width 1440))))
-          (gtk:paned-set-position outer (or (first saved) (round (* width (case view (:sidebar 0.66) (:agents-left 0.34) (t 0.30))))))
-          (gtk:paned-set-position inner (or (second saved) (if (sidebar-view-p view) 360 470))))))))
+          ;; Apply after allocation: the inner pane still has its old axis and
+          ;; extent here. Its default divider is calculated in the next frame.
+          (setf (getf *controls* :pending-layout-positions)
+                (list (or (first saved) (round (* width (case view (:sidebar 0.66) (:agents-left 0.34) (t 0.30)))))
+                      (or (second saved)
+                          (if (sidebar-view-p view)
+                              (equal-agent-divider-position view
+                                (let ((height (gtk:widget-get-height outer)))
+                                  (if (plusp height) height 720)))
+                              (equal-agent-divider-position view
+                                (round (* width 0.70)) (round (* width 0.30)))))))
+          (unless saved
+            (setf (getf *controls* :equalize-agent-panels) :pending)))))))
 
 (defun set-view (view)
   "Show VIEW and persist the layout and its divider positions."

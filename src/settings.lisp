@@ -120,6 +120,22 @@ Entries with circular values are dropped, keeping the rest."
                (every (lambda (n) (and (integerp n) (<= 0 n 100000))) positions))
       positions)))
 
+(defun equal-agent-divider-position (view available &optional (other-agent-size 0))
+  "Divider within AVAILABLE child space (excluding its handle).
+In Three panes the first agent is outside this split, with OTHER-AGENT-SIZE.
+Sidebar and responsive layouts split the child space in half."
+  (max 0 (if (eq view :panes)
+             (- available other-agent-size)
+             (floor available 2))))
+
+(defun migrate-agent-panel-positions ()
+  "Discard legacy defaults once: they were saved without distinguishing drags.
+Subsequent saved positions, including deliberate unequal splits, are retained."
+  (unless (setting :equal-agent-panels-version)
+    (dolist (view '(:sidebar :agents-left :panes))
+      (remf *settings* (layout-position-key view)))
+    (setf (setting :equal-agent-panels-version) 1)))
+
 (defun saved-choice-index (key count)
   "Return a valid dropdown index, tolerating obsolete or malformed settings."
   (let ((index (setting key 0)))

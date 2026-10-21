@@ -61,13 +61,15 @@
       (unless (or narrow (control :narrow-layout)
                   (control :pre-checklist-positions)
                   (control :restore-checklist-positions)
-                  (control :pending-layout-positions))
+                  (control :pending-layout-positions)
+                  (control :equalize-agent-panels))
         (setf (getf *controls* :last-wide-positions)
               (list (gtk:paned-get-position outer) (gtk:paned-get-position inner))))
       (when (and narrow (control :narrow-layout)
                  (not (eq (gtk:orientable-get-orientation inner)
                           (if (>= width 680) :horizontal :vertical))))
         (gtk:orientable-set-orientation inner (if (>= width 680) :horizontal :vertical))
+        (setf (getf *controls* :equalize-agent-panels) :pending)
         (setf (getf *controls* :pending-layout-positions)
               (list (round (* (gtk:widget-get-height outer) (if (>= width 680) 0.60 0.40)))
                     (if (>= width 680) (round (/ width 2))
@@ -76,7 +78,8 @@
         (when (and narrow (control :last-wide-positions)
                    (not (control :pre-checklist-positions))
                    (not (control :restore-checklist-positions))
-                   (not (control :pending-layout-positions)))
+                   (not (control :pending-layout-positions))
+                   (not (control :equalize-agent-panels)))
           (setf (setting (layout-position-key *view*)) (control :last-wide-positions)))
         (setf (getf *controls* :narrow-layout) narrow)
         ;; In either sidebar view, narrow windows put the conversation first.
@@ -88,6 +91,10 @@
           (gtk:paned-set-end-child outer (control (if narrow :conversation-split :middle-widget))))
         (gtk:orientable-set-orientation outer (if narrow :vertical :horizontal))
         (gtk:orientable-set-orientation inner (if (and narrow (>= width 680)) :horizontal :vertical))
+        (setf (getf *controls* :equalize-agent-panels)
+              (when (or narrow (not (or (control :restore-checklist-positions)
+                                        (layout-positions *view*))))
+                :pending))
         (if narrow
             (setf (getf *controls* :pending-layout-positions)
                   (list (round (* (gtk:widget-get-height outer) (if (>= width 680) 0.60 0.40)))
@@ -118,6 +125,18 @@
                  :css-classes (if (or (getf stage :attention-p) (eq (getf stage :state) :error))
                                   '("duet-stage" "warning") '("duet-stage"))))
 
+(defun equalize-agent-panels ()
+  "Set the default divider from allocated child sizes, excluding the handle."
+  (let* ((inner (control :conversation-split))
+         (claude (control :claude-widget))
+         (codex (control :codex-widget))
+         (horizontal (eq (gtk:orientable-get-orientation inner) :horizontal))
+         (extent (if horizontal #'gtk:widget-get-width #'gtk:widget-get-height))
+         (start (if (eq *view* :panes) (control :middle-widget) claude))
+         (available (+ (funcall extent start) (funcall extent codex))))
+    (gtk:paned-set-position
+     inner (equal-agent-divider-position *view* available (funcall extent claude)))))
+
 (defun watch-conversation-allocation (widget)
   "Observe rendered allocations; queue another only for staged restoration."
   (dolist (split (list widget (control :conversation-split)))
@@ -128,7 +147,8 @@
                    (>= (gtk:widget-get-width widget) 940)
                    (not (control :pre-checklist-positions))
                    (not (control :restore-checklist-positions))
-                   (not (control :pending-layout-positions)))
+                   (not (control :pending-layout-positions))
+                   (not (control :equalize-agent-panels)))
           (setf (getf *controls* :last-wide-positions)
                 (list (gtk:paned-get-position widget)
                       (gtk:paned-get-position (control :conversation-split))))))))
@@ -142,12 +162,26 @@
               ;; Orientation changes queue another allocation. Set positions
               ;; only after that allocation, or GtkPaned scales them using the
               ;; previous axis and loses the user's wide divider positions.
+              ;; The outer divider needs one allocation before the inner
+              ;; divider can use the actual available agent space. Only new
+              ;; layouts are equalized; subsequent user drags stay untouched.
+              (when (eq (control :equalize-agent-panels) :ready)
+                (equalize-agent-panels)
+                (remf *controls* :equalize-agent-panels)
+                (unless (control :narrow-layout)
+                  (setf (getf *controls* :last-wide-positions)
+                        (list (gtk:paned-get-position widget)
+                              (gtk:paned-get-position (control :conversation-split))))))
               (let ((pending (control :pending-layout-positions)))
                 (when pending
                   (gtk:paned-set-position widget (first pending))
                   (gtk:paned-set-position (control :conversation-split) (second pending))
                   (remf *controls* :pending-layout-positions)
-                  (setf (getf *controls* :last-wide-positions) pending)))
+                  (unless (or (control :equalize-agent-panels) (control :narrow-layout))
+                    (setf (getf *controls* :last-wide-positions) pending))
+                  (when (eq (control :equalize-agent-panels) :pending)
+                    (setf (getf *controls* :equalize-agent-panels) :ready)
+                    (gtk:widget-queue-allocate widget))))
               (let ((current (list (gtk:widget-get-width widget)
                                    (gtk:widget-get-height widget) *view*)))
                 (unless (equal size current)
