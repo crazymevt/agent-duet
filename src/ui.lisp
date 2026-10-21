@@ -261,6 +261,8 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   (attachments '())                           ; the paths of the files dropped on its message box
   chips                                       ; the box showing them
   (stream-box nil) (stream-label nil) (stream-text "")
+  (conversation-box nil) (conversation-label nil) (conversation-activity nil)
+  (conversation-replies nil) ; completed text/bubble pairs eligible for a handoff
   (tools (make-hash-table :test 'equal))
   (activity-text "No commands yet") (activity-id nil) (activity-title "") (activity-labels '())
   (approvals (make-hash-table :test 'equal))  ; approval id → its cards: (button row . widgets to disable)s
@@ -724,10 +726,35 @@ answer settles it, wherever it was given."
                                                       :css-classes (if (eq decision :deny) '("error") '("dim-label")))))
       (pane-update-status pane))))
 
+(defvar *mirror-agent-replies* t "Mirror live replies, but not transcript history replay.")
+
+(defun ensure-conversation-reply (pane)
+  "Give this reply its own conversation bubble and command line."
+  (when (and *mirror-agent-replies* *middle* (not (agent-pane-conversation-box pane)))
+    (let* ((agent (agent-pane-agent pane))
+           (bubble (middle-bubble (agent-id agent) (agent-name agent) ""))
+           (body (gtk:widget-get-last-child bubble))
+           (label (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t
+                                          :wrap-mode :word-char)))
+      ;; Only the newest message follows live commands; older messages keep
+      ;; the command that accompanied them.
+      (setf (agent-pane-activity-labels pane)
+            (remove (agent-pane-conversation-activity pane)
+                    (agent-pane-activity-labels pane)))
+      (gtk:box-append body label)
+      (let ((activity (make-agent-activity-label pane)))
+        (gtk:box-append bubble activity)
+        (setf (agent-pane-conversation-activity pane) activity))
+      (setf (agent-pane-conversation-box pane) body
+            (agent-pane-conversation-label pane) label))))
+
 (defun pane-finish-stream (pane)
+  (setf (agent-pane-conversation-box pane) nil
+        (agent-pane-conversation-label pane) nil)
   (setf (agent-pane-stream-box pane) nil (agent-pane-stream-label pane) nil (agent-pane-stream-text pane) ""))
 
 (defun pane-delta (pane text)
+  (ensure-conversation-reply pane)
   (unless (agent-pane-stream-box pane)
     (let ((box (make-instance 'gtk:box :orientation :vertical :spacing 6))
           (label (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t :wrap-mode :word-char)))
@@ -737,10 +764,20 @@ answer settles it, wherever it was given."
             (agent-pane-stream-text pane) "")))
   (setf (agent-pane-stream-text pane) (concatenate 'string (agent-pane-stream-text pane) text))
   (gtk:label-set-text (agent-pane-stream-label pane) (agent-pane-stream-text pane))
+  (when (agent-pane-conversation-label pane)
+    (gtk:label-set-text (agent-pane-conversation-label pane) (agent-pane-stream-text pane))
+    (pane-scroll-to-end *middle*))
   (pane-scroll-to-end pane))
 
 (defun pane-text (pane text)
   "A finished block of a reply: rendered in place of what was streamed."
+  (ensure-conversation-reply pane)
+  (when (agent-pane-conversation-box pane)
+    (clear-box (agent-pane-conversation-box pane))
+    (render-markdown (agent-pane-conversation-box pane) text)
+    (push (cons text (gtk:widget-get-parent (agent-pane-conversation-box pane)))
+          (agent-pane-conversation-replies pane))
+    (pane-scroll-to-end *middle*))
   (let ((box (or (agent-pane-stream-box pane)
                  (pane-append pane (make-instance 'gtk:box :orientation :vertical :spacing 6)))))
     (clear-box box)
@@ -770,6 +807,8 @@ answer settles it, wherever it was given."
 (defun pane-tool (pane id title)
   (setf (agent-pane-activity-id pane) id
         (agent-pane-activity-title pane) title)
+  (unless (agent-pane-conversation-activity pane)
+    (ensure-conversation-reply pane))
   (set-agent-activity pane (format nil "Running · ~a" title))
   (let ((entry (gethash id (agent-pane-tools pane)))
         (label (format nil "⚙ ~a" title)))
@@ -851,7 +890,9 @@ few such prompts made resizing take a large part of a second.")
       (reconcile-stall-cards agent)
       (ecase kind
         (:busy (pane-set-busy pane busy) (update-controls))
-        (:prompt (pane-prompt pane text))
+        (:prompt
+         (setf (agent-pane-conversation-replies pane) nil)
+         (pane-prompt pane text))
         (:delta (pane-delta pane text))
         (:text (pane-text pane text))
         (:thinking (pane-thinking pane text))
@@ -869,6 +910,10 @@ few such prompts made resizing take a large part of a second.")
          (when error (pane-note pane (or text "The turn failed.") "error")))))))
 
 (defun clear-agent-pane (pane)
+  (setf (agent-pane-activity-labels pane)
+        (remove (agent-pane-conversation-activity pane) (agent-pane-activity-labels pane))
+        (agent-pane-conversation-activity pane) nil
+        (agent-pane-conversation-replies pane) nil)
   (clear-box (pane-messages pane))
   (setf (agent-pane-activity-id pane) nil
         (agent-pane-activity-title pane) "")
@@ -955,36 +1000,37 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun replay-history (history)
   "Show HISTORY's entries in the panes, as they were."
-  (dolist (entry (history-entries history))
-    (destructuring-bind (&key who kind text &allow-other-keys) entry
-      (case who
-        ((:claude :codex)
-         (let ((pane (cdr (assoc who *panes*))))
+  (let ((*mirror-agent-replies* nil))
+    (dolist (entry (history-entries history))
+      (destructuring-bind (&key who kind text &allow-other-keys) entry
+        (case who
+          ((:claude :codex)
+           (let ((pane (cdr (assoc who *panes*))))
+             (case kind
+               (:prompt (pane-prompt pane text))
+               (:text (pane-text pane text))
+               (:tool (pane-note pane (format nil "⚙ ~a" text) "dim-label" "duet-tool"))
+               (:error (pane-note pane text "error"))
+               (t (pane-note pane text)))))
+          (:user (middle-bubble :user "You  ·  request" text))
+          (:middle
            (case kind
-             (:prompt (pane-prompt pane text))
-             (:text (pane-text pane text))
-             (:tool (pane-note pane (format nil "⚙ ~a" text) "dim-label" "duet-tool"))
-             (:error (pane-note pane text "error"))
-             (t (pane-note pane text)))))
-        (:user (middle-bubble :user "You  ·  request" text))
-        (:middle
-         (case kind
-           (:text
-            ;; The header, as MIDDLE-MESSAGE wrote it, says whose it was.
-            (let* ((end (or (search (format nil "~%~%") text) (length text)))
-                   (header (subseq text 0 end))
-                   (body (string-left-trim '(#\Newline) (subseq text end))))
-              (cond
-                ((string= header "Check") (middle-check body))
-                ;; Earlier conversations saved checklists as "Review checklist".
-                ((member header '("Task checklist" "Review checklist") :test #'string=)
-                 (show-checklist body :notify nil))
-                (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
-                                        ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
-                                        (t :user))
-                                  header body)))))
-           (:error (pane-note *middle* text "error"))
-           (t (pane-note *middle* text "dim-label" "duet-note"))))))))
+             (:text
+              ;; The header, as MIDDLE-MESSAGE wrote it, says whose it was.
+              (let* ((end (or (search (format nil "~%~%") text) (length text)))
+                     (header (subseq text 0 end))
+                     (body (string-left-trim '(#\Newline) (subseq text end))))
+                (cond
+                  ((string= header "Check") (middle-check body))
+                  ;; Earlier conversations saved checklists as "Review checklist".
+                  ((member header '("Task checklist" "Review checklist") :test #'string=)
+                   (show-checklist body :notify nil))
+                  (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
+                                          ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
+                                          (t :user))
+                                    header body)))))
+             (:error (pane-note *middle* text "error"))
+             (t (pane-note *middle* text "dim-label" "duet-note")))))))))
 
 (defun format-history-time (time)
   (multiple-value-bind (s minute hour day month year) (decode-universal-time time)
@@ -1172,6 +1218,36 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                          (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
                          (markdown-box text)))))
 
+(defun middle-agent-message (agent header text)
+  "Promote an existing live reply to a handoff instead of repeating it."
+  (let* ((pane (agent-pane-of agent))
+         (replies (and pane
+                       (remove-if-not
+                        (lambda (entry)
+                          (eq (gtk:widget-get-parent (cdr entry)) (pane-messages *middle*)))
+                        (agent-pane-conversation-replies pane))))
+         ;; Claude's result is separate from its streamed text blocks. Prefer
+         ;; the matching block, then the newest reply from this prompt.
+         (entry (or (find text replies :key #'car
+                          :test (lambda (a b)
+                                  (string= (string-trim '(#\Space #\Tab #\Return #\Newline) a)
+                                           (string-trim '(#\Space #\Tab #\Return #\Newline) b))))
+                    (first replies)))
+         (bubble (cdr entry)))
+    (if (and bubble (eq (gtk:widget-get-parent bubble) (pane-messages *middle*)))
+        (progn
+          (gtk:label-set-text (gtk:widget-get-first-child bubble) header)
+          ;; A fallback may contain only the last block of a longer result.
+          ;; Show the authoritative handoff without disturbing its command.
+          (let ((body (gtk:widget-get-next-sibling (gtk:widget-get-first-child bubble))))
+            (clear-box body)
+            (render-markdown body text))
+          (pane-scroll-to-end *middle*)
+          (setf (agent-pane-conversation-replies pane)
+                (remove entry (agent-pane-conversation-replies pane)))
+          bubble)
+        (middle-bubble (agent-id agent) header text))))
+
 (defun middle-message (from to text kind)
   (cond
     ((eq kind :findings)
@@ -1196,7 +1272,9 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                                   (format nil "~a: ~(~a~)" label
                                           (if (eq (review-verdict text) :approved) "approved" "changes requested"))
                                   label)))))
-        (middle-bubble (if (eq from :user) :user (agent-id from)) header text)
+        (if (eq from :user)
+            (middle-bubble :user header text)
+            (middle-agent-message from header text))
         ;; The request is the conversation's title; the rest keep their header.
         (if (eq from :user)
             (record :user :prompt text)
@@ -1364,15 +1442,14 @@ and a line saying what each is doing.")
     (refresh-activity)))
 
 (defun agent-activity (agent)
-  "Workflow detail and remaining usage; the conversation header has a state pill."
+  "Workflow detail and remaining usage beside the conversation header pill."
   (when (or (null *workflow*) (not (workflow-agent-member-p *workflow* agent)))
     (return-from agent-activity (gtk:label-get-text (pane-status (agent-pane-of agent)))))
   (let* ((presentation (workflow-agent-presentation *workflow* agent))
          (usage (usage-summary (agent-usage-windows agent))))
     (format nil "~{~a~^ · ~}"
             (remove nil
-                    (list (unless (eq *view* :conversation) (getf presentation :label))
-                          (getf presentation :detail)
+                    (list (getf presentation :detail)
                           (and (not (agent-out-of-usage-p agent))
                                (not (eq (agent-out-until agent) :unknown)) usage
                                (format nil "~a left" usage)))))))
@@ -1380,7 +1457,7 @@ and a line saying what each is doing.")
 (defun refresh-activity ()
   "Bring the shared conversation's agent status lines up to date."
   (refresh-workflow-presentation)
-  ;; The conversation-only view has its own copy of each header pill.
+  ;; The shared conversation has its own copy of each header pill.
   (dolist (agent (list *claude* *codex*))
     (when agent
       (let ((source (control (agent-setting-key agent "WORKFLOW-ACTIVITY")))
@@ -1400,8 +1477,8 @@ and a line saying what each is doing.")
                                                    '("warning") '("dim-label"))))))
 
 (defun make-activity-strip ()
-  "Keep status and usage beside each name, with command activity underneath.
-Model controls and workflow pills are available when the agent panels are hidden."
+  "Keep workflow pills and usage beside each name.
+Model controls are available when the agent panels are hidden."
   (let ((claude (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")))
         (codex (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label"))))
     (flet ((agent-column (agent label)
@@ -1410,15 +1487,8 @@ Model controls and workflow pills are available when the agent panels are hidden
                 (gtk:box :orientation :vertical :spacing 4
                          (gtk:box :spacing 6
                                   (gtk:label :label (agent-name agent) :css-classes (list "caption-heading" (agent-css-class agent)))
-                                  (view-only :conversation label)
-                                  (view-only :conversation
-                                             (make-workflow-activity-pill agent "WORKFLOW-STATUS-PILL")))
-                         (let ((doing (make-agent-activity-label (agent-pane-of agent))))
-                           ;; The strip already supplies the surrounding margins.
-                           (gtk:widget-set-margin-start doing 0)
-                           (gtk:widget-set-margin-end doing 0)
-                           (gtk:widget-set-margin-bottom doing 0)
-                           doing)
+                                  label
+                                  (make-workflow-activity-pill agent "WORKFLOW-STATUS-PILL"))
                          (let ((controls (wrapping-controls models efforts)))
                            ;; Lined up with the agent's name, as the strip has its own margins.
                            (gtk:widget-set-margin-start controls 0)

@@ -433,9 +433,10 @@ libraries used to build them.
 make test-parallel             # full suite, eight isolated workers
 make test-parallel TEST_JOBS=2  # reduce memory/CPU usage
 make test                       # sequential, for debugging a failure
+make test-ui                   # GTK conversation checks; requires a display
 ```
 
-They run without GTK or the CLIs: the workflows are driven by scripted agents.
+The main suite runs without GTK or the CLIs: the workflows are driven by scripted agents.
 The fake CLIs and review enforcement use Lisp; Python is not required.
 
 The parallel target compiles the suite once before starting workers, then splits
