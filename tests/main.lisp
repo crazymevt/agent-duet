@@ -279,6 +279,62 @@
     (false (ai::layout-positions :agents-left))
     (is equal '(950 400) (ai::layout-positions :sidebar))))
 
+(define-test agent-panels-start-equal
+    :parent agent-duet
+  ;; EQUAL-AGENT-DIVIDER-POSITION places the inner divider within AVAILABLE,
+  ;; the combined extent of its two children (excluding the handle). In Three
+  ;; panes Claude's pane lies outside that split, with the given extent.
+  (flet ((agents (view available &optional (claude 0))
+           ;; The two agent panels' extents that the position produces.
+           (let ((position (ai::equal-agent-divider-position view available claude)))
+             (true (and (integerp position) (<= 0 position available)) "~s ~s" view position)
+             (if (eq view :panes)
+                 (list claude (- available position))
+                 (list position (- available position))))))
+    ;; Both sidebar layouts, wide (stacked agents) or narrow (side by side or
+    ;; stacked), take the same split: at even, odd and degenerate extents.
+    (dolist (view '(:sidebar :agents-left))
+      (dolist (available '(820 821 1 0))
+        (destructuring-bind (claude codex) (agents view available)
+          (true (<= (abs (- claude codex)) 1) "~s ~d: ~d ~d" view available claude codex))))
+    ;; Three panes: Codex matches Claude, the middle pane takes the rest,
+    ;; including the first frame's estimate from a 1440 wide window.
+    (dolist (case '((1008 432) (1009 300) (600 300) (300 300)))
+      (destructuring-bind (available claude) case
+        (is equal (list claude claude) (agents :panes available claude) "~s" case)))
+    ;; Claude wider than the space left: no negative position.
+    (agents :panes 200 432)))
+
+(define-test agent-panel-positions-migrate-once
+    :parent agent-duet
+  ;; Positions saved before equal sizing were defaults, not drags: they are
+  ;; discarded once, and positions saved afterwards are respected.
+  (let* ((config (merge-pathnames (format nil "duet-config-~d/" (random 1000000)) (uiop:temporary-directory)))
+         (old (uiop:getenv "XDG_CONFIG_HOME"))
+         (ai::*settings* (list :sidebar-positions '(950 400) :agents-left-positions '(480 420)
+                               :pane-positions '(300 900) :view :panes :theme :dark)))
+    (setf (uiop:getenv "XDG_CONFIG_HOME") (namestring config))
+    (unwind-protect
+         (progn
+           (ai::migrate-agent-panel-positions)
+           (dolist (view '(:sidebar :agents-left :panes))
+             (false (ai::layout-positions view) "~s" view))
+           (is eq :panes (ai::setting :view))
+           (is eq :dark (ai::setting :theme))
+           ;; The migration is recorded on disk, so a restart keeps new drags.
+           (setf ai::*settings* '())
+           (ai::load-settings)
+           (true (ai::setting :equal-agent-panels-version))
+           (setf (ai::setting :sidebar-positions) '(900 300)
+                 (ai::setting :pane-positions) '(320 960))
+           (ai::migrate-agent-panel-positions)
+           (ai::load-settings)
+           (ai::migrate-agent-panel-positions)
+           (is equal '(900 300) (ai::layout-positions :sidebar))
+           (is equal '(320 960) (ai::layout-positions :panes)))
+      (setf (uiop:getenv "XDG_CONFIG_HOME") (or old ""))
+      (uiop:delete-directory-tree config :validate t :if-does-not-exist :ignore))))
+
 (define-test layout-preferences-survive-restart
     :parent agent-duet
   (let ((file (merge-pathnames (format nil "duet-settings-~d.lisp" (random 1000000)) (uiop:temporary-directory)))
