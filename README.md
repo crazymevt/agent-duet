@@ -374,11 +374,27 @@ usage, Claude cost and CLI duration where available. Unknown values stay unknown
 partial measurements are marked, including interrupted attempts. Claude input
 counts exclude cached input; Codex input counts include it, as their labels say.
 The file preview lists up to ten paths; Changes has the full list. These are CLI
-measurements, not a billing estimate. Recovery preserves the recorded turns. Nothing is committed until you click it, with the message in the
-box beside it (the request's first line to start with). The button is only
-enabled when the approved work's changes are still what's in the folder; when
-it isn't, the card says why (there's nothing to commit, say). The card then
-shows the commit, or why it failed.
+measurements, not a billing estimate. Recovery preserves the recorded turns.
+
+Before a writing task starts, a folder with uncommitted changes opens a
+commit preview. Choose **Commit and start task**, **Continue without
+committing**, or **Cancel**. Review-only tasks keep their existing behavior.
+If you commit only some files, the remaining changes are offered again before
+starting; continuing preserves them as the task's starting state. During a
+merge or rebase that prevents committing, Continue and Cancel remain available.
+Own worktrees still requires a clean starting repository.
+
+After approved work, **Commit changes** opens a file selection and diff preview.
+Task-changed files are preselected, except files already dirty before the task,
+which are marked and left unselected. Choose **Select all changes** or **Select
+task-changed files**, then adjust individual files. The task-changed preset
+restores the default selection, excluding previously dirty files. Selection is by whole file:
+a selected file includes earlier edits and edits you made while the task ran.
+The editable message starts with the author's suggested subject. Preparing the
+preview leaves your staging untouched; committing preserves staging for files
+you leave out. Git hooks still run. If the folder changes after completion or
+after preview, the commit is refused so you can review its current state.
+Nothing is committed until you click the explicit commit button.
 
 ## What they may do
 

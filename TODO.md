@@ -25,7 +25,7 @@ sequence, see [the implementation plan](docs/implementation-plan.md).
 Review-only mode and restart recovery are complete. The task summary card is
 implemented for review. Remaining agreed priorities, in order:
 
-1. **Commit at the end**, completing the selection and preview flow below.
+1. **Commit at the end:** implemented for review, including the pre-task dirty-folder prompt.
 2. **Undo a task** (below).
 
 The earlier top five, and the rest:
@@ -53,7 +53,7 @@ The earlier top five, and the rest:
 Later:
 
 - [ ] **Undo a task:** Revert what changed in the folder during the task, building on the changes view: apply the reverse of the task's diff (start → end snapshot) to the current tree, as a three-way merge, so edits made after the task are kept. Files where they conflict are listed and left untouched, not overwritten. Shows the reverse diff before applying. The start → end diff can't tell the agents' changes from edits the user made in the folder while the task ran, so those are reversed too: the confirmation says so, and lets files be left out. (Telling them apart would need per-turn snapshots or the agents' own edit events, which is not planned here.)
-- [ ] **Commit at the end:** After an approved task outside *Own worktrees*, offer **Commit**: the task's changed files (from the changes view) are preselected, files that were already changed before the task are unselected and marked, the user can change the selection, and the staged diff is shown with a message drafted by the lead (editable) before committing.
+- [x] **Commit at the end:** After an approved task outside *Own worktrees*, offer **Commit**: the task's changed files (from the changes view) are preselected, files that were already changed before the task are unselected and marked, the user can change the selection, and the proposed staged diff is shown with a message drafted by the lead (editable) before committing. Before writing tasks, offer committing current edits, continuing with them, or cancelling. Completion offers all changes or task-changed files; selected files include all their edits, and excluded files retain their staging. Implemented for review.
 - [ ] **Cost and time in status lines:** Turn records and per-task CLI metric totals are implemented in the completion card. Showing per-turn totals in status lines remains open.
 - [x] **End-of-task summary card:** Files changed (linked to the changes view), rounds per loop, check result, open findings, elapsed time and available per-agent CLI metrics in one card. Unknown/partial values are explicit and turn records survive recovery.
 - [ ] **Search** in a pane (⌘F) and in the conversation list.

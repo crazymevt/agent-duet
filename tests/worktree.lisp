@@ -148,7 +148,7 @@
          (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory repo))
          (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Test work")))
     (when dirty (write-worktree-file repo "existing.txt" "user edit"))
-    (setf (ai::workflow-repository-start workflow) (ai::repository-state repo)
+    (setf (ai::workflow-repository-start workflow) (ai::repository-start-state repo)
           (ai:workflow-state workflow) :running
           (ai:workflow-loops workflow)
           (list (ai::make-review-loop :author author :reviewer reviewer :state :approved
@@ -235,7 +235,7 @@
       (is eq :error (getf (ai:commit-workflow-changes workflow) :status)))))
 
 (define-test completion-commit-refusals :parent agent-duet
-  (dolist (scenario '(:dirty :later-edit :later-untracked :staged :branch :merge :busy :unapproved :failed-check))
+  (dolist (scenario '(:later-edit :later-untracked :staged :branch :merge :busy :unapproved :failed-check))
     (with-worktree-repository (repo trees)
       (let* ((workflow (completed-test-workflow repo :dirty (eq scenario :dirty)))
              (head (ai::worktree-git-line repo "rev-parse" "HEAD")))
@@ -248,7 +248,7 @@
         (ai::finish-workflow workflow)
       (ai::await-completion-capture workflow)
         (ecase scenario
-          ((:dirty :unapproved :failed-check) nil)
+          ((:unapproved :failed-check) nil)
           (:later-edit (write-worktree-file repo "shared.txt" "later edit"))
           (:later-untracked (write-worktree-file repo "new.txt" "later content"))
           (:staged (ai::worktree-git repo "add" "shared.txt"))
@@ -340,9 +340,10 @@
       (write-worktree-file repo "shared.txt" "later work")
       (ai::finish-workflow workflow)
       (ai::await-completion-capture workflow)
-      (false (getf (ai:workflow-completion workflow) :can-commit))
-      (true (search "untracked files before this work"
-                    (getf (ai:workflow-completion workflow) :commit-reason))))))
+      (true (getf (ai:workflow-completion workflow) :can-commit))
+      (let ((preview (ai::prepare-repository-commit repo :start (ai::workflow-repository-start workflow))))
+        (is equal '("shared.txt") (getf preview :paths))
+        (true (member "existing.txt" (getf preview :dirty) :test #'equal))))))
 
 (define-test completion-error-cleared-on-continue :parent agent-duet
   (let* ((author (make-instance 'fake-agent :id :claude :name "Claude" :replies (list (says "Fixed"))))
@@ -366,9 +367,7 @@
            (entered (sb-thread:make-semaphore))
            (release (sb-thread:make-semaphore))
            (capture-thread nil))
-      (is equal '(:root :status)
-          (loop for (key value) on (ai::repository-start-state repo) by #'cddr
-                collect key))
+      (true (getf (ai::repository-start-state repo) :tree))
       (unwind-protect
            (progn
              (setf (symbol-function 'ai::repository-state)
@@ -842,3 +841,117 @@
           (is equal '("shared.txt") files))
         (true (ai::merge-in-progress-p tree))
         (true (search "<<<<<<<" (uiop:read-file-string (merge-pathnames "shared.txt" tree))))))))
+
+(define-test commit-selection-preserves-preexisting-staging :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (write-worktree-file repo "shared.txt" "before task")
+    (ai::worktree-git repo "add" "shared.txt")
+    (write-worktree-file repo "shared.txt" "unstaged before task")
+    (write-worktree-file repo "existing.txt" "earlier untracked")
+    (let ((workflow (completed-test-workflow repo))
+          (staged (ai::worktree-git repo "diff" "--cached")))
+      (write-worktree-file repo "shared.txt" "overlapping task edit")
+      (write-worktree-file repo (uiop:parse-native-namestring "task[1].txt") "task output")
+      (ai::finish-workflow workflow)
+      (ai::await-completion-capture workflow)
+      (let* ((preview (ai::prepare-repository-commit repo :start (ai::workflow-repository-start workflow)))
+             (all (ai::prepare-repository-commit repo :start (ai::workflow-repository-start workflow)
+                                                 :paths (getf preview :all))))
+        (is equal '("task[1].txt") (getf preview :paths))
+        (true (member "shared.txt" (getf preview :changed) :test #'equal))
+        (true (member "shared.txt" (getf preview :dirty) :test #'equal))
+        (true (search "overlapping task edit" (getf all :diff)))
+        (false (search "overlapping task edit" (getf preview :diff)))
+        (is string= staged (ai::worktree-git repo "diff" "--cached"))
+        (is eq :committed (getf (ai:commit-workflow-changes workflow :preview preview :message "Add task output") :status))
+        (is string= staged (ai::worktree-git repo "diff" "--cached"))
+        (is string= (format nil "overlapping task edit~%") (uiop:read-file-string (merge-pathnames "shared.txt" repo)))
+        (is string= "base" (ai::worktree-git-line repo "show" "HEAD:shared.txt"))))))
+
+(define-test commit-preview-stale-and-preflight :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (write-worktree-file repo "existing.txt" "current edits")
+    (let ((preview (ai::prepare-repository-commit repo)))
+      (true (search "current edits" (getf preview :diff)))
+      (write-worktree-file repo "existing.txt" "later edits")
+      (fail (ai::commit-repository-preview preview "Reject stale preview"))
+      (is string= "" (ai::worktree-git repo "diff" "--cached")))
+    (let ((preview (ai::prepare-repository-commit repo)))
+      (ai::commit-repository-preview preview "Commit before task")
+      (is string= "" (getf (ai::repository-state repo) :status)))))
+
+(define-test commit-selection-deletions-and-renames :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let ((workflow (completed-test-workflow repo)))
+      (ai::worktree-git repo "mv" "shared.txt" "renamed.txt")
+      (ai::finish-workflow workflow)
+      (ai::await-completion-capture workflow)
+      (let ((preview (ai::prepare-repository-commit repo :start (ai::workflow-repository-start workflow))))
+        (true (member "shared.txt" (getf preview :paths) :test #'equal))
+        (true (member "renamed.txt" (getf preview :paths) :test #'equal))
+        (is eq :committed (getf (ai:commit-workflow-changes workflow :preview preview :message "Rename file") :status))
+        (is string= "" (ai::worktree-git repo "status" "--porcelain"))))))
+
+(define-test commit-before-first-repository-commit :parent agent-duet
+  (let ((repo (merge-pathnames (format nil "duet-unborn-~a/" (ai::make-uuid)) (uiop:temporary-directory))))
+    (ensure-directories-exist repo)
+    (unwind-protect
+         (progn
+           (ai::worktree-git repo "init")
+           (ai::worktree-git repo "config" "user.name" "Duet Test")
+           (ai::worktree-git repo "config" "user.email" "duet@example.invalid")
+           (ai::worktree-git repo "config" "commit.gpgsign" "false")
+           (write-worktree-file repo "first.txt" "first output")
+           (let* ((start (ai::repository-start-state repo))
+                  (preview (ai::prepare-repository-commit repo :start start)))
+             (true (member "first.txt" (getf start :dirty-paths) :test #'equal))
+             (is equal nil (getf preview :paths)))
+           (let ((preview (ai::prepare-repository-commit repo)))
+             (is equal '("first.txt") (getf preview :paths))
+             (true (search "first output" (getf preview :diff)))
+             (ai::commit-repository-preview preview "Create initial files")
+             (is string= "" (getf (ai::repository-state repo) :status))))
+      (uiop:delete-directory-tree repo :validate t))))
+
+(define-test commit-start-fallback-ref-cleanup :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (write-worktree-file repo "earlier.txt" "earlier edit")
+    (let* ((before (ai::worktree-git repo "for-each-ref" "refs/agent-duet/snapshots/"))
+           (start (ai::repository-start-state repo)))
+      (true (getf start :tree))
+      (true (member "earlier.txt" (getf start :dirty-paths) :test #'equal))
+      (is string= before (ai::worktree-git repo "for-each-ref" "refs/agent-duet/snapshots/")))
+    (let ((snapshot (ai::snapshot-folder repo "owned-by-task")))
+      (ai::repository-start-state repo snapshot)
+      (true (search "owned-by-task" (ai::worktree-git repo "for-each-ref" "refs/agent-duet/snapshots/"))))))
+
+(define-test dirty-text-only-completion-does-not-offer-commit :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let ((workflow (completed-test-workflow repo :dirty t)))
+      (ai::finish-workflow workflow)
+      (ai::await-completion-capture workflow)
+      (false (getf (ai:workflow-completion workflow) :can-commit))
+      (true (search "task changed no files" (getf (ai:workflow-completion workflow) :commit-reason))))))
+
+(define-test task-start-during-conflicted-merge :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let ((branch (ai::worktree-git-line repo "branch" "--show-current")))
+      (ai::worktree-git repo "checkout" "-b" "other")
+      (write-worktree-file repo "shared.txt" "other change")
+      (ai::commit-worktree repo "Change other branch")
+      (ai::worktree-git repo "checkout" branch)
+      (write-worktree-file repo "shared.txt" "main change")
+      (ai::commit-worktree repo "Change main branch")
+      (ignore-errors (ai::worktree-git repo "merge" "other"))
+      (true (ai::repository-operation-p repo))
+      (true (getf (ai::repository-state repo) :status))
+      (fail (ai::prepare-repository-commit repo))
+      (let* ((author (make-instance 'fake-agent :id :claude :name "Claude" :directory repo
+                                   :replies (list (says "Resolve the conflicts"))))
+             (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory repo
+                                     :replies (list (says *approve*))))
+             (workflow (make-instance 'ai:workflow :mode :review :lead author :partner reviewer
+                                      :request "Resolve the merge conflicts")))
+        (ai:start-workflow workflow)
+        (is eq :finished (ai:workflow-state workflow))
+        (true (fake-prompts author))))))

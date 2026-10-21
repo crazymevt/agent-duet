@@ -969,14 +969,15 @@ Accept older snapshots too, so replay uses the same grouped presentation."
 
 ;;; Running
 
-(defun start-workflow (workflow)
+(defun start-workflow (workflow &key repository-start)
   (setf (workflow-ended-at workflow) nil
         (workflow-state workflow) :running
         (workflow-completion-data workflow) nil
         (workflow-completion-error workflow) nil
         (workflow-commit-hash workflow) nil
         (workflow-repository-start workflow)
-        (ignore-errors (repository-start-state (agent-directory (workflow-lead workflow)))))
+        (or repository-start
+            (ignore-errors (repository-start-state (agent-directory (workflow-lead workflow))))))
   (setf (workflow-recovery-baseline workflow) (workflow-repositories workflow))
   (let ((lead (workflow-lead workflow))
         (partner (workflow-partner workflow))
@@ -1920,11 +1921,13 @@ the worktrees are kept: ~{~a~^, ~}."
        "An agent is still working.")
       ((or (null start) (null end)) "No supported Git repository was captured.")
       ((not (equal (getf start :root) root)) "The repository changed during the work.")
-      ((plusp (length (getf start :status))) "The repository had tracked edits or untracked files before this work. Start with a clean repository to use this commit action.")
       ((repository-operation-p root) "Finish the repository's merge, rebase or other Git operation first.")
       ((not (equal end (repository-state root)))
        "The repository changed after completion. Review the current changes before committing.")
       ((zerop (length (getf end :status))) "There are no uncommitted changes.")
+      ((and (getf start :tree)
+            (null (getf (prepare-repository-commit root :start start) :changed)))
+       "This task changed no files. Earlier uncommitted changes remain in the folder.")
       (t nil))))
 
 (defun workflow-completion (workflow)
@@ -1993,42 +1996,107 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
         (report-commit-suggestion (getf (workflow-completion-data workflow) :summary))
         "Update completed workflow changes")))
 
-(defun commit-workflow-changes (workflow &key message)
-  "User action only. Commit the captured approved edits if still current.
-Return a plist with :STATUS (:COMMITTED, :CLEAN or :ERROR), :MESSAGE and :COMMIT.
-Git hook/identity errors are returned; a failed commit restores the prior index."
+(defun commit-index-git (root index &rest arguments)
+  "Use an isolated index, preserving the user's identity and hook configuration."
+  (multiple-value-bind (out err code)
+      (run-git-program (append (list "env" (format nil "GIT_INDEX_FILE=~a" index)
+                                      "git" "--literal-pathspecs" "-C" (namestring root)) arguments)
+                       :output :string :error-output :string :ignore-error-status t)
+    (unless (zerop code) (error "Git failed: ~a" err))
+    (string-right-trim '(#\Newline #\Return) out)))
+
+(defun call-with-commit-index (root function)
+  (let ((index (merge-pathnames (format nil "duet-commit-~a" (make-uuid))
+                                (uiop:pathname-directory-pathname
+                                 (pathname (worktree-git-line root "rev-parse" "--path-format=absolute" "--git-path" "index"))))))
+    (unwind-protect (funcall function index)
+      (when (probe-file index) (delete-file index))
+      (let ((lock (pathname (concatenate 'string (namestring index) ".lock"))))
+        (when (probe-file lock) (delete-file lock))))))
+
+(defun prepare-repository-commit (root &key start (paths nil paths-p))
+  "Build an exact preview without changing staging. PATHS selects whole files."
+  (when (repository-operation-p root) (error "Finish the current Git operation first."))
+  (let* ((state (repository-state root))
+         (root (getf state :root))
+         (snapshot (or (snapshot-folder root (concatenate 'string "commit-preview-" (make-uuid)))
+                       (snapshot-unborn-folder root)))
+         (all (repository-changed-paths root snapshot))
+         (dirty (getf start :dirty-paths))
+         (changed (if (getf start :tree)
+                      (git-path-list root "diff" "--name-only" "--no-renames" "-z"
+                                     (getf start :tree) (snapshot-working-tree snapshot) "--")
+                      all))
+         (selected (if paths-p paths
+                       (if start (set-difference (intersection all changed :test #'equal) dirty :test #'equal) all))))
+    (when (snapshot-label snapshot) (delete-snapshot root snapshot))
+    (unless (equal state (repository-state root))
+      (error "The repository changed while preparing the preview. Reopen it."))
+    (unless (every (lambda (p) (member p all :test #'equal)) selected)
+      (error "The file selection is no longer current."))
+    (call-with-commit-index
+     root (lambda (index)
+            (commit-index-git root index "read-tree" (getf state :head))
+            (when selected
+              (apply #'commit-index-git root index
+                     (append (list "restore" "--source" (snapshot-working-tree snapshot) "--staged" "--") selected)))
+            (list :root root :state state :paths selected :all all :dirty dirty :changed changed
+                  :tree (commit-index-git root index "write-tree")
+                  :diff (commit-index-git root index "diff" "--cached" "--no-ext-diff" "--no-textconv"
+                                          "--no-color" "--binary" (getf state :head) "--"))))))
+
+(defun commit-repository-preview (preview message)
+  "Commit the preview, rejecting stale contents and preserving unrelated staging."
+  (let* ((root (getf preview :root)) (paths (getf preview :paths))
+         (index-path (pathname (worktree-git-line root "rev-parse" "--path-format=absolute" "--git-path" "index")))
+         (lock (pathname (concatenate 'string (namestring index-path) ".lock")))
+         (locked nil))
+    (unless (and paths (plusp (length (string-trim '(#\Space #\Tab #\Newline) message))))
+      (error "Select files and give the commit a message."))
+    (unwind-protect
+         (progn
+           ;; Hold Git's index lock throughout the commit and reconciliation.
+           ;; Other Git writers cannot stage edits that our update would lose.
+           (with-open-file (out lock :direction :output :if-exists :error :if-does-not-exist :create)
+             (declare (ignore out)))
+           (setf locked t)
+           (unless (equal (getf preview :state) (repository-state root))
+             (error "The repository changed since preview. Reopen the preview."))
+           (when (repository-operation-p root) (error "Finish the current Git operation first."))
+           (if (probe-file index-path) (uiop:copy-file index-path lock)
+               (call-with-commit-index root
+                 (lambda (empty-index)
+                   (commit-index-git root empty-index "read-tree" "--empty")
+                   (uiop:copy-file empty-index lock))))
+           (call-with-commit-index
+            root (lambda (index)
+                   (commit-index-git root index "read-tree" (getf preview :tree))
+                   (commit-index-git root index "commit" "-m" message)))
+           ;; Reconcile only selected paths in a copy of the original index.
+           (apply #'commit-index-git root lock (append '("reset" "-q" "HEAD" "--") paths))
+           (sb-posix:rename (namestring lock) (namestring index-path))
+           (worktree-git-line root "rev-parse" "HEAD"))
+      (when (and locked (probe-file lock)) (delete-file lock)))))
+
+(defun commit-workflow-changes (workflow &key message preview)
+  "Explicit user action; commit the reviewed selection if the task is still eligible."
   (handler-case
-      (let* ((reason (workflow-commit-reason workflow))
-             (end (workflow-completion-state workflow))
-             (root (getf end :root)))
+      (let ((reason (workflow-commit-reason workflow)))
         (when reason
           (return-from commit-workflow-changes
-            (list :status (if (and root (not (workflow-commit-hash workflow))
-                                  (eq (workflow-state workflow) :finished)
-                                  (equal end (repository-state root))
-                                  (zerop (length (getf end :status)))) :clean :error)
-                  :message reason :commit nil)))
-        (let ((message (or message (default-commit-message workflow))))
-          (when (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) message)))
-            (error "The commit message must not be empty."))
-          ;; Explicit action, after comparing HEAD, branch, index and file contents.
-          (let ((index-tree (worktree-git-line root "write-tree"))
-                (head (getf end :head))
-                (committed nil))
-            (unwind-protect
-                 (progn (worktree-git root "add" "-A")
-                        (worktree-git root "commit" "-m" message)
-                        (setf committed t))
-              ;; Restore staging after hook/identity/signing failures. Keep any
-              ;; hook edits in the working tree. Never reset an advanced HEAD.
-              (when (and (not committed)
-                         (string= head (worktree-git-line root "rev-parse" "HEAD")))
-                (worktree-git root "read-tree" index-tree))))
-          (let ((hash (worktree-git-line root "rev-parse" "HEAD")))
-            (setf (workflow-commit-hash workflow) hash)
-            (list :status :committed :message (format nil "Committed changes (~a)." (subseq hash 0 12))
-                  :commit hash))))
-    (error (e) (list :status :error :message (format nil "Could not commit changes: ~a" e) :commit nil))))
+            (list :status (if (and (not (workflow-commit-hash workflow))
+                                         (getf (workflow-completion workflow) :clean)) :clean :error) :message reason)))
+        (let* ((root (getf (workflow-completion-state workflow) :root))
+               (preview (or preview (prepare-repository-commit root :start (workflow-repository-start workflow))))
+               (hash (progn
+                       (unless (and (equal root (getf preview :root))
+                                    (equal (workflow-completion-state workflow) (getf preview :state)))
+                         (error "The preview does not match this task's completed repository."))
+                       (commit-repository-preview preview (or message (default-commit-message workflow))))))
+          (setf (workflow-commit-hash workflow) hash)
+          (list :status :committed :commit hash
+                :message (format nil "Committed changes (~a)." (subseq hash 0 12)))))
+    (error (e) (list :status :error :message (format nil "Could not commit changes: ~a" e)))))
 
 ;;; Review existing work without an author turn or a fix loop.
 

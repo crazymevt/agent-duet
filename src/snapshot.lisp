@@ -138,3 +138,18 @@ Return NIL outside Git; signal a Git error if the ref moved or deletion fails."
       (let ((space (position #\Space line)))
         (worktree-git directory "update-ref" "-d" (subseq line 0 space) (subseq line (1+ space)))))
     remove-count))
+
+(defun snapshot-unborn-folder (root)
+  "Content-only snapshot for a repository with no first commit yet."
+  (let* ((index-path (pathname (worktree-git-line root "rev-parse" "--path-format=absolute" "--git-path" "index")))
+         (temporary (merge-pathnames (format nil "duet-unborn-~a" (make-uuid))
+                                     (uiop:pathname-directory-pathname index-path))))
+    (unwind-protect
+         (progn
+           (if (probe-file index-path) (uiop:copy-file index-path temporary)
+               (snapshot-git root temporary "read-tree" "--empty"))
+           (let ((index (snapshot-git root temporary "write-tree")))
+             (snapshot-git root temporary "add" "-A" "--" ".")
+             (make-snapshot :head (repository-head-tree root) :index index
+                            :working-tree (snapshot-git root temporary "write-tree"))))
+      (when (probe-file temporary) (delete-file temporary)))))

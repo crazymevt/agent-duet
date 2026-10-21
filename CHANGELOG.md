@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Before writing tasks, dirty folders offer committing current changes,
+  continuing with them, or cancelling. Approved tasks offer a file selection,
+  all/task-changed presets, an editable suggested message, and a commit diff
+  preview. Previously dirty files are marked and initially excluded. Commits
+  preserve unrelated staging and reject stale previews; Git hooks still run.
+  Conflict-resolution tasks can continue even when a commit preview is unavailable.
+  Task-changed presets exclude previously dirty files, and text-only tasks explain
+  why there is no task commit to offer.
+
 - Task completion cards show elapsed time (including pauses), review rounds,
   open findings, changed files linked to Changes, and available per-agent token,
   cost and CLI duration totals. Missing measurements stay unknown, and partial

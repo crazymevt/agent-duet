@@ -406,15 +406,52 @@ behaviors, including the GTK polling path. F4 and F5 remain dismissed.
 
 ## Milestone 3: finish the commit-at-end flow
 
-Some completion/commit UI already exists; inspect it before implementing
-anything new. Reconcile it with the unchecked entry in `TODO.md`.
+Implemented for review. Writing tasks now inspect uncommitted changes before
+starting and offer commit-and-start, continue without committing, or cancel.
+Review-only mode does not prompt. Partial pre-task commits recheck remaining
+changes before starting. The completion action opens file selection with all
+changes and task-changed presets, previously dirty file markers, exact diff
+preview, and an editable suggested message. Selected files include all their
+edits; excluded files retain their staging. Preview uses a temporary index;
+committing holds the real index lock while preserving unrelated staged entries.
+Git hooks run with the temporary index, and failures preserve the original index.
+Repository and preview freshness are rechecked before committing.
 
-- [ ] Compare existing commit behavior with task snapshots and Changes.
-- [ ] Preselect task-changed files; leave files already modified before the
+Review corrections F1–F7: Continue uses the preflight's opening state,
+independent of preview success or refresh. A failed pre-task preview shows
+Continue/Cancel with commit controls hidden, so conflict-resolution tasks can
+start during a merge or rebase. The task-changed preset restores the default
+selection, excluding previously dirty files. Fallback start snapshots delete
+only their own refs; task-owned snapshot refs remain intact. Text-only tasks
+explain that no files changed instead of enabling Commit. The completion card
+has no message entry; the preview contains the sole editable message.
+
+Deliberate limits: changes made after task completion still invalidate the
+commit action rather than being silently included in an approved result.
+Existing `completion-commit-refusals` tests cover later edits, new untracked
+content, staging and branch changes. Own worktrees continues to require a
+clean start; its part commits and integration merges are handled by the existing
+workflow, not this dialog. The dialog commits only remaining uncommitted changes
+in the home repository, never inside individual part worktrees. A clean,
+already-integrated task has no additional commit to offer. This milestone does
+not add partial integration or part-worktree commit actions.
+
+Regression coverage includes pre-task preview failure, Continue during refresh,
+stale opening-state rejection, preset exclusion of earlier edits, no duplicate
+message box, conflicted merge startup, fallback ref ownership/cleanup,
+text-only dirty tasks, and a dirty baseline before the first repository commit.
+Final validation: `make test-parallel` passed 2,869 assertions across eight
+workers, with zero failures or skips. `make test-ui` passed, including preview
+failure/Continue, pending refresh/Continue, preset exclusion, and the single
+message-entry checks. GTK emitted frame-timing warnings during layout checks.
+`make load` and `git diff --check` passed. Changes remain uncommitted for review.
+
+- [x] Compare existing commit behavior with task snapshots and Changes.
+- [x] Preselect task-changed files; leave files already modified before the
   task unselected and visibly marked. Let the user edit the selection.
-- [ ] Show the staged diff and an editable lead-drafted message before the
+- [x] Show the staged diff and an editable lead-drafted message before the
   explicit commit action. Handle existing staged edits deliberately.
-- [ ] Verify dirty repositories, untracked files, text-only results, failed
+- [x] Verify dirty repositories, untracked files, text-only results, failed
   checks, worktree integrations, and changes made after task completion.
 
 ## Milestone 4: undo a task
@@ -454,6 +491,6 @@ A third agent remains outside the current plan.
 2. Read `AGENTS.md`, this file, `TODO.md`, and the working-tree diff/status.
    Preserve existing uncommitted changes; do not re-copy old worktree files.
 3. Milestone 1 is signed off and milestone 2 is implemented for review.
-   Review the current diff before starting milestone 3.
+   Milestone 3 is implemented for review; review the current diff before starting milestone 4.
 4. Update this file and `TODO.md` as milestones are completed. Add user-visible
    changes to `CHANGELOG.md` under Unreleased before committing.

@@ -2715,15 +2715,12 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (body (make-instance 'gtk:box :orientation :vertical :spacing 6))
          (files-label (make-instance 'gtk:label :xalign 0.0 :wrap t))
          (status (make-instance 'gtk:label :xalign 0.0 :wrap t :wrap-mode :word-char :selectable t :visible nil))
-         (message-entry (make-instance 'gtk:entry :hexpand t :visible nil :text (default-commit-message workflow)
-                                 :placeholder-text "Commit message"
-                                 :tooltip-text "Suggested from the completed work; edit before committing"))
          (commit (make-instance 'gtk:button :label "Commit changes" :sensitive nil :css-classes '("suggested-action")))
          (changes (make-instance 'gtk:button :label "Changes" :tooltip-text "What this task changed, file by file"))
          ;; This task's, not whichever is latest when the button is clicked.
          (task (and *task-changes* (eq (task-changes-workflow *task-changes*) workflow) *task-changes*))
          (history *history*)
-         (buttons (gtk:build (gtk:box :spacing 6 :halign :end message-entry changes commit))))
+         (buttons (gtk:build (gtk:box :spacing 6 :halign :end changes commit))))
     (labels ((say (text &optional (class "dim-label"))
                (gtk:label-set-text status text)
                (gtk:widget-set-css-classes status (list class))
@@ -2733,7 +2730,6 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                ;; KEEP-STATUS: leave what the card says (a commit's error) as it is.
                (if (null completion)
                    (progn (gtk:widget-set-sensitive commit nil)
-                          (gtk:widget-set-visible message-entry nil)
                           (say "This task has carried on since; see the newer summary."))
                    (destructuring-bind (&key outcome summary check-status repository can-commit commit-reason
                                           commit-hash &allow-other-keys)
@@ -2754,16 +2750,14 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        (when (plusp (length summary))
                          (gtk:box-append body (make-instance 'gtk:expander :label "Summary" :child (markdown-box summary)
                                                                            :expanded (<= (length summary) *summary-expanded-length*)))))
-                     (gtk:widget-set-visible message-entry (and can-commit t))
                      (gtk:widget-set-sensitive commit (and can-commit t))
                      (gtk:widget-set-tooltip-text commit (if can-commit
-                                                             (format nil "Commit everything changed in ~a, with this message"
+                                                             (format nil "Select files and preview a commit in ~a"
                                                                      (folder-label repository))
                                                              commit-reason))
                      (cond (commit-hash
                             (gtk:widget-set-visible commit nil)
-                            (gtk:widget-set-visible message-entry nil)
-                            (say (format nil "Committed as ~a." (subseq commit-hash 0 (min 12 (length commit-hash))))))
+                              (say (format nil "Committed as ~a." (subseq commit-hash 0 (min 12 (length commit-hash))))))
                            (keep-status)
                            ((and (not can-commit) commit-reason (eq outcome :approved))
                             (say commit-reason))
@@ -2799,37 +2793,17 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                     (progn (show completion keep-status)
                                            (when completion (poll-files)))))))
              (commit-it ()
-               (let ((text (string-trim '(#\Space #\Tab #\Newline) (gtk:editable-get-text message-entry))))
-                 (cond ((zerop (length text)) (say "Give the commit a message." "error"))
-                       (*committing* (say "Another commit is running; try again once it's done." "error"))
-                       ((workflow-running-p) (say "Wait for the running task to end before committing." "error"))
-                       (t
-                        (gtk:widget-set-sensitive commit nil)
-                        (gtk:widget-set-sensitive message-entry nil)
-                        (say "Committing…")
-                        (setf *committing* t)
-                        (in-background "commit" (lambda () (commit-workflow-changes workflow :message text))
-                                       (lambda (result why)
-                                         (setf *committing* nil)
-                                         (gtk:widget-set-sensitive message-entry t)
-                                         (destructuring-bind (&key status message &allow-other-keys) result
-                                           (let ((text (or why message "")))
-                                             ;; In the task's conversation, even if another is open by now.
-                                             (cond ((and history (eq history *history*))
-                                                    (record :middle :note text)
-                                                    (save-current-history))
-                                                   (history
-                                                    (history-add-entry history :middle :note text)
-                                                    (save-history history)))
-                                             (case status
-                                               (:committed
-                                                (gtk:widget-set-visible commit nil)
-                                                (gtk:widget-set-visible message-entry nil)
-                                                (say text))
-                                               (:clean (say (format nil "Nothing to commit: ~a" text)))
-                                               (t (say text "error"))))
-                                           ;; What can be done now (a failed commit may have staged the edits).
-                                           (unless (eq status :committed) (refresh t))))))))))
+               (cond (*committing* (say "Another commit is running." "error"))
+                     ((workflow-running-p) (say "Wait for the running task to end." "error"))
+                     (t (show-commit-preview
+                         (getf (workflow-completion-state workflow) :root)
+                         :start (workflow-repository-start workflow) :workflow workflow
+                         :message (default-commit-message workflow)
+                         :on-committed (lambda (result)
+                                         (when history
+                                           (history-add-entry history :middle :note (getf result :message))
+                                           (save-history history))
+                                         (refresh)))))))
       (gobject:connect commit :clicked (lambda (b) (declare (ignore b)) (commit-it)))
       (gobject:connect changes :clicked
                        (lambda (b) (declare (ignore b))
@@ -3081,7 +3055,49 @@ and summary, with Changes and, when the work can be committed, Commit changes."
              (if (eq (selected-mode) :review-only) ""
                  (format nil " · ~d rounds" (gtk:spin-button-get-value-as-int (control :rounds))))))))
 
+(defvar *request-preflight* nil)
+
 (defun start-request (&optional attachments)
+  (cond ((workflow-running-p) (stop-workflow *workflow*))
+        (*request-preflight* nil)
+        ((committing-p *middle*) nil)
+        ((and (not attachments) (not (eq (selected-mode) :review-only))
+              (null (blank-to-nil (text-view-text (control :input))))) nil)
+        ((or (eq (selected-mode) :review-only)
+             (not (git-repository-p *directory*)))
+         (start-request-ready attachments))
+        (t
+         (let ((directory *directory*)
+               (text (text-view-text (control :input)))
+               (mode (selected-mode)))
+           (setf *request-preflight* t)
+           (labels ((still-current-p ()
+                      (and (equal directory *directory*) (eq mode (selected-mode))
+                           (equal text (text-view-text (control :input)))
+                           (not (workflow-running-p))))
+                    (proceed (state)
+                      (in-background "verify task starting state"
+                        (lambda () (equal state (repository-state directory)))
+                        (lambda (current why)
+                          (if (and current (not why) (still-current-p))
+                              (start-request-ready attachments)
+                              (pane-note *middle* "The folder or request changed. Start again to review its current state." "error"))))))
+             (in-background "inspect task starting state"
+               (lambda () (repository-state directory))
+               (lambda (state why)
+                 (setf *request-preflight* nil)
+                 (cond (why (pane-note *middle* (format nil "Cannot inspect the repository: ~a" why) "error"))
+                       ((not (still-current-p)) nil)
+                       ((zerop (length (getf state :status))) (start-request-ready attachments))
+                       (t (show-commit-preview directory
+                            :opening-state state
+                            :on-continue #'proceed
+                            :on-committed (lambda (result) (declare (ignore result))
+                                            ;; Recheck cleanliness and offer the prompt again if needed.
+                                            (when (still-current-p) (start-request attachments)))))))))))))
+
+(defun start-request-ready (&optional attachments)
+
   (if (workflow-running-p)
       (stop-workflow *workflow*)
       (let ((text (prompt-with-attachments
@@ -3121,7 +3137,11 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                                :check-command (folder-check-command *directory*)
                                                (workflow-callbacks)))
                (snapshot-task-start *workflow*)
-               (start-workflow *workflow*)
+               (start-workflow *workflow*
+                               :repository-start
+                               (and *task-changes* (task-changes-start *task-changes*)
+                                    (ignore-errors
+                                      (repository-start-state *directory* (task-changes-start *task-changes*)))))
                (update-controls))))))))
 
 (defun worktrees-wanted-p ()

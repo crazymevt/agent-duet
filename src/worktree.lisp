@@ -229,23 +229,46 @@ Each ref is deleted only if unchanged since read. Return the number deleted."
           (loop for file in regular for hash in hashes do (setf (third file) hash)))))
     files))
 
-(defun repository-start-state (directory)
-  "Only the root and initial dirtiness are needed for commit eligibility."
-  (let ((root (uiop:ensure-directory-pathname
-               (uiop:parse-native-namestring
-                (worktree-git-line directory "rev-parse" "--show-toplevel")))))
-    (list :root root
-          :status (worktree-git root "status" "--porcelain=v1" "-z" "--untracked-files=all"))))
+(defun repository-start-state (directory &optional captured-snapshot)
+  "Record starting contents and dirty paths; reuse the task snapshot when available."
+  (let* ((root (uiop:ensure-directory-pathname
+                (uiop:parse-native-namestring (worktree-git-line directory "rev-parse" "--show-toplevel"))))
+         (snapshot (or captured-snapshot
+                       (snapshot-folder root (concatenate 'string "commit-start-" (make-uuid)))
+                       (snapshot-unborn-folder root))))
+    (unwind-protect
+         (list :root root
+               :status (worktree-git root "status" "--porcelain=v1" "-z" "--untracked-files=all")
+               :tree (snapshot-working-tree snapshot)
+               :dirty-paths (repository-changed-paths root snapshot))
+      (when (and (not captured-snapshot) (snapshot-label snapshot))
+        (delete-snapshot root snapshot)))))
+
+(defun repository-changed-paths (root snapshot)
+  (when snapshot
+    (remove-duplicates
+     (append (git-path-list root "diff" "--name-only" "--no-renames" "-z"
+                            (snapshot-head snapshot) (snapshot-working-tree snapshot) "--")
+             (git-path-list root "diff" "--name-only" "--no-renames" "-z"
+                            (snapshot-head snapshot) (snapshot-index snapshot) "--"))
+     :test #'equal)))
+
+(defun git-path-list (root &rest arguments)
+  (remove "" (uiop:split-string (snapshot-output root arguments) :separator '(#\Null)) :test #'equal))
+
+(defun repository-head-tree (directory)
+  (or (ignore-errors (worktree-git-line directory "rev-parse" "--verify" "HEAD"))
+      (worktree-git-line directory "hash-object" "-w" "-t" "tree" "/dev/null")))
 
 (defun repository-state (directory)
   "Capture HEAD, branch, index, tracked edits and untracked contents without staging."
-  (let ((root (uiop:ensure-directory-pathname
-               (uiop:parse-native-namestring (worktree-git-line directory "rev-parse" "--show-toplevel")))))
-    (list :root root
-          :head (worktree-git-line root "rev-parse" "HEAD")
-          :branch (worktree-git-line root "rev-parse" "--symbolic-full-name" "HEAD")
+  (let* ((root (uiop:ensure-directory-pathname
+                (uiop:parse-native-namestring (worktree-git-line directory "rev-parse" "--show-toplevel"))))
+         (head (repository-head-tree root)))
+    (list :root root :head head
+          :branch (or (ignore-errors (worktree-git-line root "symbolic-ref" "-q" "HEAD")) "HEAD")
           :status (worktree-git root "status" "--porcelain=v1" "-z" "--untracked-files=all")
-          :index (worktree-git root "diff" "--cached" "--binary" "HEAD" "--")
+          :index (worktree-git root "diff" "--cached" "--binary" head "--")
           :working (worktree-git root "diff" "--binary" "--")
           :untracked (repository-untracked-state root))))
 
