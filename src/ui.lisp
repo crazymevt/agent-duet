@@ -66,6 +66,98 @@
                          t)))
     (gtk:widget-add-controller view keys)))
 
+;;; Images in replies: an agent's mockups, as thumbnails that open in the
+;;; system's viewer (image-artifacts.lisp finds the files)
+
+(defvar *image-directory* nil
+  "Where relative image references resolve while a saved conversation is
+replayed: its folder. Otherwise *DIRECTORY*.")
+
+(defparameter *image-thumbnail-size* '(360 240) "The largest thumbnail, width and height.")
+
+(defvar *image-thumbnails* (make-hash-table :test #'equal)
+  "(namestring write-date) → texture, so a reply drawn again isn't decoded again.")
+
+(defun markdown-image-reference (text node)
+  "The destination of the :image NODE in TEXT. One in <…> may hold spaces,
+where the inline parser stops."
+  (destructuring-bind (kind s e cs ce children us ue url) node
+    (declare (ignore kind s cs ce children ue))
+    (let ((close (and (< us e) (char= (char text us) #\<) (position #\> text :start us :end e))))
+      (if close (subseq text (1+ us) close) url))))
+
+(defun image-node-alt (text node)
+  (string-trim " " (subseq text (fourth node) (fifth node))))
+
+(defun image-node-artifact (text node)
+  "The existing local image file the :image NODE in TEXT refers to, or nil."
+  (resolve-image-artifact (markdown-image-reference text node) (or *image-directory* *directory*)))
+
+(defun image-fallback-markup (alt reference)
+  "Pango markup for an image that can't be shown: a link to a web image,
+otherwise its description and where it was expected."
+  (flet ((escape (s) (glib:markup-escape-text s -1)))
+    (let ((alt (if (string= alt "") "image" alt)))
+      (if (or (uiop:string-prefix-p "http://" reference) (uiop:string-prefix-p "https://" reference))
+          (format nil "<a href=\"~a\">🖼 ~a</a>" (escape reference) (escape alt))
+          (format nil "🖼 ~a <span alpha=\"60%\">(~a not found)</span>" (escape alt) (escape reference))))))
+
+(defun line-images (line)
+  "The local images a line of Markdown shows, as (pathname alt), in order."
+  (when (search "![" line)
+    (let ((found '()))
+      (labels ((walk (node)
+                 (if (eq (first node) :image)
+                     (let ((path (image-node-artifact line node)))
+                       (when path (push (list path (image-node-alt line node)) found)))
+                     (mapc #'walk (sixth node)))))
+        (mapc #'walk (markdown-inlines line)))
+      (nreverse found))))
+
+(defun image-thumbnail-texture (path)
+  "PATH's image, scaled down to fit *IMAGE-THUMBNAIL-SIZE*; nil if it can't be read."
+  (let ((key (list (namestring path) (ignore-errors (file-write-date path)))))
+    (or (gethash key *image-thumbnails*)
+        (let ((texture
+                (ignore-errors
+                 (let ((name (uiop:native-namestring path)))
+                   (multiple-value-bind (format width height) (gdk-pixbuf:pixbuf-get-file-info name)
+                     (when (and format (plusp width) (plusp height))
+                       (gdk:texture-new-for-pixbuf
+                        (gdk-pixbuf:pixbuf-new-from-file-at-scale
+                         name (min width (first *image-thumbnail-size*))
+                         (min height (second *image-thumbnail-size*)) t))))))))
+          (when texture
+            (when (>= (hash-table-count *image-thumbnails*) 64) (clrhash *image-thumbnails*))
+            (setf (gethash key *image-thumbnails*) texture))))))
+
+(defun open-image-artifact (path widget)
+  "Open the image file PATH in the system's viewer."
+  (gio:async (gtk:uri-launcher-launch (gtk:uri-launcher-new (image-artifact-uri path))
+                                      (or (gtk:widget-get-root widget) *window*))
+             (lambda (ok) (declare (ignore ok)))
+             :error (lambda (e) (declare (ignore e)))))
+
+(defun image-thumbnail (path alt)
+  "A button showing PATH's image, captioned with ALT or its name, that opens it."
+  (let* ((texture (image-thumbnail-texture path))
+         (caption (if (string= alt "") (file-namestring path) alt))
+         (button (make-instance 'gtk:button :css-classes '("flat" "duet-image") :halign :start
+                                :tooltip-text (format nil "Open ~a" (uiop:native-namestring path))))
+         (box (make-instance 'gtk:box :orientation :vertical :spacing 4)))
+    (if texture
+        (progn
+          (gtk:box-append box (make-instance 'gtk:picture :paintable texture :can-shrink t
+                                             :content-fit :scale-down :halign :start
+                                             :alternative-text caption))
+          (gtk:box-append box (make-instance 'gtk:label :label caption :xalign 0.0 :ellipsize :middle
+                                             :css-classes '("caption" "dim-label"))))
+        (gtk:box-append box (make-instance 'gtk:label :label (format nil "🖼 ~a — no preview, click to open" caption)
+                                           :xalign 0.0 :wrap t :wrap-mode :word-char)))
+    (gtk:button-set-child button box)
+    (gobject:connect button :clicked (lambda (b) (open-image-artifact path b)))
+    button))
+
 ;;; Rendering Markdown, simply (from Cadre)
 
 (defun code-span-text (string start end)
@@ -94,7 +186,11 @@
                                           (escape (let ((url (first more)))
                                                     (if (search "://" url) url (format nil "https://~a" url))))
                                           (escape (subseq text cs ce))))
-                       (:image (write-string (escape (subseq text cs ce)) out)))))))
+                       ;; A local image is shown below its line instead.
+                       (:image (unless (image-node-artifact text node)
+                                 (write-string (image-fallback-markup (image-node-alt text node)
+                                                                      (markdown-image-reference text node))
+                                               out))))))))
         (mapc #'walk (markdown-inlines text))))))
 
 (defun prose-markup (text)
@@ -135,20 +231,58 @@
               (gtk:label :label code :xalign 0.0 :selectable t :wrap t :wrap-mode :char :css-classes '("monospace"))
               (gtk:box :halign :end copy)))))
 
+(defun markup-without-links (markup)
+  "MARKUP with its links as spans, for checking: Pango can't parse <a>,
+though labels show it. Text in markup is escaped, so each < starts a tag."
+  (with-output-to-string (out)
+    (loop with i = 0
+          for start = (position #\< markup :start i)
+          while start
+          do (let* ((end (or (position #\> markup :start start) (1- (length markup))))
+                    (tag (subseq markup start (1+ end))))
+               (write-string markup out :start i :end start)
+               (write-string (cond ((uiop:string-prefix-p "<a " tag) "<span>")
+                                   ((string= tag "</a>") "</span>")
+                                   (t tag))
+                             out)
+               (setf i (1+ end)))
+          finally (write-string markup out :start i))))
+
+(defun prose-label (text)
+  "A label showing TEXT's prose, or nil when only shown images were in it."
+  (let ((markup (prose-markup text)))
+    (when (plusp (length (string-trim '(#\Space #\Newline #\•) markup)))
+      (let ((label (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t :wrap-mode :word-char)))
+        ;; Markup GTK can't parse would leave the label
+        ;; empty: show the text as it is instead.
+        (if (ignore-errors (pango:parse-markup (markup-without-links markup) -1 0) t)
+            (gtk:label-set-markup label markup)
+            (gtk:label-set-text label text))
+        label))))
+
+(defun render-prose (box text)
+  "Append TEXT's prose to BOX. A line showing local images ends its label,
+and the images follow it as thumbnails."
+  (let ((lines '()))
+    (flet ((flush ()
+             (let ((label (and lines (prose-label (format nil "~{~a~^~%~}" (reverse lines))))))
+               (when label (gtk:box-append box label)))
+             (setf lines '())))
+      (dolist (line (split-lines text))
+        (push line lines)
+        (let ((images (line-images line)))
+          (when images
+            (flush)
+            (loop for (path alt) in images
+                  do (gtk:box-append box (image-thumbnail path alt))))))
+      (flush))))
+
 (defun render-markdown (box text)
   "Fill BOX with TEXT, rendered."
   (dolist (segment (markdown-segments text))
-    (gtk:box-append box (if (eq (first segment) :code)
-                            (code-block-widget (second segment))
-                            (let ((label (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t
-                                                        :wrap-mode :word-char)))
-                              ;; Markup GTK can't parse would leave the label
-                              ;; empty: show the text as it is instead.
-                              (let ((markup (prose-markup (second segment))))
-                                (if (ignore-errors (pango:parse-markup markup -1 0) t)
-                                    (gtk:label-set-markup label markup)
-                                    (gtk:label-set-text label (second segment))))
-                              label)))))
+    (if (eq (first segment) :code)
+        (gtk:box-append box (code-block-widget (second segment)))
+        (render-prose box (second segment)))))
 
 (defun markdown-box (text &rest classes)
   (let ((box (make-instance 'gtk:box :orientation :vertical :spacing 6 :css-classes classes)))
@@ -1050,7 +1184,8 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun replay-history (history)
   "Show HISTORY's entries in the panes, as they were."
-  (let ((*replaying-conversation* t))
+  (let ((*replaying-conversation* t)
+        (*image-directory* (history-folder history)))
     (dolist (entry (history-entries history))
       (destructuring-bind (&key who kind text &allow-other-keys) entry
         (case who
@@ -3262,6 +3397,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (".duet-middle" :background-color "alpha(@view_fg_color, 0.02)")
     (".duet-pane" :background-color "@view_bg_color")
     (".duet-prompt" :background-color "alpha(@accent_bg_color, 0.18)" :border-radius "8px" :padding ("6px" "10px"))
+    (".duet-image" :padding "4px")
     (".duet-code" :background-color "alpha(@view_fg_color, 0.07)" :border-radius "6px" :padding "6px")
     (".duet-tool" :opacity "1.0")
     (".duet-approval" :background-color "alpha(@warning_bg_color, 0.22)" :border-radius "8px" :padding "10px"
