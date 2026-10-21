@@ -1,9 +1,125 @@
 ;;;; ui-presentation.lisp — presentation widgets; delivery stays in ui.lisp.
 (in-package #:agent-duet)
 
+;;; The look of the conversation, its cards and composers, and the agents'
+;;; panels: peach Claude, teal ChatGPT; blue review, green done, amber for
+;;; the user's turn, red errors. Text colors mix the theme's foreground with
+;;; each accent, keeping at least 4.5:1 contrast on their tints in light and
+;;; dark themes. The classes come from ui.lisp. This provider sits one step
+;;; above the window's stylesheet, so its rules win where both set a property.
+
+(defparameter *presentation-css*
+  '("@define-color duet_claude #d97757;"
+    "@define-color duet_codex #14b8a6;"
+    "@define-color duet_claude_text mix(@view_fg_color, #d97757, 0.55);"
+    "@define-color duet_codex_text mix(@view_fg_color, #14b8a6, 0.45);"
+    ;; Agent identity
+    (".duet-claude" :color "@duet_claude_text")
+    (".duet-codex" :color "@duet_codex_text")
+    (".duet-panel-claude" :border-top "3px solid alpha(@duet_claude, 0.85)")
+    (".duet-panel-codex" :border-top "3px solid alpha(@duet_codex, 0.85)")
+    ;; Conversation messages: a quiet card, its author's accent on the left
+    (".duet-message" :border-radius "10px" :padding ("10px" "14px")
+     :margin-top "3px" :margin-bottom "3px")
+    (".duet-message > label.caption-heading" :font-weight "700")
+    (".duet-from-user" :background-color "alpha(@view_fg_color, 0.06)"
+     :border "1px solid alpha(@view_fg_color, 0.10)")
+    (".duet-from-claude" :background-color "alpha(@duet_claude, 0.07)"
+     :border "1px solid alpha(@duet_claude, 0.22)" :border-left "3px solid alpha(@duet_claude, 0.85)")
+    (".duet-from-codex" :background-color "alpha(@duet_codex, 0.07)"
+     :border "1px solid alpha(@duet_codex, 0.22)" :border-left "3px solid alpha(@duet_codex, 0.85)")
+    (".duet-from-claude > label.caption-heading" :color "@duet_claude_text")
+    (".duet-from-codex > label.caption-heading" :color "@duet_codex_text")
+    (".duet-prompt" :background-color "alpha(@view_fg_color, 0.06)" :border-radius "10px"
+     :border "1px solid alpha(@view_fg_color, 0.10)" :padding ("7px" "11px"))
+    (".duet-checklist" :background-color "alpha(@view_fg_color, 0.05)" :border-radius "9px"
+     :padding ("8px" "12px"))
+    ;; Approvals and questions stand out from the thread
+    (".duet-approval" :background-color "alpha(@accent_bg_color, 0.08)" :border-radius "9px"
+     :border "1px solid alpha(@view_fg_color, 0.14)" :border-left "3px solid @accent_bg_color"
+     :padding ("12px" "14px"))
+    (".duet-summary" :background-color "alpha(@success_bg_color, 0.10)" :border-radius "9px"
+     :border "1px solid alpha(@success_color, 0.35)" :border-left "3px solid @success_color"
+     :padding ("12px" "14px"))
+    ;; Tool calls and thinking: compact disclosures, muted until opened
+    ("expander-widget.duet-tool" :background-color "alpha(@view_fg_color, 0.035)"
+     :border "1px solid alpha(@view_fg_color, 0.10)" :border-radius "8px" :padding ("2px" "8px"))
+    ("expander-widget.duet-tool > box > title" :color "alpha(@view_fg_color, 0.75)" :padding ("3px" "0"))
+    ("expander-widget.duet-tool label.monospace" :font-size "smaller")
+    (".duet-code" :background-color "alpha(@view_fg_color, 0.07)" :border-radius "6px" :padding "6px")
+    ;; Each agent's latest action, in its panel and the conversation
+    (".duet-live-activity" :font-size "smaller" :background-color "alpha(@view_fg_color, 0.05)"
+     :border-radius "6px" :padding ("5px" "9px") :border-left "3px solid alpha(@view_fg_color, 0.2)")
+    (".duet-live-activity.duet-claude" :border-left-color "alpha(@duet_claude, 0.8)")
+    (".duet-live-activity.duet-codex" :border-left-color "alpha(@duet_codex, 0.8)")
+    (".duet-live-activity.error" :border-left-color "@error_color")
+    ("expander-widget.duet-transcript > box > title" :font-weight "600" :padding ("4px" "12px"))
+    ("expander-widget.duet-workflow-settings > box > title" :color "alpha(@view_fg_color, 0.75)")
+    ;; Composers: one rounded field, outlined in the accent while typing.
+    ;; A composer is a frame in a .duet-composer box, or (unmarked) directly in a
+    ;; pane or in a box there. The box itself also holds Send: no border.
+    (".duet-composer > frame, .duet-pane > box > frame, .duet-pane > box > box > frame"
+     :border-radius "10px" :border "1px solid alpha(@view_fg_color, 0.16)"
+     :background-color "alpha(@view_fg_color, 0.03)")
+    (".duet-composer > frame:focus-within, .duet-pane > box > frame:focus-within, .duet-pane > box > box > frame:focus-within"
+     :border-color "alpha(@accent_color, 0.8)")
+    (".duet-composer > frame textview, .duet-composer > frame textview > text, .duet-pane > box > frame textview, .duet-pane > box > frame textview > text, .duet-pane > box > box > frame textview, .duet-pane > box > box > frame textview > text"
+     :background-color "transparent")
+    ;; The task's stages: ✓ Plan — ● Working — ○ Done
+    (".duet-progress-label" :font-weight "600")
+    (".duet-sequence > flowboxchild, .duet-sequence > flowboxchild:hover, .duet-sequence > flowboxchild:active"
+     :background-color "transparent" :box-shadow "none"
+     :border "none" :padding "0" :outline "none")
+    (".duet-step-connector" :color "alpha(@view_fg_color, 0.35)")
+    (".duet-step-marker" :font-weight "700")
+    (".duet-step-detail" :font-size "smaller" :color "alpha(@view_fg_color, 0.72)")
+    (".duet-step-group" :border-left "2px solid alpha(@view_fg_color, 0.15)" :padding-left "6px")
+    (".duet-step-pending .duet-step-label, .duet-step-pending .duet-step-marker, .duet-step-skipped .duet-step-label, .duet-step-skipped .duet-step-marker, .duet-step-row.duet-step-pending, .duet-step-row.duet-step-skipped"
+     :color "alpha(@view_fg_color, 0.70)")
+    (".duet-step-active .duet-step-label" :font-weight "700")
+    (".duet-step-active .duet-step-marker" :color "@accent_color")
+    (".duet-step-complete .duet-step-marker" :color "@success_color")
+    (".duet-step-attention .duet-step-marker, .duet-step-attention .duet-step-label, .duet-step-row.duet-step-attention"
+     :color "@warning_color")
+    (".duet-step-error .duet-step-marker, .duet-step-error .duet-step-label, .duet-step-row.duet-step-error"
+     :color "@error_color")
+    ;; Agent status pills
+    (".duet-pill" :border-radius "999px" :padding ("2px" "10px") :font-weight "600"
+     :border "1px solid transparent")
+    (".duet-pill-idle" :background-color "alpha(@view_fg_color, 0.08)"
+     :color "alpha(@view_fg_color, 0.75)" :border-color "alpha(@view_fg_color, 0.18)")
+    (".duet-pill-working" :background-color "alpha(@accent_bg_color, 0.18)"
+     :color "mix(@view_fg_color, @accent_color, 0.7)" :border-color "alpha(@accent_color, 0.6)")
+    (".duet-pill-working.duet-pill-claude" :background-color "alpha(@duet_claude, 0.18)"
+     :color "@duet_claude_text" :border-color "alpha(@duet_claude, 0.65)")
+    (".duet-pill-working.duet-pill-codex" :background-color "alpha(@duet_codex, 0.18)"
+     :color "@duet_codex_text" :border-color "alpha(@duet_codex, 0.65)")
+    (".duet-pill-review" :background-color "alpha(#3b82f6, 0.18)"
+     :color "mix(@view_fg_color, #3b82f6, 0.55)" :border-color "alpha(#3b82f6, 0.65)")
+    (".duet-pill-success" :background-color "alpha(#22c55e, 0.16)"
+     :color "mix(@view_fg_color, #22c55e, 0.45)" :border-color "alpha(#22c55e, 0.6)")
+    (".duet-pill-attention" :background-color "alpha(#f59e0b, 0.2)"
+     :color "mix(@view_fg_color, #f59e0b, 0.45)" :border-color "alpha(#f59e0b, 0.7)")
+    (".duet-pill-error" :background-color "alpha(#ef4444, 0.18)"
+     :color "mix(@view_fg_color, #ef4444, 0.55)" :border-color "alpha(#ef4444, 0.7)")))
+
+(defvar *presentation-css-provider* nil)
+
+(defun ensure-presentation-css ()
+  "Install the presentation stylesheet once, for the default display."
+  (unless *presentation-css-provider*
+    (setf *presentation-css-provider*
+          (gtk:add-css *presentation-css* :priority (1+ gtk:+style-provider-priority-application+)))))
+
+(defun ensure-pill-css ()
+  "The pills are part of the presentation stylesheet."
+  (ensure-presentation-css))
+
 (defun make-workflow-settings (child)
+  (ensure-presentation-css)
   (let ((expander (make-instance 'gtk:expander :label "Workflow settings" :child child
                                  :expanded (setting :workflow-settings-expanded nil)
+                                 :css-classes '("duet-workflow-settings")
                                  :margin-start 12 :margin-end 12 :margin-top 4)))
     (gobject:connect expander "notify::expanded"
                      (lambda (widget spec) (declare (ignore spec))
@@ -11,8 +127,10 @@
     expander))
 
 (defun make-transcript (agent scroller)
+  (ensure-presentation-css)
   (let* ((key (agent-setting-key agent "TRANSCRIPT-EXPANDED"))
          (expander (make-instance 'gtk:expander :label "Transcript" :child scroller
+                                  :css-classes '("duet-transcript")
                                   :expanded (setting key t) :vexpand t)))
     (setf (getf *controls* (agent-setting-key agent "TRANSCRIPT")) expander)
     (gobject:connect expander "notify::expanded"
@@ -23,67 +141,43 @@
     (gtk:widget-set-vexpand expander (setting key t))
     expander))
 
+(defun progress-text (presentation)
+  "The progress line: where the task is, and the round when one part is current."
+  (format nil "~a~@[ · Round ~d~]~@[ of ~d~]"
+          (getf presentation :label) (getf presentation :round)
+          (and (getf presentation :round) (getf presentation :max-rounds))))
+
 (defun refresh-workflow-presentation ()
   "Render the shared presentation model alongside CLI readiness and usage."
+  (ensure-presentation-css)
   (let* ((presentation (workflow-progress-presentation *workflow*))
-           (stages (getf presentation :stages)))
-      (when (control :progress)
-        (gtk:label-set-text (control :progress)
-                            (format nil "~a~@[ · round ~d~]~@[ of ~d~]"
-                                    (getf presentation :label) (getf presentation :round)
-                                    (and (getf presentation :round) (getf presentation :max-rounds))))
-        (gtk:widget-set-tooltip-text
-         (control :progress)
-         (format nil "~{~a~^~%~}"
-                 (mapcar (lambda (stage)
-                           (format nil "~a: ~(~a~)" (getf stage :label) (getf stage :state))) stages))))
-      (when (and (control :progress-details) (not (equal presentation (control :last-progress))))
-        (setf (getf *controls* :last-progress) presentation)
-        (clear-box (control :progress-details))
-        (gtk:box-append (control :progress-details)
-                        (make-progress-stages stages))))
+         (stages (getf presentation :stages)))
+    (when (control :progress)
+      (gtk:label-set-text (control :progress) (progress-text presentation))
+      (gtk:widget-add-css-class (control :progress) "duet-progress-label")
+      (gtk:widget-set-tooltip-text
+       (control :progress) (format nil "~{~a~^~%~}" (mapcar #'progress-stage-summary stages))))
+    (when (and (control :progress-details) (not (equal presentation (control :last-progress))))
+      (setf (getf *controls* :last-progress) presentation)
+      (clear-box (control :progress-details))
+      (when stages
+        (gtk:box-append (control :progress-details) (make-progress-stages stages)))
+      (when (control :progress-stage-details)
+        (clear-box (control :progress-stage-details))
+        (dolist (stage stages)
+          (gtk:box-append (control :progress-stage-details) (make-progress-stage-row stage))))
+      (when (control :progress-stage-expander)
+        (gtk:widget-set-visible (control :progress-stage-expander) (and stages t)))))
   (dolist (agent (list *claude* *codex*))
-      (let* ((pane (and agent (agent-pane-of agent)))
-             (label (and agent (control (agent-setting-key agent "WORKFLOW-ACTIVITY"))))
-             (presentation (and pane (workflow-agent-presentation *workflow* agent))))
-        (when label
-          (ensure-pill-css)
-          (gtk:label-set-text label (getf presentation :label))
-          (gtk:widget-set-halign label :start)
-          (gtk:widget-set-tooltip-text label
-                                       (format nil "~a~@[~%~a~]" (getf presentation :label) (getf presentation :detail)))
-          (gtk:widget-set-css-classes label (activity-pill-classes agent presentation))))))
-
-;;; Agent status pills: orange Claude, teal ChatGPT; blue review, green done,
-;;; amber for the user's turn, red errors. A provider of their own, so the
-;;; window's stylesheet needn't know them.
-
-(defparameter *pill-css*
-  '((".duet-pill" :border-radius "999px" :padding ("2px" "10px") :font-weight "600"
-     :border "1px solid transparent")
-    (".duet-pill-idle" :background-color "alpha(@view_fg_color, 0.08)"
-     :color "alpha(@view_fg_color, 0.75)" :border-color "alpha(@view_fg_color, 0.18)")
-    (".duet-pill-working" :background-color "alpha(@accent_bg_color, 0.18)"
-     :color "mix(@view_fg_color, @accent_color, 0.7)" :border-color "alpha(@accent_color, 0.6)")
-    (".duet-pill-working.duet-pill-claude" :background-color "alpha(#d97757, 0.18)"
-     :color "mix(@view_fg_color, #e8875f, 0.7)" :border-color "alpha(#d97757, 0.65)")
-    (".duet-pill-working.duet-pill-codex" :background-color "alpha(#14b8a6, 0.18)"
-     :color "mix(@view_fg_color, #2dd4bf, 0.7)" :border-color "alpha(#14b8a6, 0.65)")
-    (".duet-pill-review" :background-color "alpha(#3b82f6, 0.18)"
-     :color "mix(@view_fg_color, #60a5fa, 0.7)" :border-color "alpha(#3b82f6, 0.65)")
-    (".duet-pill-success" :background-color "alpha(#22c55e, 0.16)"
-     :color "mix(@view_fg_color, #4ade80, 0.65)" :border-color "alpha(#22c55e, 0.6)")
-    (".duet-pill-attention" :background-color "alpha(#f59e0b, 0.2)"
-     :color "mix(@view_fg_color, #fbbf24, 0.7)" :border-color "alpha(#f59e0b, 0.7)")
-    (".duet-pill-error" :background-color "alpha(#ef4444, 0.18)"
-     :color "mix(@view_fg_color, #f87171, 0.7)" :border-color "alpha(#ef4444, 0.7)")))
-
-(defvar *pill-css-provider* nil)
-
-(defun ensure-pill-css ()
-  "Install the pill stylesheet once, for the default display."
-  (unless *pill-css-provider*
-    (setf *pill-css-provider* (gtk:add-css *pill-css*))))
+    (let* ((pane (and agent (agent-pane-of agent)))
+           (label (and agent (control (agent-setting-key agent "WORKFLOW-ACTIVITY"))))
+           (presentation (and pane (workflow-agent-presentation *workflow* agent))))
+      (when label
+        (gtk:label-set-text label (getf presentation :label))
+        (gtk:widget-set-halign label :start)
+        (gtk:widget-set-tooltip-text label
+                                     (format nil "~a~@[~%~a~]" (getf presentation :label) (getf presentation :detail)))
+        (gtk:widget-set-css-classes label (activity-pill-classes agent presentation))))))
 
 (defun activity-pill-classes (agent presentation)
   (list "caption" "duet-pill"
@@ -156,41 +250,115 @@
     (when expander (gtk:expander-set-expanded expander t))))
 
 (defun make-progress-details ()
-  (let* ((box (make-instance 'gtk:box :orientation :vertical :spacing 6))
-         (expander (make-instance 'gtk:expander :label "Workflow progress" :child box
+  "The stage sequence under the progress line, then each stage's detail."
+  (ensure-presentation-css)
+  (let* ((sequence (make-instance 'gtk:box :orientation :vertical))
+         (rows (make-instance 'gtk:box :orientation :vertical :spacing 4 :margin-top 4 :margin-start 4))
+         (expander (make-instance 'gtk:expander :label "Stage details" :child rows :visible nil
                                   :expanded (setting :workflow-progress-expanded nil)
-                                  :margin-start 12 :margin-end 12 :margin-bottom 6)))
-    (setf (getf *controls* :progress-details) box)
+                                  :css-classes '("duet-workflow-settings")
+                                  :margin-start 12 :margin-end 12)))
+    (setf (getf *controls* :progress-details) sequence
+          (getf *controls* :progress-stage-details) rows
+          (getf *controls* :progress-stage-expander) expander)
     (gobject:connect expander "notify::expanded"
                      (lambda (widget param)
                        (declare (ignore param))
                        (setf (setting :workflow-progress-expanded) (gtk:expander-get-expanded widget))))
-    expander))
+    (gtk:build (gtk:box :orientation :vertical :spacing 2 :margin-bottom 6 sequence expander))))
+
+(defparameter *parallel-stage-ids* '(:lead-part :partner-part :lead-review :partner-review)
+  "Stages that run side by side: a split plan's parts, or both reviews.")
+
+(defun progress-stage-tone (stage)
+  "STAGE's look: an error, or something the user is to do, outranks its state."
+  (cond ((eq (getf stage :state) :error) :error)
+        ((getf stage :attention-p) :attention)
+        (t (case (getf stage :state)
+             ((:active :complete :skipped) (getf stage :state))
+             (otherwise :pending)))))
+
+(defun progress-stage-marker (stage)
+  "A symbol for each state, so the sequence reads without color."
+  (ecase (progress-stage-tone stage)
+    (:error "✕") (:attention "!") (:active "●") (:complete "✓") (:skipped "–") (:pending "○")))
+
+(defun progress-stage-summary (stage)
+  "Plan: done, or Claude's part: in progress — Working · round 2."
+  (format nil "~a: ~a~@[ — ~a~]" (getf stage :label)
+          (ecase (progress-stage-tone stage)
+            (:error "failed") (:attention "needs you") (:active "in progress")
+            (:complete "done") (:skipped "skipped") (:pending "not started"))
+          (getf stage :detail)))
+
+(defun progress-stage-groups (stages)
+  "STAGES in order, with consecutive parallel stages in one group."
+  (let ((groups '()))
+    (dolist (stage stages)
+      (if (and groups (member (getf stage :id) *parallel-stage-ids*)
+               (member (getf (first (first groups)) :id) *parallel-stage-ids*))
+          (push stage (first groups))
+          (push (list stage) groups)))
+    (mapcar #'reverse (nreverse groups))))
 
 (defun make-progress-stages (stages)
-  "Wrap status cards without FlowBox's otherwise actionable child wrappers."
-  (let ((flow (apply #'wrapping-controls (mapcar #'make-progress-stage stages))))
-    (gtk:widget-add-css-class flow "duet-progress")
-    (gtk:widget-set-can-target flow nil)
+  "One wrapping row: ✓ Plan — ● Working — ○ Done. Parts that run side by side
+are stacked in one step, so the row doesn't imply an order between them.
+The row is status, not controls: its children take no focus or clicks, but
+stay under the pointer so each stage's tooltip can be read."
+  (let ((flow (apply #'wrapping-controls
+                     (loop for group in (progress-stage-groups stages)
+                           for first = t then nil
+                           collect (let ((step (make-instance 'gtk:box :spacing 8 :css-classes '("duet-sequence-step"))))
+                                     (unless first
+                                       (gtk:box-append step (make-instance 'gtk:label :label "—" :valign :start
+                                                                           :css-classes '("duet-step-connector"))))
+                                     (gtk:box-append
+                                      step
+                                      (if (rest group)
+                                          (let ((box (make-instance 'gtk:box :orientation :vertical :spacing 4
+                                                                    :css-classes '("duet-step-group"))))
+                                            (dolist (stage group box)
+                                              (gtk:box-append box (make-progress-stage stage))))
+                                          (make-progress-stage (first group))))
+                                     step)))))
+    (gtk:widget-add-css-class flow "duet-sequence")
+    (gtk:flow-box-set-column-spacing flow 8)
+    (gtk:flow-box-set-max-children-per-line flow 12)
+    (gtk:widget-set-margin-start flow 12)
+    (gtk:widget-set-margin-end flow 12)
+    (gtk:widget-set-margin-top flow 0)
+    (gtk:widget-set-margin-bottom flow 2)
+    (gtk:flow-box-set-activate-on-single-click flow nil)
     (gtk:widget-set-can-focus flow nil)
     (loop for child = (gtk:widget-get-first-child flow) then (gtk:widget-get-next-sibling child)
           while child do (gtk:widget-set-focusable child nil))
     flow))
 
 (defun make-progress-stage (stage)
-  "Independent cards also describe concurrent parts without implying an order."
-  (make-instance 'gtk:label :xalign 0.0 :wrap t :max-width-chars 34
-                 :label (format nil "~a · ~(~a~)~@[~%~a~]"
-                                (getf stage :label) (getf stage :state) (getf stage :detail))
-                 :css-classes
-                 (list "duet-stage"
-                       (cond ((eq (getf stage :state) :error) "duet-stage-error")
-                             ((getf stage :attention-p) "duet-stage-attention")
-                             (t (case (getf stage :state)
-                                  (:active "duet-stage-active")
-                                  (:complete "duet-stage-complete")
-                                  (:skipped "duet-stage-skipped")
-                                  (otherwise "duet-stage-pending")))))))
+  "A marker and name; beneath, what a current, blocked or failed stage is doing."
+  (let* ((tone (progress-stage-tone stage))
+         (detail (and (member tone '(:active :attention :error)) (getf stage :detail)))
+         (box (make-instance 'gtk:box :orientation :vertical
+                                      :tooltip-text (progress-stage-summary stage)
+                                      :css-classes (list "duet-step" (format nil "duet-step-~(~a~)" tone)))))
+    (gtk:box-append box (gtk:build
+                         (gtk:box :spacing 5
+                                  (gtk:label :label (progress-stage-marker stage) :css-classes '("duet-step-marker"))
+                                  (gtk:label :label (getf stage :label) :xalign 0.0
+                                             :css-classes '("duet-step-label")))))
+    (when detail
+      (gtk:box-append box (make-instance 'gtk:label :label detail :xalign 0.0 :wrap t
+                                                    :max-width-chars 30 :margin-start 16
+                                                    :css-classes '("duet-step-detail"))))
+    box))
+
+(defun make-progress-stage-row (stage)
+  "STAGE's state and full detail, for Stage details."
+  (make-instance 'gtk:label :xalign 0.0 :wrap t :wrap-mode :word-char :selectable t
+                            :label (format nil "~a ~a" (progress-stage-marker stage) (progress-stage-summary stage))
+                            :css-classes (list "duet-step-row"
+                                               (format nil "duet-step-~(~a~)" (progress-stage-tone stage)))))
 
 (defun agent-layout-size ()
   (let ((outer (control :agent-split)))
