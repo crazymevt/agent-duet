@@ -1077,6 +1077,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
   (let ((panel (control :checklist-panel))
         (content (control :checklist-split)))
     (when (and panel content (not (eql (not (null visible)) (gtk:widget-get-visible panel))))
+      (remf *controls* :checklist-outer-restored)
       (when visible
         (remember-layout)
         (setf (getf *controls* :pre-checklist-positions)
@@ -1292,6 +1293,7 @@ and a line saying what each is doing.")
       ;; Checklist snapshots belong to the view in which they were captured.
       (remf *controls* :pre-checklist-positions)
       (remf *controls* :restore-checklist-positions)
+      (remf *controls* :checklist-outer-restored)
       (setf *view* view)
       (arrange-conversation view))
     (setf (setting :view) view)

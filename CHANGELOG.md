@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Closing the checklist restores the outer divider, waits for allocation,
+  then restores the inner divider, avoiding a shifted Three panes divider
+  when opening the checklist enlarged the window.
 - Sidebar divider positions now restore after GTK allocates an orientation
   change, preserving the wide layout when narrowing and widening. Checklist
   restoration also runs when a visibility toggle leaves the allocation unchanged.

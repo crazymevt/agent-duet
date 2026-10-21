@@ -48,8 +48,10 @@ still), and go back when it widens.
 Panes reserve at least 320px for the conversation and 300px per agent.
 Three panes therefore needs about 925px (more with the checklist open).
 A smaller requested window is held wider; the sidebar layouts and
-Conversation only work better on small screens. Short transcripts scroll
-to keep attention controls reachable.
+Conversation only work better on small screens. Opening the checklist can
+also enlarge the window to fit its controls; GTK may keep that larger window
+width after it closes. Resize the window to make it smaller again. Short
+transcripts scroll to keep attention controls reachable.
 
 Each agent's panel also has its own box for talking to that agent alone.
 While it works, press Return or **Send now** to send more instructions without

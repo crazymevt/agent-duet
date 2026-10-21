@@ -150,6 +150,61 @@ Still required before milestone 1 sign-off:
   The process restart above deliberately disabled CLI discovery.
 - [ ] Commit only when requested; no later milestone work was started.
 
+### Acceptance continuation, 2026-10-21 (Codex, before integration)
+
+Fresh-process GTK verification loaded this worktree with temporary
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME`; CLI discovery, notifications and history
+pruning were disabled. An earlier hot-reload run briefly reenabled local CLI
+catalog/readiness probes; those results are not protocol acceptance evidence. The computer-use target was a temporary *Divider
+Acceptance* app, separate from the user's running Agent Duet. No CLI task
+was sent and no real user preferences were changed.
+
+- Native pointer drag calls were attempted on the Agents on right divider,
+  the Agents on left divider, the Three panes inner divider and the checklist
+  edge at 1000px. Settled
+  GtkPaned readbacks did **not** establish movement caused by a drag.
+  A temporary wider-handle experiment also did not establish movement and
+  was reverted in the fixture. This is inconclusive physical-input evidence,
+  not a successful drag check or proof of an application defect. Physical
+  divider acceptance remains open; position setters cannot close it.
+- A separate settled-allocation matrix repeats checklist opening and closing
+  for all four layouts at requested widths 1440, 1000, 720 and 640px, at
+  1000px height. These are programmatic layout, resize and visibility calls.
+  Sidebar restoration at 1440/1000px is asserted against positions read
+  before opening; the 1000px cases cross the narrow-layout threshold while
+  the checklist is open.
+- That matrix exposed a Three panes bug: opening the checklist at 1000px
+  grew the window to 1183px; closing it changed inner position 398 to 441.
+  `watch-conversation-allocation` now restores the outer split first and
+  queues an allocation before restoring the inner split in the next frame.
+  Its temporary phase marker resets on visibility and layout changes.
+  A fresh-process repeat preserved `(300 398)` exactly in the same 1000px
+  case, and `(300 320)` at the Three panes minimum width. Both sidebars
+  preserved their 1440/1000px positions too.
+- GTK can retain the enlarged width after checklist closing: a requested
+  720px sidebar reached 862–869px with the checklist, and Three panes held at
+  922px without it and 1183px with it in this fixture. Those are actual
+  allocations, not a claim that Three panes fits at 640px. README now
+  explains that closing the checklist may leave a larger window to resize.
+- The final fresh-process matrix completed all 16 layout/width combinations
+  without assertion errors. Every visible conversation/agent panel retained
+  positive width and height with the checklist open; Three panes restoration
+  was also asserted at requested 720/640px (actual minimum width 922px).
+  This harness is manual GTK evidence, not a new checked-in headless test.
+- Local `make load`, `make test-parallel` (275 selected tests, 2,405 passed
+  assertions across eight workers, zero failed/skipped) and `git diff --check`
+  passed after the fix. These are pre-integration checks for this worktree.
+- The existing README screenshot still represents the current layout; no
+  replacement is needed for this divider-restoration fix. No successful
+  physical-input check is claimed from unsuccessful pointer automation.
+
+Claude's real-CLI acceptance report and changes are not yet integrated in
+this worktree. Keep its authenticated-protocol evidence separate from these
+GTK fixtures. After integration, reconcile the remaining checks above with
+that report and rerun `make load`, `make test-parallel` and
+`git diff --check` on the combined result before sign-off. No commit or later
+milestone work is part of this continuation.
+
 ## Milestone 2: task summary, usage, and time
 
 The existing agreed priority after review-only and restart recovery is an

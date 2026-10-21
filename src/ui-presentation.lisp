@@ -119,7 +119,7 @@
                                   '("duet-stage" "warning") '("duet-stage"))))
 
 (defun watch-conversation-allocation (widget)
-  "Observe rendered allocations without scheduling frames or polling timers."
+  "Observe rendered allocations; queue another only for staged restoration."
   (dolist (split (list widget (control :conversation-split)))
     (gobject:connect split "notify::position"
       (lambda (split spec)
@@ -157,6 +157,16 @@
                 ;; including Three panes and unchanged-size visibility toggles.
                 (let ((saved (control :restore-checklist-positions)))
                   (when (and saved (not (control :narrow-layout)))
-                    (remf *controls* :restore-checklist-positions)
-                    (gtk:paned-set-position widget (first saved))
-                    (gtk:paned-set-position (control :conversation-split) (second saved))))))))))))
+                    ;; Restoring the outer split changes the inner split's
+                    ;; allocation. Setting both in this frame lets GtkPaned
+                    ;; rescale the inner request against its old width (most
+                    ;; visible when the checklist grew a Three panes window).
+                    (if (control :checklist-outer-restored)
+                        (progn
+                          (remf *controls* :restore-checklist-positions)
+                          (remf *controls* :checklist-outer-restored)
+                          (gtk:paned-set-position (control :conversation-split) (second saved)))
+                        (progn
+                          (gtk:paned-set-position widget (first saved))
+                          (setf (getf *controls* :checklist-outer-restored) t)
+                          (gtk:widget-queue-allocate widget)))))))))))))
