@@ -6,8 +6,8 @@ sequence, see [the implementation plan](docs/implementation-plan.md).
 - [ ] **Redesign milestone 1 acceptance:** Live GTK layout, narrow-width,
   divider restoration, draft continuity and preference-application checks were
   performed on 2026-10-21; the screenshot is current. Real CLI delivery,
-  authentication/usage transitions, physical divider drags and final combined
-  review/checks remain before sign-off. See the plan for evidence and limits.
+  authentication/usage transitions and physical divider drags remain before
+  sign-off. See the plan for evidence and limits.
 
 - [x] **Structured review checklist:** Track each review finding as open, fixed, or dismissed, with file locations, so unresolved findings remain visible across review rounds.
 - [x] **Plan approval before coding:** Offer an optional pause after the lead proposes a plan, allowing the user to edit the scope or assignments before implementation starts.

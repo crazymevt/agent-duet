@@ -69,7 +69,7 @@ Automated coverage added in this step (headless; GTK widgets are untested):
   finished one shows its unfinished part as skipped; a paused step restored
   from its checkpoint still asks for the user, with its round.
 
-Resolved in Claude's reviewed settings changes (pending integration here):
+Resolved in the integrated settings changes:
 circular top-level settings are rejected, and circular nested values,
 including arrays of any rank, are dropped while other valid entries survive.
 `settings-malformed-files` and `settings-circular-values` cover these cases
@@ -136,10 +136,10 @@ Verified in that fixture:
 
 Still required before milestone 1 sign-off:
 
-- [ ] Review the combined diff with Claude's settings robustness work and
-  repeat `make load`, `make test-parallel`, and `git diff --check` after
-  integration. The checks above apply only to this worktree's combined base
-  and UI changes; Claude's separate worktree was not imported here.
+- [x] Reviewed the combined diff, settings regression coverage, and refreshed
+  screenshot after integration. `make load` and `make test-parallel` (eight
+  workers) passed on the merged result; both the working-tree diff and the
+  full diff against `9b69940` passed `git diff --check`.
 - [ ] Exercise physical divider drags, including checklist toggles at 1000px
   and minimum widths. Current evidence uses GtkPaned position setters.
 - [ ] Exercise real streaming/direct-message delivery while switching all
