@@ -447,7 +447,7 @@ for Codex, the one marked as the default)."
       (multiple-value-bind (models efforts) (make-model-dropdowns pane)
         (values pane
                 (gtk:build
-                 (gtk:box :orientation :vertical :css-classes '("duet-pane")
+                 (gtk:box :orientation :vertical :width-request 300 :css-classes '("duet-pane")
                           (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6
                                    (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
                                    status
@@ -1237,6 +1237,7 @@ and a line saying what each is doing.")
     (setf (setting (layout-position-key *view*))
           (or (control :restore-checklist-positions)
               (control :pre-checklist-positions)
+              (control :pending-layout-positions)
               (list (gtk:paned-get-position (control :agent-split))
                     (gtk:paned-get-position (control :conversation-split)))))))
 
@@ -1250,6 +1251,7 @@ and a line saying what each is doing.")
     (when outer
       (setf (getf *controls* :narrow-layout) nil)
       (remf *controls* :last-wide-positions)
+      (remf *controls* :pending-layout-positions)
       (gtk:orientable-set-orientation outer :horizontal)
       ;; The retained three-pane layout must respect each pane's minimum
       ;; size; otherwise dragging a divider can hide approvals and questions.
@@ -2557,7 +2559,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
       (on-return input (lambda () (unless (workflow-running-p) (start-request))))
       (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; the agent panels show their full transcripts.~%~%Return starts; Shift+Return starts a new line."))
       (gtk:build
-       (gtk:box :orientation :vertical :css-classes '("duet-pane" "duet-middle")
+       (gtk:box :orientation :vertical :width-request 320 :css-classes '("duet-pane" "duet-middle")
                 (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-top 6 :margin-bottom 6
                          (gtk:label :label "Conversation" :css-classes '("heading"))
                          status)

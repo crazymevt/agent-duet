@@ -3,6 +3,12 @@
 For the current redesign checkpoint, acceptance checks, and remaining milestone
 sequence, see [the implementation plan](docs/implementation-plan.md).
 
+- [ ] **Redesign milestone 1 acceptance:** Live GTK layout, narrow-width,
+  divider restoration, draft continuity and preference-application checks were
+  performed on 2026-10-21; the screenshot is current. Real CLI delivery,
+  authentication/usage transitions, physical divider drags and final combined
+  review/checks remain before sign-off. See the plan for evidence and limits.
+
 - [x] **Structured review checklist:** Track each review finding as open, fixed, or dismissed, with file locations, so unresolved findings remain visible across review rounds.
 - [x] **Plan approval before coding:** Offer an optional pause after the lead proposes a plan, allowing the user to edit the scope or assignments before implementation starts.
 - [x] **Completion and attention notifications:** Notify the user when both agents finish, a permission request needs attention, or usage limits pause a task.

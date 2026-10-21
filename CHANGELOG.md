@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Sidebar divider positions now restore after GTK allocates an orientation
+  change, preserving the wide layout when narrowing and widening. Checklist
+  restoration also runs when a visibility toggle leaves the allocation unchanged.
+- The conversation reserves 320px and each agent panel 300px so Three panes
+  keeps its composer and attention controls readable. Below 680px, responsive
+  sidebar layouts stack the agents and reserve more vertical room for them.
+- Refreshed the README screenshot from the redesigned window with explicitly
+  synthetic approval/question cards.
+- Settings loading rejects malformed top-level lists and drops circular or
+  dotted values while preserving independent valid preferences. Circular
+  nested lists and arrays of any rank no longer reach the settings printer;
+  malformed divider positions, recent folders and check commands are ignored.
 - A redesigned window: the shared conversation is the large pane on the
   left, with both agents' panels stacked in a resizable sidebar on the
   right. Workspace › Layout offers four layouts: *Agents on right*,

@@ -4,10 +4,10 @@ Claude and ChatGPT working on the same code, side by side, through their
 command-line tools: Claude Code (`claude -p`, stream-json) and Codex
 (`codex app-server`, the CLI bundled with the ChatGPT app or on PATH).
 
-![Agent Duet: Claude writes, ChatGPT reviews, with the checklist on the right](docs/screenshot.png)
+![Agent Duet: shared conversation with agent panels on the right](docs/screenshot.png)
 
-*The screenshot shows the earlier three-pane window; it predates the redesign
-described below.*
+*Current Agents on right layout, using synthetic approval and question cards
+for UI acceptance; no CLI command is running.*
 
 The window has a shared conversation and a panel for each agent:
 
@@ -45,8 +45,11 @@ layout is remembered, and each layout remembers its own divider positions.
 In a window too narrow for a sidebar, both sidebar layouts put the
 conversation above the agents (side by side, or stacked when narrower
 still), and go back when it widens.
-Panes keep a minimum size, so a divider can't hide an approval card; a very
-narrow window may be held wider than requested.
+Panes reserve at least 320px for the conversation and 300px per agent.
+Three panes therefore needs about 925px (more with the checklist open).
+A smaller requested window is held wider; the sidebar layouts and
+Conversation only work better on small screens. Short transcripts scroll
+to keep attention controls reachable.
 
 Each agent's panel also has its own box for talking to that agent alone.
 While it works, press Return or **Send now** to send more instructions without
@@ -425,9 +428,9 @@ libraries used to build them.
 ## Tests
 
 ```sh
-make test
-make test-parallel              # eight isolated workers
+make test-parallel             # full suite, eight isolated workers
 make test-parallel TEST_JOBS=2  # reduce memory/CPU usage
+make test                       # sequential, for debugging a failure
 ```
 
 They run without GTK or the CLIs: the workflows are driven by scripted agents.

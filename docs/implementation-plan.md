@@ -11,7 +11,7 @@ Committed as `bf9eb61` ("UI Resign"); milestone 1 continues on top of it:
 
 - Shared conversation on the left and stacked agent panels in a resizable
   sidebar; optional three-pane and conversation-only layouts.
-- In progress (lead, `src/ui.lisp`, `src/ui-presentation.lisp`,
+- Implemented (`src/ui.lisp`, `src/ui-presentation.lisp`,
   `src/settings.lisp`): a fourth layout, *Agents on left*, with the stacked
   agent panels on the left and the conversation on the right, its own saved
   divider positions (`:agents-left-positions`), and the same narrow-window
@@ -55,11 +55,13 @@ Automated coverage added in this step (headless; GTK widgets are untested):
   independently; missing, wrong-length, dotted, non-integer, negative and
   out-of-range positions ignored; out-of-range or non-integer dropdown
   choices fall back to the first); `layout-preferences-agents-left`
-  (*Agents on left* positions independent of the others; needs the lead's
-  `src/settings.lisp` change); `layout-preferences-survive-restart`
+  (*Agents on left* positions independent of the others);
+  `layout-preferences-survive-restart`
   (layout, positions, workflow choices and expansion states round-trip a
   save and load, and a hand-edited file with bad layout values still loads
-  its other settings).
+  its other settings); `settings-circular-values` (circular nested lists and
+  arrays of any rank are dropped while independent valid preferences survive
+  loading, updating/saving, and reloading; dotted divider values are ignored).
 - `tests/workflow-presentation.lisp`: every recoverable pause reason shown on
   the panel and stage with attention; both agents out of usage; a failed
   task; work finished unreviewed (never shown as approved, with and without
@@ -67,44 +69,86 @@ Automated coverage added in this step (headless; GTK widgets are untested):
   finished one shows its unfinished part as skipped; a paused step restored
   from its checkpoint still asks for the user, with its round.
 
-Known gap, reported to the lead: a settings file containing a circular list
-(`#1=(1 . #1#)`, which the reader accepts) hangs `layout-positions`, because
-`length` never returns; `load-settings` has the same problem for a circular
-top-level list. `list-length` (nil for circular lists) would fix both. No
-test is included for it yet, since it would hang the suite until fixed.
+Resolved in Claude's reviewed settings changes (pending integration here):
+circular top-level settings are rejected, and circular nested values,
+including arrays of any rank, are dropped while other valid entries survive.
+`settings-malformed-files` and `settings-circular-values` cover these cases
+with timeout guards; divider validation also safely ignores dotted values.
 
-Remaining manual acceptance checks (not verified by the automated suite):
+### Live GTK acceptance, 2026-10-21 (Codex worktree)
 
-- [ ] Review the final combined diff again, including the last review fixes.
-- [ ] Verify readable content and actual on-screen controls at narrow widths,
-  rather than treating nonzero allocations alone as sufficient acceptance.
-  At a requested 720px with the checklist open, the conversation measured
-  337px wide and agent panels 168px each; after closing it the window grew
-  to 845px. Decide whether that minimum-width behavior is acceptable.
-- [ ] Verify checklist divider restoration and user-dragged positions. At
-  1000px the conversation measured 660px before opening the checklist and
-  692px after closing it, so exact position restoration is not established.
-- [ ] Check approvals, questions, direct messages, missing/signed-out CLIs,
-  model/effort and usage controls in all four layouts (*Agents on right*,
-  *Agents on left*, *Three panes*, *Conversation only*), including while
-  switching layouts during a run. Preserve message delivery and recovery
-  semantics.
-- [ ] *Agents on left*: verify on screen that the agents are on the left and
-  the conversation on the right, that its divider positions are kept
-  separately from *Agents on right*, that a narrow window puts the
-  conversation first and restores the mirrored order when widened, and that
-  the checklist opens and closes without moving the other layout's dividers.
-- [ ] Verify layout and workflow preferences survive an actual app restart
-  and narrow/wide transitions in the running window. Saving, loading and
-  validating the preferences themselves is now covered by tests; the GTK
-  side (applying them to dividers and dropdowns) is not.
-- [x] Update README layout/control descriptions to match the redesigned UI,
-  including the four layouts, the Workspace menu and the shared composer.
-- [ ] Replace `docs/screenshot.png`, which still shows the old three-pane
-  window (the README says so under the image).
-- [ ] Re-run `make load`, `make test-parallel`, and `git diff --check` on the
-  merged result of the lead's layout work and these tests. Full-suite tests must use `make test-parallel`.
-- [ ] Check `CHANGELOG.md` under Unreleased, then commit when requested.
+The window was exercised in an isolated SBCL/GTK process with temporary
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME`, synthetic approval/question cards,
+and CLI discovery and desktop notifications disabled. No real CLI command
+was sent. Rendered images were captured with GtkWidgetPaintable/GtkSnapshot
+and inspected, rather than relying only on nonzero allocations.
+
+Fixes made after observing the renders:
+
+- GtkPaned rescaled divider requests against the previous orientation. A
+  narrow/wide cycle changed requested `(450 380)` positions to `(679 256)`.
+  Responsive divider requests now apply after the orientation's allocation;
+  both sidebar layouts returned to `(450 380)` in the repeated live check.
+  Pending requests are discarded on layout changes and protected from saving
+  transitional positions.
+- At 720px, Three panes gave the conversation only 187px, clipping its
+  composer. Minimum requests now reserve 320px for the conversation and
+  300px for each agent. Three panes holds the window at 925px when asked for
+  720px or 640px. This minimum-width policy is intentional; use a sidebar
+  layout or Conversation only for a smaller window.
+- Below 680px the responsive sidebar stacks agents vertically and gives
+  them 60% of the available height. At 720px it gives the conversation 60%
+  and places agents side by side. Divider requests apply after allocation
+  in both directions. Checklist restoration no longer depends on an
+  allocation-size change being observed in that frame.
+
+Verified in that fixture:
+
+- [x] All four layouts rendered at 1440 × 1000 and requested widths of 720
+  and 640. The conversation, composer, model/effort controls and attention
+  buttons remained reachable. Short transcript viewports scroll; whole
+  question cards do not always fit vertically at once.
+- [x] Agents on left rendered agents left/conversation right when wide,
+  conversation first when narrow, and mirrored again when widened. Agents
+  on right retained its own order. Seeded wide positions were `(900 350)`
+  and `(420 370)` respectively at initial application.
+- [x] Checklist opening/closing after programmatic divider moves restored
+  `(450 380)` in both sidebar layouts and `(450 373)` in Three panes (the
+  latter was GTK's accepted position before opening). These were read back
+  after settled allocations. Physical pointer dragging was not exercised.
+- [x] Existing approval/question cards survived layout changes. The same
+  widgets and agent instances were retained; an unsent agent draft was
+  asserted unchanged in each layout. Conversation only showed the mirrored
+  cards and model/effort controls. Approval/question arrival expanded the
+  transcript. This verifies UI continuity, not real protocol delivery.
+- [x] Workflow mode, lead, rounds and collapsed workflow settings applied
+  from seeded settings. A second Lisp process loaded the saved fixture file,
+  asserted the Conversation only layout, lead and rounds, then switched to
+  each sidebar and asserted its independent saved divider positions applied.
+- [x] README layout/control descriptions and minimum-width guidance updated;
+  `docs/screenshot.png` now shows the redesigned Agents on right layout
+  with a neutral `/tmp/agent-duet-demo/example/` folder and task-like demo
+  content. Its synthetic content is identified in the README caption.
+- [x] `CHANGELOG.md` Unreleased reviewed and updated.
+- [x] Local `make load`, `make test-parallel` (274 selected tests, 2,363
+  passed assertions across eight workers, zero failed/skipped), and
+  `git diff --check` passed after the UI fixes.
+
+Still required before milestone 1 sign-off:
+
+- [ ] Review the combined diff with Claude's settings robustness work and
+  repeat `make load`, `make test-parallel`, and `git diff --check` after
+  integration. The checks above apply only to this worktree's combined base
+  and UI changes; Claude's separate worktree was not imported here.
+- [ ] Exercise physical divider drags, including checklist toggles at 1000px
+  and minimum widths. Current evidence uses GtkPaned position setters.
+- [ ] Exercise real streaming/direct-message delivery while switching all
+  layouts, real approval/question answers, missing and signed-out CLIs,
+  model/effort changes and usage transitions. The fixture displayed these
+  controls but did not validate authenticated CLI behavior or recovery.
+- [ ] Recheck saved preferences with real CLI catalogs arriving asynchronously.
+  The process restart above deliberately disabled CLI discovery.
+- [ ] Commit only when requested; no later milestone work was started.
 
 ## Milestone 2: task summary, usage, and time
 
