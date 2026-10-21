@@ -262,6 +262,7 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   chips                                       ; the box showing them
   (stream-box nil) (stream-label nil) (stream-text "")
   (tools (make-hash-table :test 'equal))
+  (activity-text "No commands yet") (activity-id nil) (activity-title "") (activity-labels '())
   (approvals (make-hash-table :test 'equal))  ; approval id → its cards: (button row . widgets to disable)s
   (ready "Checking…")                         ; what the status says when the agent is idle
   (version nil)
@@ -451,7 +452,7 @@ for Codex, the one marked as the default)."
       (multiple-value-bind (models efforts) (make-model-dropdowns pane)
         (values pane
                 (gtk:build
-                 (gtk:box :orientation :vertical :width-request 300 :css-classes '("duet-pane")
+                 (gtk:box :orientation :vertical :width-request 300 :css-classes (list "duet-pane" (if (eq (agent-id agent) :claude) "duet-panel-claude" "duet-panel-codex"))
                           (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6
                                    (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
                                    status
@@ -463,6 +464,7 @@ for Codex, the one marked as the default)."
                             (setf (getf *controls* (agent-setting-key agent "WORKFLOW-ACTIVITY")) label)
                             label)
                           (wrapping-controls models efforts)
+                          (make-agent-activity-label pane)
                           (gtk:separator)
                           (make-transcript agent scroller)
                           (gtk:separator)
@@ -741,7 +743,29 @@ answer settles it, wherever it was given."
     (pane-finish-stream pane)
     (pane-scroll-to-end pane)))
 
+(defun set-agent-activity (pane text &optional error)
+  "Keep the latest command/edit visible without adding transcript rows."
+  (let ((line (substitute #\Space #\Return (substitute #\Space #\Newline text))))
+    (setf (agent-pane-activity-text pane) line)
+    (dolist (label (agent-pane-activity-labels pane))
+      (gtk:label-set-text label line)
+      (gtk:widget-set-tooltip-text label text)
+      (gtk:widget-set-css-classes label
+        (list "duet-live-activity" (if error "error" (agent-css-class (agent-pane-agent pane))))))))
+
+(defun make-agent-activity-label (pane)
+  (let ((label (make-instance 'gtk:label :label (agent-pane-activity-text pane)
+                             :xalign 0.0 :ellipsize :end :max-width-chars 48
+                             :margin-start 12 :margin-end 12 :margin-bottom 6
+                             :css-classes (list "duet-live-activity" (agent-css-class (agent-pane-agent pane))))))
+    (gtk:widget-set-tooltip-text label (agent-pane-activity-text pane))
+    (push label (agent-pane-activity-labels pane))
+    label))
+
 (defun pane-tool (pane id title)
+  (setf (agent-pane-activity-id pane) id
+        (agent-pane-activity-title pane) title)
+  (set-agent-activity pane (format nil "Running · ~a" title))
   (let ((entry (gethash id (agent-pane-tools pane)))
         (label (format nil "⚙ ~a" title)))
     (if entry
@@ -760,6 +784,11 @@ answer settles it, wherever it was given."
 (defun pane-tool-result (pane id text error)
   (let ((entry (gethash id (agent-pane-tools pane))))
     (when entry
+      ;; An older parallel tool finishing must not replace the newest command.
+      (when (equal id (agent-pane-activity-id pane))
+        (set-agent-activity pane
+          (format nil "~a · ~a" (if error "Failed" "Finished")
+                  (agent-pane-activity-title pane)) error))
       (gtk:label-set-text (cdr entry) (if (> (length text) 4000) (concatenate 'string (subseq text 0 4000) "…") text))
       (when error
         (let ((title (gtk:expander-get-label-widget (car entry))))
@@ -836,6 +865,9 @@ few such prompts made resizing take a large part of a second.")
 
 (defun clear-agent-pane (pane)
   (clear-box (pane-messages pane))
+  (setf (agent-pane-activity-id pane) nil
+        (agent-pane-activity-title pane) "")
+  (set-agent-activity pane "No commands yet")
   (clrhash (agent-pane-tools pane))
   (clrhash (agent-pane-approvals pane))
   (pane-finish-stream pane)
@@ -1323,8 +1355,6 @@ and a line saying what each is doing.")
     (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
     (loop for (widget . only) in *view-only*
           do (gtk:widget-set-visible widget (visible-in-view-p only view)))
-    (when (control :activity)
-      (gtk:widget-set-visible (control :activity) (eq view :conversation)))
     (refresh-activity)))
 
 (defun agent-activity (agent)
@@ -1339,9 +1369,9 @@ and a line saying what each is doing.")
                  (not (eq (agent-out-until agent) :unknown)) usage))))
 
 (defun refresh-activity ()
-  "Bring the conversation-only view's status line up to date."
+  "Bring the shared conversation's agent status lines up to date."
   (refresh-workflow-presentation)
-  (when (and (eq *view* :conversation) (control :claude-activity) *panes*)
+  (when (and (control :claude-activity) *panes*)
     (loop for (agent . name) in (list (cons *claude* :claude-activity) (cons *codex* :codex-activity))
           for label = (control name)
           for text = (agent-activity agent)
@@ -1352,8 +1382,8 @@ and a line saying what each is doing.")
                                                    '("warning") '("dim-label"))))))
 
 (defun make-activity-strip ()
-  "The line under the conversation's heading saying what each agent is
-doing, with its model and thinking level, shown in the conversation-only view."
+  "Compact status and latest command for each agent in every layout.
+Model controls are also available when the agent panels are hidden."
   (let ((claude (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")))
         (codex (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label"))))
     (flet ((agent-column (agent label)
@@ -1362,19 +1392,19 @@ doing, with its model and thinking level, shown in the conversation-only view."
                 (gtk:box :orientation :vertical :spacing 4
                          (gtk:box :spacing 6
                                   (gtk:label :label (agent-name agent) :css-classes (list "caption-heading" (agent-css-class agent)))
-                                  label)
+                                  (make-agent-activity-label (agent-pane-of agent)))
+                         (view-only :conversation label)
                          (let ((controls (wrapping-controls models efforts)))
                            ;; Lined up with the agent's name, as the strip has its own margins.
                            (gtk:widget-set-margin-start controls 0)
                            (gtk:widget-set-margin-end controls 0)
                            (gtk:widget-set-margin-top controls 0)
                            (gtk:widget-set-margin-bottom controls 0)
-                           controls))))))
+                           (view-only :conversation controls)))))))
     (let ((strip (gtk:build
                   (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-bottom 6 :homogeneous t
                            (agent-column *claude* claude)
                            (agent-column *codex* codex)))))
-      (gtk:widget-set-visible strip (eq *view* :conversation))
       (setf *controls* (list* :activity strip :claude-activity claude :codex-activity codex *controls*))
       strip))))
 
@@ -2717,6 +2747,9 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
          (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*)))
          (view (gtk:drop-down-new-from-strings (mapcar #'second *views*)))
+         (terminal-shortcut (make-instance 'gtk:button :label ">_"
+                                           :css-classes '("duet-terminal-shortcut" "monospace")
+                                           :tooltip-text "Show or hide terminal (Ctrl+`)"))
          (tools (make-instance 'gtk:menu-button :label "Workspace"))
          (box (make-instance 'gtk:box :orientation :vertical :spacing 10
                              :margin-start 12 :margin-end 12 :margin-top 12 :margin-bottom 12))
@@ -2780,7 +2813,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        (set-view (first (nth (gtk:drop-down-get-selected d) *views*)))))
     (gtk:header-bar-pack-start header folder)
     (gtk:header-bar-pack-start header (make-history-button))
+    (gobject:connect terminal-shortcut :clicked
+                     (lambda (button) (declare (ignore button)) (toggle-terminal)))
     (gtk:header-bar-pack-end header tools)
+    (gtk:header-bar-pack-end header terminal-shortcut)
     header))
 
 ;;; Checking the CLIs
@@ -2848,7 +2884,12 @@ and summary, with Changes and, when the work can be committed, Commit changes."
 ;;; The window
 
 (defparameter *css*
-  '((".duet-middle" :background-color "alpha(@view_fg_color, 0.02)")
+  '((".duet-panel-claude" :border-top "3px solid alpha(#d97757, 0.8)")
+    (".duet-panel-codex" :border-top "3px solid alpha(#14b8a6, 0.8)")
+    (".duet-live-activity" :font-size "smaller" :background-color "alpha(@view_fg_color, 0.05)"
+     :border-radius "6px" :padding ("5px" "8px"))
+    (".duet-terminal-shortcut" :color "@accent_color" :background-color "alpha(@accent_bg_color, 0.12)")
+    (".duet-middle" :background-color "alpha(@view_fg_color, 0.02)")
     (".duet-pane" :background-color "@view_bg_color")
     (".duet-prompt" :background-color "alpha(@accent_bg_color, 0.18)" :border-radius "8px" :padding ("6px" "10px"))
     (".duet-code" :background-color "alpha(@view_fg_color, 0.07)" :border-radius "6px" :padding "6px")
@@ -2857,10 +2898,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
      :border "1px solid alpha(@warning_color, 0.5)")
     (".duet-message" :border-radius "10px" :padding ("8px" "12px"))
     (".duet-from-user" :background-color "alpha(@accent_bg_color, 0.18)")
-    (".duet-from-claude" :background-color "alpha(#d97757, 0.16)" :margin-right "12px")
-    (".duet-from-codex" :background-color "alpha(#10a37f, 0.16)" :margin-left "12px")
-    (".duet-claude" :color "mix(@view_fg_color, #d97757, 0.55)")
-    (".duet-codex" :color "mix(@view_fg_color, #10a37f, 0.55)")
+    (".duet-from-claude" :border "1px solid alpha(#d97757, 0.24)" :background-color "alpha(#d97757, 0.16)" :margin-right "12px")
+    (".duet-from-codex" :border "1px solid alpha(#14b8a6, 0.24)" :background-color "alpha(#14b8a6, 0.16)" :margin-left "12px")
+    (".duet-claude" :color "mix(@view_fg_color, #e8875f, 0.7)")
+    (".duet-codex" :color "mix(@view_fg_color, #2dd4bf, 0.7)")
     (".duet-note" :font-size "smaller")
     (".duet-progress > flowboxchild" :background-color "transparent" :box-shadow "none"
      :border "none" :padding "0" :outline "none")
