@@ -1,10 +1,10 @@
 ;;;; ui.lisp — a shared conversation with live agent panels
 ;;;;
 ;;;; The agent panels show everything each agent does: the prompts it gets, its
-;;;; replies as they stream, its tool calls. Each has its own box for talking
-;;;; to that agent alone. The shared pane is the conversation between them:
-;;;; the user's request and each finished reply passed from one to the other.
-;;;; Its box starts a workflow (workflow.lisp) with the chosen mode and lead.
+;;;; replies as they stream, its tool calls, and an expandable direct composer.
+;;;; The shared conversation holds messages and attention cards in every layout.
+;;;; Its primary composer starts a workflow (workflow.lisp) when idle, or routes
+;;;; direction to both agents or an individual agent while work continues.
 
 (in-package #:agent-duet)
 
@@ -315,7 +315,7 @@ and the images follow it as thumbnails."
   status input send)
 
 (defun make-message-list ()
-  (let* ((messages (make-instance 'gtk:box :orientation :vertical :spacing 14
+  (let* ((messages (make-instance 'gtk:box :orientation :vertical :spacing 22
                                   :margin-start 12 :margin-end 12 :margin-top 8 :margin-bottom 8))
          (scroller (make-instance 'gtk:scrolled-window :child messages :vexpand t :hexpand t
                                   :hscrollbar-policy :never)))
@@ -369,7 +369,7 @@ and the images follow it as thumbnails."
 
 (defun composer (input send)
   (gtk:build
-   (gtk:box :spacing 6 :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 8
+   (gtk:box :css-classes '("duet-composer") :spacing 8 :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 8
             (gtk:frame :hexpand t
                        (gtk:scrolled-window :max-content-height 180 :propagate-natural-height t
                                             :hscrollbar-policy :never :child input))
@@ -581,6 +581,18 @@ for Codex, the one marked as the default)."
     (setf (getf *controls* (agent-setting-key agent key)) label)
     label))
 
+(defun make-agent-disclosure (agent name label child)
+  "An inset disclosure with an agent-specific saved expansion preference."
+  (let* ((key (agent-setting-key agent name))
+         (expander (make-instance 'gtk:expander :label label :child child
+                                  :expanded (setting key nil)
+                                  :margin-start 12 :margin-end 12 :margin-top 4 :margin-bottom 4)))
+    (setf (getf *controls* key) expander)
+    (gobject:connect expander "notify::expanded"
+                     (lambda (widget spec) (declare (ignore spec))
+                       (setf (setting key) (gtk:expander-get-expanded widget))))
+    expander))
+
 (defun make-agent-pane (agent)
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")
@@ -625,7 +637,7 @@ for Codex, the one marked as the default)."
                                    (gtk:button :label "New" :css-classes '("flat")
                                                :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
                                                :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
-                          (wrapping-controls models efforts)
+                          (make-agent-disclosure agent "MODEL-EXPANDED" "Model & thinking" (wrapping-controls models efforts))
                           (make-agent-activity-label pane)
                           (gtk:separator)
                           (make-transcript agent scroller)
@@ -643,7 +655,8 @@ for Codex, the one marked as the default)."
                                                 (set-attachments pane (append (agent-pane-attachments pane)
                                                                               (set-difference paths (agent-pane-attachments pane)
                                                                                               :test #'equal)))))
-                            box))))))))
+                            (make-agent-disclosure agent "COMPOSER-EXPANDED"
+                                                   (format nil "Message ~a directly" (agent-name agent)) box)))))))))
 
 (defun set-attachments (pane paths)
   "Attach PATHS to the next message from PANE's box, each shown as a removable chip."
@@ -742,8 +755,7 @@ for Codex, the one marked as the default)."
   (make-instance 'gtk:label :label text :xalign 0.0 :css-classes (list "heading" (agent-css-class agent))))
 
 (defun pane-approval (pane id title text)
-  "The approval card, in the agent's pane and, for the conversation-only
-view, in the conversation; either answers it, and both show the answer."
+  "Show synchronized approval cards in the transcript and every conversation layout."
   (reveal-agent-transcript pane)
   (let ((agent (agent-pane-agent pane)))
     (flet ((card ()
@@ -759,15 +771,9 @@ view, in the conversation; either answers it, and both show the answer."
                          buttons)))))
       (pane-finish-stream pane)
       (pane-append pane (card))
-      (pane-append *middle* (view-only :conversation (card)))
+      (pane-append *middle* (card))
       (pane-update-status pane)
-      (attention (format nil "~a needs your approval" (agent-name agent)) title :sound t)
-      (when (workflow-running-p)
-        (pane-append *middle*
-                     (view-only :panes
-                                (pane-note-label (format nil "~a is waiting for you to approve a command in its transcript."
-                                                         (agent-name agent))
-                                                 "warning" "duet-note")))))))
+      (attention (format nil "~a needs your approval" (agent-name agent)) title :sound t))))
 
 (defun question-choices (question)
   "Widgets for one of AskUserQuestion's QUESTIONS, and a function giving the
@@ -859,15 +865,9 @@ answer settles it, wherever it was given."
   (let ((agent (agent-pane-agent pane)))
     (pane-finish-stream pane)
     (pane-append pane (question-card pane id questions))
-    (pane-append *middle* (view-only :conversation (question-card pane id questions)))
+    (pane-append *middle* (question-card pane id questions))
     (pane-update-status pane)
-    (attention (format nil "~a has a question" (agent-name agent)) "It's waiting for your answer." :sound t)
-    (when (workflow-running-p)
-      (pane-append *middle*
-                   (view-only :panes
-                              (pane-note-label (format nil "~a is waiting for you to answer a question in its transcript."
-                                                       (agent-name agent))
-                                               "warning" "duet-note"))))))
+    (attention (format nil "~a has a question" (agent-name agent)) "It's waiting for your answer." :sound t)))
 
 (defun pane-approval-answered (pane id decision)
   "Settle every card for approval ID: the buttons give way to the answer."
@@ -1480,12 +1480,13 @@ comes without one (a turn stopped as the folder changes) isn't kept."
   "A message in the conversation, from SIDE: :user, :claude or :codex."
   (pane-append *middle*
                (gtk:build
-                (gtk:box :orientation :vertical :spacing 4
+                (gtk:box :orientation :vertical :spacing 8
+                         :hexpand t
                          :css-classes (list "duet-message" (ecase side
                                                              (:user "duet-from-user")
                                                              (:claude "duet-from-claude")
                                                              (:codex "duet-from-codex")))
-                         :halign (ecase side (:user :center) (:claude :start) (:codex :end))
+                         :halign :fill
                          (gtk:label :label header :xalign 0.0 :css-classes '("caption-heading"))
                          (markdown-box text)))))
 
@@ -1580,9 +1581,18 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun update-controls ()
   (when *controls*
+    (update-workflow-summary)
+    (when (control :routing-note)
+      (gtk:label-set-text (control :routing-note)
+                          (if (and (eq (composer-recipient) :both) (workflow-running-p))
+                              "To both: direction goes only to task agents with a live turn."
+                              "")))
     (let ((running (workflow-running-p)))
-      (gtk:button-set-label (control :send) "Start collaboration")
-      (gtk:widget-set-sensitive (control :send) (not running))
+      (gtk:button-set-label (control :send)
+                            (if (and (eq (composer-recipient) :both) (not running)
+                                     (not (agent-busy *claude*)) (not (agent-busy *codex*)))
+                                "Start collaboration" "Send"))
+      (gtk:widget-set-sensitive (control :send) t)
       (when (control :stop)
         (gtk:widget-set-visible (control :stop) running))
       (dolist (name '(:mode :lead :rounds :check :folder :permission :review-target :review-base :review-branch :review-count :review-agents))
@@ -2909,10 +2919,80 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                         :xalign 0.0 :wrap t)
                              buttons))))))
 
-(defun start-request ()
+(defun composer-recipient ()
+  (case (if (control :recipient) (gtk:drop-down-get-selected (control :recipient)) 0)
+    (1 :claude) (2 :codex) (t :both)))
+
+(defun send-composer-message ()
+  "Start a task, or deliver direction, remembering partial delivery for retries."
+  (let* ((recipient (composer-recipient))
+         (holder (control :composer-attachments))
+         (attachments (copy-list (and holder (agent-pane-attachments holder))))
+         (text (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input))))
+         (key (list recipient text attachments *workflow* *directory*))
+         (pending (control :composer-delivery)))
+    (unless (equal key (getf pending :key))
+      (setf pending nil (getf *controls* :composer-delivery) nil))
+    (unless (committing-p *middle*)
+      (if (and (null pending) (eq recipient :both) (not (workflow-running-p))
+               (not (agent-busy *claude*)) (not (agent-busy *codex*)))
+          (progn
+            (start-request attachments)
+            (when (and holder (workflow-running-p)) (set-attachments holder nil)))
+          (when (or (plusp (length text)) attachments)
+            (unless pending
+              (let ((targets (case recipient
+                               (:claude (list *claude*)) (:codex (list *codex*))
+                               (t (if (workflow-running-p)
+                                      (remove-if-not
+                                       (lambda (agent) (and (agent-busy agent)
+                                                            (workflow-agent-member-p *workflow* agent)))
+                                       (list *claude* *codex*))
+                                      (list *claude* *codex*))))))
+                (unless targets
+                  (pane-note *middle* "No task agents have a live turn. Your message is kept; send when an agent is working." "dim-label")
+                  (return-from send-composer-message))
+                (setf pending (list :key key :remaining targets)
+                      (getf *controls* :composer-delivery) pending)))
+            (handler-case
+                (progn
+                  (loop while (getf pending :remaining)
+                        for agent = (first (getf pending :remaining)) do
+                    ;; A task agent may have finished since a partial delivery.
+                    ;; A retry must never start an unrelated idle turn.
+                    (when (and (eq recipient :both) (workflow-running-p) (not (agent-busy agent)))
+                      (error "~a has no live turn. The remaining message is kept for retry." (agent-name agent)))
+                    (agent-send-now agent (if (plusp (length text)) text "Take a look at these.") attachments)
+                    ;; Mark success before recording, so even a history error
+                    ;; cannot cause a successful recipient to receive a retry.
+                    (pop (getf pending :remaining))
+                    (let ((header (format nil "You → ~a" (agent-name agent)))
+                          (body (prompt-with-attachments text attachments)))
+                      (middle-bubble :user header body)
+                      (record :middle :text (format nil "~a~%~%~a" header body))
+                      (save-current-history)))
+                  (setf (getf *controls* :composer-delivery) nil)
+                  (clear-text-view (control :input))
+                  (when holder (set-attachments holder nil)))
+              (error (e) (pane-note *middle* (format nil "~a~%Retry sends only to recipients who have not received this message."
+                                                   e) "error"))))))))
+
+(defun update-workflow-summary ()
+  (when (control :workflow-summary)
+    (gtk:label-set-text
+     (control :workflow-summary)
+     (format nil "~a · ~a leads~a"
+             (nth (gtk:drop-down-get-selected (control :mode))
+                  '("Write & review" "Split the work" "Compare proposals" "Review only"))
+             (agent-name (selected-lead))
+             (if (eq (selected-mode) :review-only) ""
+                 (format nil " · ~d rounds" (gtk:spin-button-get-value-as-int (control :rounds))))))))
+
+(defun start-request (&optional attachments)
   (if (workflow-running-p)
       (stop-workflow *workflow*)
-      (let ((text (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input))))
+      (let ((text (prompt-with-attachments
+                   (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input))) attachments))
             (problem nil))
         (when (or (plusp (length text)) (eq (selected-mode) :review-only))
           (cond
@@ -2958,6 +3038,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 1.0 :hexpand t :ellipsize :end :css-classes '("dim-label")))
            (input (make-input))
+           (recipient (gtk:drop-down-new-from-strings '("To both agents" "To Claude" "To ChatGPT")))
+           (chips (make-instance 'gtk:flow-box :selection-mode :none :visible nil
+                                 :row-spacing 4 :column-spacing 4 :margin-start 12 :margin-end 12))
+           (attachments (new-agent-pane :chips chips))
            (send (make-instance 'gtk:button :label "Start collaboration" :valign :end :css-classes '("suggested-action")))
            (stop (make-instance 'gtk:button :label "Stop collaboration" :valign :end :visible nil
                                 :css-classes '("destructive-action")))
@@ -2985,9 +3069,11 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                                                      saved *default-max-rounds*) 'double-float)))
       (gobject:connect lead "notify::selected"
                        (lambda (widget spec) (declare (ignore spec))
-                         (setf (setting :workflow-lead) (gtk:drop-down-get-selected widget))))
+                         (setf (setting :workflow-lead) (gtk:drop-down-get-selected widget))
+                         (update-workflow-summary)))
       (gobject:connect rounds :value-changed
-                       (lambda (widget) (setf (setting :workflow-rounds) (gtk:spin-button-get-value-as-int widget))))
+                       (lambda (widget) (setf (setting :workflow-rounds) (gtk:spin-button-get-value-as-int widget))
+                         (update-workflow-summary)))
       (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part. Compare proposals: both propose an approach on their own, the lead reconciles them into a plan, and then the work is split. Review only: selected agents inspect existing changes with enforced read-only access; Fix these starts a writing task.")
       (gtk:widget-set-tooltip-text approve-plan "Wait for you to look over (and edit) the plan before any work starts")
       (gobject:connect review-target "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
@@ -3006,19 +3092,22 @@ and summary, with Changes and, when the work can be committed, Commit changes."
       (gobject:connect check :changed
                        (lambda (e) (when *directory*
                                      (setf (folder-check-command *directory*) (gtk:editable-get-text e)))))
-      (gtk:widget-set-tooltip-text input "Drop files here to put their paths in the request")
-      (on-file-drop input (lambda (paths) (insert-paths input paths)))
-      (setf *controls* (list* :input input :send send :stop stop :mode mode :lead lead :rounds rounds :check check
+      (gtk:widget-set-tooltip-text input "Add direction or ask a question. Drop files or images to attach them. Return sends; Shift+Return adds a line.")
+      (on-file-drop input (lambda (paths)
+                            (set-attachments attachments
+                                             (union (agent-pane-attachments attachments) paths :test #'equal))))
+      (setf *controls* (list* :recipient recipient :composer-attachments attachments :input input :send send :stop stop :mode mode :lead lead :rounds rounds :check check
                               :approve-plan approve-plan :worktrees worktrees
                               :review-options review-options :review-target review-target :review-base review-base
                               :review-branch review-branch :review-count review-count :review-agents review-agents *controls*))
       (gobject:connect send :clicked (lambda (b) (declare (ignore b))
-                                      (unless (workflow-running-p) (start-request))))
+                                      (send-composer-message)))
       (gobject:connect stop :clicked (lambda (b) (declare (ignore b))
                                       (when (workflow-running-p) (stop-workflow *workflow*))))
       (gtk:widget-set-size-request input -1 100)
-      (on-return input (lambda () (unless (workflow-running-p) (start-request))))
-      (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; the agent panels show their full transcripts.~%~%Return starts; Shift+Return starts a new line."))
+      (on-return input #'send-composer-message)
+      (gobject:connect recipient "notify::selected" (lambda (d p) (declare (ignore d p)) (update-controls)))
+      (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; the agent panels show their full transcripts.~%~%Choose both agents to start collaborating, or route a message to one agent. During a task, send direction here. Return sends; Shift+Return adds a line."))
       (gtk:build
        (gtk:box :orientation :vertical :width-request 320 :css-classes '("duet-pane" "duet-middle")
                 (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-top 6 :margin-bottom 6
@@ -3033,16 +3122,26 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                 (gtk:separator)
                 scroller
                 (gtk:separator)
-                (wrapping-controls mode lead
-                 (gtk:build (gtk:box :spacing 6 (gtk:label :label "Rounds") rounds)))
+                (let ((summary (make-instance 'gtk:label :xalign 0.0 :wrap t
+                                               :margin-start 12 :margin-end 12 :margin-top 6
+                                               :css-classes '("caption-heading"))))
+                  (setf (getf *controls* :workflow-summary) summary)
+                  (update-workflow-summary)
+                  summary)
                 (make-workflow-settings
                  (gtk:build
                   (gtk:box :orientation :vertical :spacing 8
+                           (wrapping-controls mode lead
+                            (gtk:build (gtk:box :spacing 6 (gtk:label :label "Rounds") rounds)))
                            (wrapping-controls approve-plan worktrees)
                            (wrapping-controls (make-instance 'gtk:label :label "Check command") check)
                            review-options)))
-                (gtk:label :label "Task for both agents" :xalign 0.0
-                           :margin-start 12 :margin-top 8 :css-classes '("caption-heading"))
+                (wrapping-controls recipient)
+                (let ((note (make-instance 'gtk:label :xalign 0.0 :wrap t
+                                            :margin-start 12 :margin-end 12 :css-classes '("dim-label" "caption"))))
+                  (setf (getf *controls* :routing-note) note)
+                  note)
+                chips
                 (composer input (gtk:build (gtk:box :orientation :vertical :spacing 8 :valign :end send stop))))))))
 
 

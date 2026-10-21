@@ -1,4 +1,4 @@
-;;;; GTK regression check; run with make test-ui on a machine with GTK/display support:
+;;;; GTK routing, synchronized attention cards, conversation and layout regression checks; run with make test-ui on a machine with GTK/display support:
 ;;;; sbcl --non-interactive --load scripts/test-conversation-ui.lisp
 (require :asdf)
 (require :sb-posix)
