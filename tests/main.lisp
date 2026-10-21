@@ -771,7 +771,7 @@ contains; the last of PAIRS (unpaired) otherwise."
                                     :findings (list (ai::make-finding :id 1 :text "Keep this visible"))))
          (text (ai::checklist-text part))
          (blocks (ai::markdown-blocks text)))
-    (is equal '(:paragraph :quote :paragraph :paragraph :list) (mapcar #'first blocks))
+    (is equal '(:paragraph :paragraph :paragraph :paragraph :list :paragraph :quote) (mapcar #'first blocks))
     (true (search "Assigned to: **Claude**" text))
     (true (search "**F1**" text))
     (setf (ai::loop-combined-result part) t)
@@ -780,6 +780,23 @@ contains; the last of PAIRS (unpaired) otherwise."
       (false (search "unfinished" merged)))
     (setf (ai::loop-state part) :unknown)
     (fail (ai::checklist-text part) type-error)))
+
+(define-test task-checklist-prioritizes-open-findings
+    :parent agent-duet
+  (let* ((findings (list (ai::make-finding :id 1 :status :fixed :text "Fixed issue")
+                         (ai::make-finding :id 2 :status :dismissed :text "Dismissed issue")
+                         (ai::make-finding :id 3 :text "Remaining issue" :location "a.lisp:42")))
+         (part (ai::make-review-loop :author (make-instance 'fake-agent :name "Claude")
+                                    :task "Original request" :findings findings))
+         (text (ai::checklist-text part)))
+    (true (< (search "Progress:" text) (search "**Open (1)**" text)
+             (search "**F3**" text) (search "**Fixed (1)**" text)
+             (search "**F1**" text) (search "**Dismissed (1)**" text)
+             (search "**F2**" text) (search "Original request" text)))
+    (true (search "`a.lisp:42`" text))
+    (is equal '(1 2 3) (mapcar #'ai::finding-id findings))
+    (setf (ai::loop-findings part) nil)
+    (true (search "No review findings." (ai::checklist-text part)))))
 
 (define-test task-checklist-from-assignment
     :parent agent-duet

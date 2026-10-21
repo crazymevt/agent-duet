@@ -160,8 +160,10 @@ The checklist is useful from the moment work is handed out: each task
 appears as soon as it's assigned, with the agent doing it and its progress
 through work and review, and the review findings join it as they come in.
 It's in a separate, resizable panel on the right, showing the latest
-checklist for each loop, updated in place. Use **Workspace › Checklist**
-to show or hide it; it starts hidden, and the conversation takes the space
+checklist for each loop, updated in place. Progress and finding counts come
+first, followed by open findings, fixed and dismissed findings, and the task
+text. Findings keep their original IDs as their status changes.
+Use **Workspace › Checklist** to show or hide it; it starts hidden, and the conversation takes the space
 left when it's open; the app remembers your choice. While it's hidden, updates
 leave a notice in the conversation pointing to Workspace › Checklist. Saved conversations restore the latest
 checklist for each loop there too, including those saved before tasks were

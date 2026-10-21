@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Checklists lead with progress and counts, group open findings before fixed
+  and dismissed findings, and keep the task text below the review summary.
+  Tasks without findings show an explicit empty state.
 - Claude indexed results now use a per-turn baseline within the process-wide
   sequence to wait for replies to mid-turn messages before completing the turn. Saved Codex thinking levels survive delayed model
   catalog discovery.

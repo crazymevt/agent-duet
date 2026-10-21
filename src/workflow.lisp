@@ -809,19 +809,27 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
 (defun count-findings (findings status)
   (count status findings :key #'finding-status))
 
+(defun checklist-findings-text (findings)
+  "Group findings by status without changing their stable IDs or stored order."
+  (if (null findings)
+      "No review findings."
+      (with-output-to-string (out)
+        (loop for (status title) in '((:open "Open")
+                                      (:fixed "Fixed") (:dismissed "Dismissed"))
+              for group = (remove status findings :key #'finding-status :test-not #'eq)
+              when group do
+                (format out "**~a (~d)**~%~%" title (length group))
+                (dolist (f group)
+                  (format out "- ~a **F~d** ~(~a~)~@[ · `~a`~] — ~a~%"
+                          (ecase status (:open "○") (:fixed "✓") (:dismissed "✕"))
+                          (finding-id f) status (finding-location f) (finding-text f)))
+                (terpri out)))))
+
 (defun checklist-text (loop)
   "LOOP's checklist, in Markdown, for the conversation."
   (let ((findings (loop-findings loop)))
-    (format nil "**Task checklist~@[, ~a~]**~%~%~a~%~%Assigned to: **~a** · Progress: **~a** · Review rounds: ~d~%~%~d open, ~d fixed, ~d dismissed~%~%~{~a~^~%~}"
+    (format nil "**Task checklist~@[, ~a~]**~%~%Assigned to: **~a** · Progress: **~a** · Review rounds: ~d~%~%~d open, ~d fixed, ~d dismissed~%~%~a~%~%**Task**~%~%~a"
             (loop-label loop)
-            ;; Keep the full merged prompt for work and review, but not in the panel.
-            ;; Quote every task line so its Markdown cannot consume progress/findings.
-            (with-output-to-string (out)
-              (with-input-from-string (in (if (loop-combined-result loop)
-                                             "Combine both parts and review the merged result."
-                                             (loop-task loop)))
-                (loop for line = (read-line in nil) while line
-                      do (format out "> ~a~%" line))))
             (agent-name (loop-author loop))
             (ecase (loop-state loop)
               (:assigned "Assigned") (:working (if (plusp (loop-round loop)) "Addressing review" "Working"))
@@ -830,10 +838,15 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
               (:failed "Failed") (:paused "Paused") (:stopped "Stopped"))
             (loop-round loop)
             (count-findings findings :open) (count-findings findings :fixed) (count-findings findings :dismissed)
-            (loop for f in findings
-                  collect (format nil "- ~a **F~d** ~(~a~)~@[ · `~a`~] — ~a"
-                                  (ecase (finding-status f) (:open "○") (:fixed "✓") (:dismissed "✕"))
-                                  (finding-id f) (finding-status f) (finding-location f) (finding-text f))))))
+            (checklist-findings-text findings)
+            ;; Keep the full merged prompt for work and review, but not in the panel.
+            ;; Quote every task line so its Markdown cannot consume progress/findings.
+            (with-output-to-string (out)
+              (with-input-from-string (in (if (loop-combined-result loop)
+                                             "Combine both parts and review the merged result."
+                                             (loop-task loop)))
+                (loop for line = (read-line in nil) while line
+                      do (format out "> ~a~%" line)))))))
 
 (defun publish-checklist (workflow loop)
   "Publish a complete snapshot, retaining the same heading throughout LOOP."
