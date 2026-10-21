@@ -80,3 +80,49 @@
           (gtk:window-destroy window)
           (settle-layout-test-window))))))
 (format t "~&Layout restart UI checks passed.~%")
+
+;; Exercise the real header signal: synchronizing its toggle during startup
+;; must not reenter SET-TERMINAL-VISIBLE with the default focus policy.
+(let* ((*settings* nil) (*controls* nil) (*terminals* nil)
+       (*current-terminal* nil) (*terminal-panel* nil)
+       (*terminal-stack* nil) (*terminal-tabs* nil)
+       (original (symbol-function 'new-terminal))
+       (focus-requests nil))
+  (unwind-protect
+       (progn
+         (setf (symbol-function 'new-terminal)
+               (lambda (&key (focus t)) (push focus focus-requests)))
+         (make-header)
+         (make-terminal-panel)
+         (set-terminal-visible t :focus nil)
+         (assert (equal '(nil) focus-requests))
+         (assert (gtk:toggle-button-get-active (control :terminal)))
+         (set-terminal-visible nil)
+         ;; A user click must still show the panel and request focus.
+         (gtk:toggle-button-set-active (control :terminal) t)
+         (assert (equal '(t nil) focus-requests)))
+    (setf (symbol-function 'new-terminal) original)))
+
+(let* ((*settings* nil) (*controls* nil)
+       (*terminal-panel* (make-instance 'gtk:box :orientation :vertical))
+       (split (make-instance 'gtk:paned :orientation :vertical :position 400))
+       (window (make-instance 'gtk:window :default-width 800 :default-height 700)))
+  (unwind-protect
+       (progn
+         (setf (getf *controls* :terminal-split) split)
+         (gtk:paned-set-start-child split (make-instance 'gtk:box))
+         (gtk:paned-set-end-child split *terminal-panel*)
+         (gtk:window-set-child window split)
+         (gtk:window-present window)
+         (settle-layout-test-window)
+         (let ((height (gtk:widget-get-height *terminal-panel*)))
+           (assert (plusp height))
+           (setf (getf *controls* :restore-terminal-height) height)
+           (assert (not (restore-terminal-height)))
+           (assert (not (control :restore-terminal-height)))
+           (setf (getf *controls* :restore-terminal-height) (- height 20))
+           (assert (restore-terminal-height))
+           (assert (not (control :restore-terminal-height)))))
+    (gtk:window-destroy window)
+    (settle-layout-test-window)))
+(format t "~&Terminal toggle and height UI checks passed.~%")

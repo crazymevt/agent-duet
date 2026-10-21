@@ -228,7 +228,11 @@
 
 (defun window-layout-snapshot ()
   "Geometry and restoration state used to debounce persistence."
-  (list *view* (agent-layout-size)
+  (list (terminal-visible-p)
+        (and (control :terminal-split)
+             (gtk:widget-get-height (gtk:paned-get-end-child (control :terminal-split))))
+        (control :restore-terminal-height)
+        *view* (agent-layout-size)
         (gtk:paned-get-position (control :agent-split))
         (gtk:paned-get-position (control :conversation-split))
         (multiple-value-list (gtk:window-get-default-size *window*))
@@ -256,7 +260,8 @@
                                                :restore-checklist-positions :pending-layout-positions
                                                :equalize-agent-panels))
                         (remember-layout))
-                      (remember-window-geometry window)))
+                      (remember-window-geometry window)
+                      (remember-terminal-layout)))
                   nil)))))))
 
 (defun watch-conversation-allocation (widget)
@@ -280,7 +285,10 @@
         (gobject:connect (gtk:widget-get-frame-clock widget) :after-paint
           (lambda (clock)
             (declare (ignore clock))
-            (unless *closing*
+            ;; A terminal divider change needs another allocation before agent
+            ;; dividers can be restored against the new available height.
+            (unless (or *closing* (restore-terminal-height)
+                        (control :restore-terminal-height))
               (observe-agent-layout-size)
               (schedule-window-layout-save)
               ;; Orientation changes queue another allocation. Set positions

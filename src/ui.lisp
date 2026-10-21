@@ -2961,7 +2961,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                   :tooltip-text "Give each agent the other agent's project instructions too.")))
         (setf (getf *controls* :terminal) terminal)
         (gobject:connect terminal :toggled
-                         (lambda (b) (set-terminal-visible (gtk:toggle-button-get-active b))))
+                         (lambda (b)
+                           (let ((visible (gtk:toggle-button-get-active b)))
+                             (unless (eql visible (not (null (terminal-visible-p))))
+                               (set-terminal-visible visible)))))
         (gobject:connect checklist :toggled
                          (lambda (b)
                            (let ((visible (gtk:check-button-get-active b)))
@@ -3191,6 +3194,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
             (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
                                            :shrink-start-child nil :shrink-end-child nil
                                            :resize-end-child nil)))
+              (setf (getf *controls* :terminal-split) vertical)
               (gtk:paned-set-start-child vertical content)
               (gtk:paned-set-end-child vertical (make-terminal-panel))
               (gtk:window-set-child window vertical))))))
@@ -3203,6 +3207,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                            (if (equal (namestring cwd) "/") (user-homedir-pathname) cwd)))))
       (setf *directory* nil)
       (set-directory directory))
+    (when (eq (setting :terminal-visible) t)
+      (set-terminal-visible t :focus nil))
     (update-controls)
     (prune-histories)
     (check-agents)
@@ -3219,6 +3225,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        ;; now is found interrupted when reopened.
                        (remember-layout)
                        (remember-window-geometry window)
+                       (remember-terminal-layout)
                        (when (control :layout-save-timeout)
                          (glib:source-remove (control :layout-save-timeout))
                          (remf *controls* :layout-save-timeout))

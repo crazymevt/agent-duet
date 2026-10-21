@@ -313,10 +313,10 @@ any variables of the same names."
     (gtk:toggle-button-set-active (term-button term) t))
   (when focus (gtk:widget-grab-focus (term-widget term))))
 
-(defun new-terminal ()
+(defun new-terminal (&key (focus t))
   "A new shell in the agents' folder, shown in the panel."
   (if (vte-available-p)
-      (handler-case (start-terminal)
+      (handler-case (start-terminal :focus focus)
         (error (e) (show-terminal-problem (princ-to-string e))))
       (show-terminal-problem (vte-missing-message))))
 
@@ -363,16 +363,44 @@ any variables of the same names."
 (defun terminal-visible-p ()
   (and *terminal-panel* (gtk:widget-get-visible *terminal-panel*)))
 
-(defun set-terminal-visible (visible)
+(defun remember-terminal-layout ()
+  "Keep the visible panel's height; hidden allocations must not replace it."
+  (when (update-terminal-layout-settings
+         (terminal-visible-p)
+         (and *terminal-panel* (gtk:widget-get-height *terminal-panel*))
+         (control :restore-terminal-height))
+    (save-settings)))
+
+(defun restore-terminal-height ()
+  "Apply the saved height after GTK allocates the visible panel."
+  (let ((height (control :restore-terminal-height))
+        (split (control :terminal-split)))
+    (when (and height split (terminal-visible-p)
+               (plusp (gtk:widget-get-height *terminal-panel*)))
+      (let* ((position (gtk:paned-get-position split))
+             (target (max 0 (+ position
+                               (- (gtk:widget-get-height *terminal-panel*) height)))))
+        (remf *controls* :restore-terminal-height)
+        (unless (= position target)
+          (gtk:paned-set-position split target)
+          t)))))
+
+(defun set-terminal-visible (visible &key (focus t))
   "Show or hide the Terminal panel. Showing it starts a shell if there's none."
+  (unless visible
+    (remember-terminal-layout)
+    (remf *controls* :restore-terminal-height))
+  (when (and visible (not (terminal-visible-p)))
+    (setf (getf *controls* :restore-terminal-height) (saved-terminal-height)))
   (gtk:widget-set-visible *terminal-panel* visible)
   (let ((toggle (control :terminal)))
     (when (and toggle (not (eq (gtk:toggle-button-get-active toggle) (and visible t))))
       (gtk:toggle-button-set-active toggle visible)))
   (when visible
     (cond ((live-terminals)
-           (when *current-terminal* (gtk:widget-grab-focus (term-widget *current-terminal*))))
-          ((null *terminals*) (new-terminal)))))
+           (when (and focus *current-terminal*) (gtk:widget-grab-focus (term-widget *current-terminal*))))
+          ((null *terminals*) (new-terminal :focus focus))))
+  (remember-terminal-layout))
 
 (defun toggle-terminal ()
   (set-terminal-visible (not (terminal-visible-p))))

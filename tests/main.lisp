@@ -3570,3 +3570,30 @@ VERDICT: APPROVED" nil)
         (ai::save-settings file)
         (ai::load-settings file)
         (is equal '(800 300) (ai::layout-positions :sidebar))))))
+
+(define-test terminal-layout-preferences
+    :parent agent-duet
+  (let ((ai::*settings* nil))
+    (false (ai::saved-terminal-height))
+    (dolist (height '(nil 0 -1 100001 250.0 "250" (250)))
+      (setf ai::*settings* (list :terminal-height height))
+      (false (ai::saved-terminal-height)))
+    (dolist (height '(1 250 100000))
+      (setf ai::*settings* (list :terminal-visible t :terminal-height height))
+      (is = height (ai::saved-terminal-height)))))
+
+(define-test terminal-layout-saving
+    :parent agent-duet
+  (let ((ai::*settings* (list :terminal-visible t :terminal-height 250)))
+    (false (ai::update-terminal-layout-settings t 250 nil))
+    (true (ai::update-terminal-layout-settings nil 0 nil))
+    (false (ai::setting :terminal-visible))
+    (is = 250 (ai::saved-terminal-height))
+    (false (ai::update-terminal-layout-settings nil 900 nil))
+    (true (ai::update-terminal-layout-settings t 900 t))
+    (is = 250 (ai::saved-terminal-height))
+    (false (ai::update-terminal-layout-settings t 900 t))
+    (true (ai::update-terminal-layout-settings t 300 nil))
+    (is = 300 (ai::saved-terminal-height))
+    (false (ai::update-terminal-layout-settings t 300 nil))
+    (false (ai::update-terminal-layout-settings t 0 nil))))

@@ -166,3 +166,20 @@ Sidebar and responsive layouts split the child space in half."
   "Return a valid dropdown index, tolerating obsolete or malformed settings."
   (let ((index (setting key 0)))
     (if (and (integerp index) (<= 0 index) (< index count)) index 0)))
+
+(defun saved-terminal-height ()
+  "The last visible terminal height, ignoring malformed preferences."
+  (let ((height (setting :terminal-height)))
+    (when (and (integerp height) (<= 1 height 100000)) height)))
+
+(defun update-terminal-layout-settings (visible height restore-pending-p)
+  "Update terminal preferences in memory; return true only when they changed."
+  (let ((visible (not (null visible)))
+        (changed nil))
+    (unless (eql visible (setting :terminal-visible))
+      (setf (getf *settings* :terminal-visible) visible changed t))
+    (when (and visible (not restore-pending-p)
+               (integerp height) (<= 1 height 100000)
+               (not (eql height (saved-terminal-height))))
+      (setf (getf *settings* :terminal-height) height changed t))
+    changed))
