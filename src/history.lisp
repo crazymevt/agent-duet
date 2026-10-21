@@ -33,7 +33,7 @@
 (defun history-add-entry (history who kind text)
   "Append an entry and update the conversation's title and timestamp."
   (unless (and (member who '(:claude :codex :middle :user))
-               (member kind '(:prompt :text :tool :note :error)) (stringp text))
+               (member kind '(:prompt :text :tool :note :error :activity :activity-error)) (stringp text))
     (error "Invalid history entry."))
   (let ((now (get-universal-time)))
     (setf (history-entries history)
@@ -463,7 +463,7 @@ the PLAN waiting for approval again, or carries on the INTEGRATION."
                                 (unless (and (stringp (jget entry "text")) (integerp (jget entry "time")))
                                   (error "Invalid history entry."))
                                 (list :who (history-keyword (jget entry "who") '(:claude :codex :middle :user))
-                                      :kind (history-keyword (jget entry "kind") '(:prompt :text :tool :note :error))
+                                      :kind (history-keyword (jget entry "kind") '(:prompt :text :tool :note :error :activity :activity-error))
                                       :text (jget entry "text") :time (jget entry "time"))))))))
 
 (defun list-histories (&key directory (limit 50))

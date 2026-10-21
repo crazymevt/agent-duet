@@ -726,11 +726,11 @@ answer settles it, wherever it was given."
                                                       :css-classes (if (eq decision :deny) '("error") '("dim-label")))))
       (pane-update-status pane))))
 
-(defvar *mirror-agent-replies* t "Mirror live replies, but not transcript history replay.")
+(defvar *replaying-conversation* nil "Replay must not record new history entries.")
 
 (defun ensure-conversation-reply (pane)
   "Give this reply its own conversation bubble and command line."
-  (when (and *mirror-agent-replies* *middle* (not (agent-pane-conversation-box pane)))
+  (when (and *middle* (not (agent-pane-conversation-box pane)))
     (let* ((agent (agent-pane-agent pane))
            (bubble (middle-bubble (agent-id agent) (agent-name agent) ""))
            (body (gtk:widget-get-last-child bubble))
@@ -743,14 +743,35 @@ answer settles it, wherever it was given."
                     (agent-pane-activity-labels pane)))
       (gtk:box-append body label)
       (let ((activity (make-agent-activity-label pane)))
+        (setf (agent-pane-activity-id pane) nil
+              (agent-pane-activity-title pane) "")
+        (gtk:label-set-text activity "")
+        (gtk:widget-set-visible activity nil)
         (gtk:box-append bubble activity)
         (setf (agent-pane-conversation-activity pane) activity))
       (setf (agent-pane-conversation-box pane) body
             (agent-pane-conversation-label pane) label))))
 
-(defun pane-finish-stream (pane)
-  (setf (agent-pane-conversation-box pane) nil
-        (agent-pane-conversation-label pane) nil)
+(defun retire-conversation-activity (pane)
+  (setf (agent-pane-activity-labels pane)
+        (remove (agent-pane-conversation-activity pane) (agent-pane-activity-labels pane))
+        (agent-pane-conversation-activity pane) nil))
+
+(defun begin-conversation-turn (pane)
+  ;; A prompt can also be an injected message during a live text block.
+  (unless (agent-pane-stream-box pane)
+    (pane-finish-stream pane nil)
+    (retire-conversation-activity pane))
+  (setf (agent-pane-conversation-replies pane) nil))
+
+(defun pane-finish-stream (pane &optional (preserve-pending t))
+  "End streamed text, keeping a command-only bubble waiting for its reply.
+Finished text, a new turn and clearing the pane explicitly discard that pending state."
+  (unless (and preserve-pending
+               (agent-pane-conversation-label pane)
+               (zerop (length (gtk:label-get-text (agent-pane-conversation-label pane)))))
+    (setf (agent-pane-conversation-box pane) nil
+          (agent-pane-conversation-label pane) nil))
   (setf (agent-pane-stream-box pane) nil (agent-pane-stream-label pane) nil (agent-pane-stream-text pane) ""))
 
 (defun pane-delta (pane text)
@@ -782,7 +803,7 @@ answer settles it, wherever it was given."
                  (pane-append pane (make-instance 'gtk:box :orientation :vertical :spacing 6)))))
     (clear-box box)
     (render-markdown box text)
-    (pane-finish-stream pane)
+    (pane-finish-stream pane nil)
     (pane-scroll-to-end pane)))
 
 (defun set-agent-activity (pane text &optional error)
@@ -791,6 +812,7 @@ answer settles it, wherever it was given."
     (setf (agent-pane-activity-text pane) line)
     (dolist (label (agent-pane-activity-labels pane))
       (gtk:label-set-text label line)
+      (gtk:widget-set-visible label t)
       (gtk:widget-set-tooltip-text label text)
       (gtk:widget-set-css-classes label
         (list "duet-live-activity" (if error "error" (agent-css-class (agent-pane-agent pane))))))))
@@ -805,10 +827,16 @@ answer settles it, wherever it was given."
     label))
 
 (defun pane-tool (pane id title)
-  (setf (agent-pane-activity-id pane) id
-        (agent-pane-activity-title pane) title)
   (unless (agent-pane-conversation-activity pane)
     (ensure-conversation-reply pane))
+  ;; The streaming tool name may later be refined to its full command.
+  ;; Keep that refinement, but do not save repeated identical notifications.
+  (unless (or *replaying-conversation*
+              (and (equal id (agent-pane-activity-id pane))
+                   (equal title (agent-pane-activity-title pane))))
+    (record (agent-id (agent-pane-agent pane)) :activity (format nil "Running · ~a" title)))
+  (setf (agent-pane-activity-id pane) id
+        (agent-pane-activity-title pane) title)
   (set-agent-activity pane (format nil "Running · ~a" title))
   (let ((entry (gethash id (agent-pane-tools pane)))
         (label (format nil "⚙ ~a" title)))
@@ -830,6 +858,10 @@ answer settles it, wherever it was given."
     (when entry
       ;; An older parallel tool finishing must not replace the newest command.
       (when (equal id (agent-pane-activity-id pane))
+        (unless *replaying-conversation*
+          (record (agent-id (agent-pane-agent pane)) (if error :activity-error :activity)
+                  (format nil "~a · ~a" (if error "Failed" "Finished")
+                          (agent-pane-activity-title pane))))
         (set-agent-activity pane
           (format nil "~a · ~a" (if error "Failed" "Finished")
                   (agent-pane-activity-title pane)) error))
@@ -891,7 +923,7 @@ few such prompts made resizing take a large part of a second.")
       (ecase kind
         (:busy (pane-set-busy pane busy) (update-controls))
         (:prompt
-         (setf (agent-pane-conversation-replies pane) nil)
+         (begin-conversation-turn pane)
          (pane-prompt pane text))
         (:delta (pane-delta pane text))
         (:text (pane-text pane text))
@@ -907,6 +939,7 @@ few such prompts made resizing take a large part of a second.")
          ;; A turn that streamed but never finished its block.
          (when (agent-pane-stream-box pane)
            (pane-text pane (agent-pane-stream-text pane)))
+         (retire-conversation-activity pane)
          (when error (pane-note pane (or text "The turn failed.") "error")))))))
 
 (defun clear-agent-pane (pane)
@@ -920,7 +953,7 @@ few such prompts made resizing take a large part of a second.")
   (set-agent-activity pane "No commands yet")
   (clrhash (agent-pane-tools pane))
   (clrhash (agent-pane-approvals pane))
-  (pane-finish-stream pane)
+  (pane-finish-stream pane nil)
   (pane-update-status pane))
 
 (defun new-conversation (agent)
@@ -1000,16 +1033,29 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun replay-history (history)
   "Show HISTORY's entries in the panes, as they were."
-  (let ((*mirror-agent-replies* nil))
+  (let ((*replaying-conversation* t))
     (dolist (entry (history-entries history))
       (destructuring-bind (&key who kind text &allow-other-keys) entry
         (case who
           ((:claude :codex)
            (let ((pane (cdr (assoc who *panes*))))
              (case kind
-               (:prompt (pane-prompt pane text))
+               (:prompt (begin-conversation-turn pane) (pane-prompt pane text))
                (:text (pane-text pane text))
-               (:tool (pane-note pane (format nil "⚙ ~a" text) "dim-label" "duet-tool"))
+               ((:activity :activity-error)
+                (unless (agent-pane-conversation-activity pane)
+                  (ensure-conversation-reply pane))
+                (set-agent-activity pane text (eq kind :activity-error)))
+               (:tool
+                (pane-note pane (format nil "⚙ ~a" text) "dim-label" "duet-tool")
+                ;; Older histories have completion titles but no live activity events.
+                (unless (some (lambda (saved)
+                                (and (eq who (getf saved :who))
+                                     (member (getf saved :kind) '(:activity :activity-error))))
+                              (history-entries history))
+                  (unless (agent-pane-conversation-activity pane)
+                    (ensure-conversation-reply pane))
+                  (set-agent-activity pane (format nil "Finished · ~a" text))))
                (:error (pane-note pane text "error"))
                (t (pane-note pane text)))))
           (:user (middle-bubble :user "You  ·  request" text))
@@ -1025,10 +1071,11 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                   ;; Earlier conversations saved checklists as "Review checklist".
                   ((member header '("Task checklist" "Review checklist") :test #'string=)
                    (show-checklist body :notify nil))
-                  (t (middle-bubble (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header) :claude)
-                                          ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header) :codex)
-                                          (t :user))
-                                    header body)))))
+                  (t (cond ((uiop:string-prefix-p (format nil "~a →" (agent-name *claude*)) header)
+                            (middle-agent-message *claude* header body))
+                           ((uiop:string-prefix-p (format nil "~a →" (agent-name *codex*)) header)
+                            (middle-agent-message *codex* header body))
+                           (t (middle-bubble :user header body)))))))
              (:error (pane-note *middle* text "error"))
              (t (pane-note *middle* text "dim-label" "duet-note")))))))))
 
@@ -1242,9 +1289,19 @@ comes without one (a turn stopped as the folder changes) isn't kept."
           (let ((body (gtk:widget-get-next-sibling (gtk:widget-get-first-child bubble))))
             (clear-box body)
             (render-markdown body text))
+          (dolist (other (reverse replies))
+            (when (and (not (eq other entry)) (plusp (length (car other)))
+                       (search (car other) text))
+              (let* ((old (cdr other))
+                     (activity (gtk:widget-get-last-child old)))
+                ;; Keep the command beneath the combined reply instead of
+                ;; leaving a separate, textless message behind.
+                (when (gtk:widget-get-visible activity)
+                  (gtk:box-remove old activity)
+                  (gtk:widget-insert-before activity bubble (gtk:widget-get-last-child bubble)))
+                (gtk:box-remove (pane-messages *middle*) old))))
           (pane-scroll-to-end *middle*)
-          (setf (agent-pane-conversation-replies pane)
-                (remove entry (agent-pane-conversation-replies pane)))
+          (setf (agent-pane-conversation-replies pane) nil)
           bubble)
         (middle-bubble (agent-id agent) header text))))
 

@@ -21,8 +21,8 @@
     (let ((history (ai::make-history "/project/")))
       (setf (ai::history-handle history :claude) "session"
             (ai::history-handle history :codex) "thread")
-      (loop for who in '(:user :claude :codex :middle :claude)
-            for kind in '(:prompt :text :tool :note :error)
+      (loop for who in '(:user :claude :codex :middle :claude :claude :codex)
+            for kind in '(:prompt :text :tool :note :error :activity :activity-error)
             do (ai::history-add-entry history who kind "hello λ"))
       (ai::save-history history)
       ;; Saving again replaces an existing file.
