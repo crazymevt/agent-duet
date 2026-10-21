@@ -426,7 +426,7 @@ for Codex, the one marked as the default)."
 
 (defun make-agent-pane (agent)
   (multiple-value-bind (messages scroller) (make-message-list)
-    (let* ((status (make-instance 'gtk:label :xalign 0.0 :hexpand t :ellipsize :end :css-classes '("dim-label")
+    (let* ((status (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")
                                   :label "Checking…"))
            (input (make-input))
            (send (make-instance 'gtk:button :label "Send" :valign :end :css-classes '("suggested-action")
@@ -464,6 +464,7 @@ for Codex, the one marked as the default)."
                                    (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
                                    status
                                    (make-workflow-activity-pill agent "WORKFLOW-ACTIVITY")
+                                   (gtk:box :hexpand t)
                                    (gtk:button :label "New" :css-classes '("flat")
                                                :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
                                                :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
@@ -1409,7 +1410,7 @@ Model controls and workflow pills are available when the agent panels are hidden
                 (gtk:box :orientation :vertical :spacing 4
                          (gtk:box :spacing 6
                                   (gtk:label :label (agent-name agent) :css-classes (list "caption-heading" (agent-css-class agent)))
-                                  label
+                                  (view-only :conversation label)
                                   (view-only :conversation
                                              (make-workflow-activity-pill agent "WORKFLOW-STATUS-PILL")))
                          (let ((doing (make-agent-activity-label (agent-pane-of agent))))
