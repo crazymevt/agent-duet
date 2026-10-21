@@ -2,9 +2,22 @@
 
 (in-package #:agent-duet)
 
+(defun run-git-program (command &rest options)
+  "Run a synchronous Git command without copying the Lisp heap when supported."
+  ;; SBCL exposes :USE-POSIX-SPAWN on builds with PSPAWN. It is not listed
+  ;; in *FEATURES*. Older builds retain UIOP's default launch behavior.
+  (apply #'uiop:run-program command
+         (append (when (let ((spawn (find-symbol "PSPAWN" "SB-IMPL")))
+                         (and spawn (fboundp spawn)))
+                   '(:use-posix-spawn t))
+                 options)))
+
+;; Read-only status queries can overlap commits during checkpoint capture.
+;; --no-optional-locks prevents their index refresh from blocking those writes;
+;; Git still takes all locks required for actual mutations.
 (defun worktree-git (directory &rest arguments)
   (multiple-value-bind (output errors status)
-      (uiop:run-program (append (list "git" "-C" (namestring (uiop:ensure-directory-pathname directory)))
+      (run-git-program (append (list "git" "--no-optional-locks" "-C" (namestring (uiop:ensure-directory-pathname directory)))
                                 arguments)
                         :output :string :error-output :string :ignore-error-status t)
     (unless (zerop status)
@@ -76,7 +89,7 @@ MESSAGE labels a merge commit when one is needed; fast-forwards create no commit
   (unless (zerop (length (worktree-git tree-path "status" "--porcelain=v1" "-z" "--untracked-files=all")))
     (return-from merge-prerequisite-into-worktree (values :dirty nil)))
   (multiple-value-bind (output errors status)
-      (uiop:run-program (list "git" "-C" (namestring (uiop:ensure-directory-pathname tree-path))
+      (run-git-program (list "git" "--no-optional-locks" "-C" (namestring (uiop:ensure-directory-pathname tree-path))
                               "merge-base" "--is-ancestor" prerequisite-head "HEAD")
                         :output :string :error-output :string :ignore-error-status t)
     (declare (ignore output))
@@ -200,8 +213,8 @@ Each ref is deleted only if unchanged since read. Return the number deleted."
          (regular (remove-if #'third files)))
     (when regular
       (multiple-value-bind (output errors status)
-          (uiop:run-program
-           (list "git" "-C" (namestring root) "hash-object" "--stdin-paths")
+          (run-git-program
+           (list "git" "--no-optional-locks" "-C" (namestring root) "hash-object" "--stdin-paths")
            :input (make-string-input-stream
                    (format nil "~{~a~%~}" (mapcar (lambda (file) (git-input-path (first file))) regular)))
            :output :string :error-output :string :ignore-error-status t)
@@ -283,7 +296,7 @@ No existing directory, branch or ref is removed. Return the new worktree path."
 (defun recovery-content-hash (directory text)
   "A stable Git object digest without storing file contents or writing an object."
   (multiple-value-bind (output errors status)
-      (uiop:run-program (list "git" "-C" (namestring directory) "hash-object" "--stdin")
+      (run-git-program (list "git" "--no-optional-locks" "-C" (namestring directory) "hash-object" "--stdin")
                         :input (make-string-input-stream text) :output :string :error-output :string :ignore-error-status t)
     (unless (zerop status) (error "Cannot fingerprint recovery state: ~a" errors))
     (string-right-trim '(#\Newline #\Return) output)))

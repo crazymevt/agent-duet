@@ -27,12 +27,12 @@ changes: call it off the GTK thread."
 (defun snapshot-output (directory arguments &optional index)
   "Run Git, replacing undecodable bytes for display and preserving stderr on errors."
   (multiple-value-bind (output errors status)
-      (uiop:run-program
+      (run-git-program
        (append (when index
                  (list "env" (format nil "GIT_INDEX_FILE=~a" index)
                        "GIT_AUTHOR_NAME=Agent Duet" "GIT_AUTHOR_EMAIL=snapshot@agent-duet.invalid"
                        "GIT_COMMITTER_NAME=Agent Duet" "GIT_COMMITTER_EMAIL=snapshot@agent-duet.invalid"))
-               (list "git" "-C" (namestring directory)) arguments)
+               (list "git" "--no-optional-locks" "-C" (namestring directory)) arguments)
        :output :string :error-output :string :ignore-error-status t
        :external-format '(:utf-8 :replacement #\?))
     (unless (zerop status)

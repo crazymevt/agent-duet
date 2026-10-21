@@ -2543,7 +2543,7 @@ the merge can't touch it. MERGE-PREREQUISITE-INTO-WORKTREE's status and files."
 (defun conflict-marker-files (tree head)
   "The files in TREE with conflict markers added since HEAD."
   (multiple-value-bind (output errors status)
-      (uiop:run-program (list "git" "-C" (namestring (uiop:ensure-directory-pathname tree)) "diff" "--check" head)
+      (run-git-program (list "git" "--no-optional-locks" "-C" (namestring (uiop:ensure-directory-pathname tree)) "diff" "--check" head)
                         :output :string :error-output :string :ignore-error-status t)
     (declare (ignore errors status))
     (remove-duplicates
@@ -2568,8 +2568,8 @@ conflicts, stage the files and conclude it with `git commit --no-edit`."))
             (dolist (dep (loop-dependencies l))
               (when (loop-tree dep)
                 (let ((head (worktree-git-line (loop-tree dep) "rev-parse" "HEAD")))
-                  (unless (zerop (nth-value 2 (uiop:run-program
-                                               (list "git" "-C" (namestring (uiop:ensure-directory-pathname tree))
+                  (unless (zerop (nth-value 2 (run-git-program
+                                               (list "git" "--no-optional-locks" "-C" (namestring (uiop:ensure-directory-pathname tree))
                                                      "merge-base" "--is-ancestor" head "HEAD")
                                                :ignore-error-status t)))
                     (return-from prerequisite-merge-problem
