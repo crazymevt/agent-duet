@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 - 2026-10-20
 
 - Split plans can be ordered: the lead says whether the parts go on at the
   same time or one first (`ORDER:` in its plan), and the plan card has an
