@@ -73,7 +73,7 @@
   "Where relative image references resolve while a saved conversation is
 replayed: its folder. Otherwise *DIRECTORY*.")
 
-(defparameter *image-thumbnail-size* '(360 240) "The largest thumbnail, width and height.")
+(defparameter *image-thumbnail-size* '(640 480) "The largest thumbnail, width and height.")
 
 (defvar *image-thumbnails* (make-hash-table :test #'equal)
   "(namestring write-date) → texture, so a reply drawn again isn't decoded again.")
@@ -153,8 +153,14 @@ otherwise its description and where it was expected."
                                 :tooltip-text (format nil "Open ~a" (uiop:native-namestring path))))
          (box (make-instance 'gtk:box :orientation :vertical :spacing 4)))
     (if texture
-        (progn
+        (let* ((width (gdk:paintable-get-intrinsic-width texture))
+               (height (gdk:paintable-get-intrinsic-height texture))
+               (scale (min 1 (/ 240 (max width height)))))
+          ;; A modest, aspect-preserving floor prevents collapse without making
+          ;; the full texture width a minimum for the pane and window.
           (gtk:box-append box (make-instance 'gtk:picture :paintable texture :can-shrink t
+                                             :width-request (max 1 (round (* width scale)))
+                                             :height-request (max 1 (round (* height scale)))
                                              :content-fit :scale-down :halign :start
                                              :alternative-text caption))
           (gtk:box-append box (make-instance 'gtk:label :label caption :xalign 0.0 :ellipsize :middle

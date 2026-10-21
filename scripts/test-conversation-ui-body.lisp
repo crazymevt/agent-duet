@@ -200,10 +200,42 @@
              (assert (typep button 'gtk:button))
              (let ((picture (first (find-widgets button 'gtk:picture))))
                (assert picture)
-               (assert (<= (gdk:paintable-get-intrinsic-width (gtk:picture-get-paintable picture)) 360))
-               (assert (<= (gdk:paintable-get-intrinsic-height (gtk:picture-get-paintable picture)) 240)))
+               ;; Keep a visible floor while allowing layout below natural size.
+               (multiple-value-bind (minimum natural) (gtk:widget-measure picture :horizontal -1)
+                 (assert (= minimum 240))
+                 (assert (= natural 640)))
+               (multiple-value-bind (minimum natural) (gtk:widget-measure picture :vertical -1)
+                 (assert (= minimum 180))
+                 (assert (= natural 480)))
+               (assert (= (gdk:paintable-get-intrinsic-width (gtk:picture-get-paintable picture)) 640))
+               (assert (= (gdk:paintable-get-intrinsic-height (gtk:picture-get-paintable picture)) 480)))
              (assert (search "Home screen" (gtk:label-get-text (first (find-widgets button 'gtk:label)))))
              (assert (string= "Next line" (gtk:label-get-text after))))
+           ;; The actual message scroller must still fit a 300px-wide pane.
+           (multiple-value-bind (messages scroller) (make-message-list)
+             (render-markdown messages "![Generated image](mock.png)")
+             (assert (<= (gtk:widget-measure scroller :horizontal -1) 300)))
+           ;; Realize the scroller: requests alone don't prove displayed size.
+           (dolist (window-width '(900 300))
+             (multiple-value-bind (messages scroller) (make-message-list)
+               (let ((window (make-instance 'gtk:window :default-width window-width :default-height 700)))
+                 (unwind-protect
+                      (progn
+                        (render-markdown messages "![Generated image](mock.png)")
+                        (gtk:window-set-child window scroller)
+                        (gtk:window-present window)
+                        (let ((loop (glib:main-loop-new nil nil)))
+                          (glib:timeout-add glib:+priority-default+ 300
+                                            (lambda () (glib:main-loop-quit loop) nil))
+                          (glib:main-loop-run loop))
+                        (let* ((picture (first (find-widgets messages 'gtk:picture)))
+                               (width (gtk:widget-get-width picture)))
+                          (if (= window-width 900)
+                              (assert (= width 640))
+                              (progn
+                                (assert (<= 240 width 300))
+                                (assert (<= (gtk:widget-get-width window) 300))))))
+                   (gtk:window-destroy window)))))
            ;; Wrapped alt text uses the same normalized input for text and images.
            (let ((children (rendered (format nil "Before ![Home~%screen](mock.png) after"))))
              (assert (= 2 (length children)))
