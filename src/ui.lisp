@@ -1515,18 +1515,41 @@ and a line saying what each is doing.")
           (unless (second saved)
             (setf (getf *controls* :equalize-agent-panels) :pending)))))))
 
+(defun update-agent-toggle ()
+  "Keep the header shortcut and layout selector in sync with the current view."
+  (when (control :agent-toggle)
+    (gtk:button-set-label (control :agent-toggle)
+                          (if (eq *view* :conversation) "Show agents" "Hide agents")))
+  (when (control :view)
+    (let ((selected (position *view* *views* :key #'first)))
+      (unless (= selected (gtk:drop-down-get-selected (control :view)))
+        (gtk:drop-down-set-selected (control :view) selected)))))
+
+(defun toggle-agents ()
+  "Hide agents or restore the last selected agent layout."
+  (set-view (if (eq *view* :conversation)
+                (let ((saved (setting :last-agent-view :sidebar)))
+                  (if (and (assoc saved *views*) (not (eq saved :conversation)))
+                      saved :sidebar))
+                :conversation)))
+
 (defun set-view (view)
   "Show VIEW and persist the layout and its divider positions."
   (let ((view (if (assoc view *views*) view :sidebar)))
     (unless (eq view *view*)
       (remember-layout)
+      (unless (eq *view* :conversation)
+        (setf (getf *settings* :last-agent-view) *view*))
       ;; Checklist snapshots belong to the view in which they were captured.
       (remf *controls* :pre-checklist-positions)
       (remf *controls* :restore-checklist-positions)
       (remf *controls* :checklist-outer-restored)
       (setf *view* view)
       (arrange-conversation view))
+    (unless (eq view :conversation)
+      (setf (getf *settings* :last-agent-view) view))
     (setf (setting :view) view)
+    (update-agent-toggle)
     (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
     (loop for (widget . only) in *view-only*
           do (gtk:widget-set-visible widget (visible-in-view-p only view)))
@@ -2933,6 +2956,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
          (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*)))
          (view (gtk:drop-down-new-from-strings (mapcar #'second *views*)))
+         (agent-toggle (make-instance 'gtk:button
+                                      :tooltip-text "Hide agents or restore the last selected agent layout"))
          (terminal-shortcut (make-instance 'gtk:button :label ">_"
                                            :css-classes '("duet-terminal-shortcut" "monospace")
                                            :tooltip-text "Show or hide terminal (Ctrl+`)"))
@@ -2942,7 +2967,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (popover (make-instance 'gtk:popover :child box)))
     (gtk:widget-set-tooltip-text folder "Choose a workspace folder or reopen a recent folder")
     (gtk:menu-button-set-popover tools popover)
-    (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
+    (setf *controls* (list* :folder folder :folder-label folder-label :permission permission
+                                 :view view :agent-toggle agent-toggle *controls*))
     (flet ((row (label widget)
              (gtk:box-append box
                              (gtk:build (gtk:box :spacing 8
@@ -2999,13 +3025,18 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (gtk:drop-down-set-selected view (or (position *view* *views* :key #'first) 0))
     (gobject:connect view "notify::selected"
                      (lambda (d spec) (declare (ignore spec))
-                       (set-view (first (nth (gtk:drop-down-get-selected d) *views*)))))
+                       (let ((selected (first (nth (gtk:drop-down-get-selected d) *views*))))
+                         (unless (eq selected *view*) (set-view selected)))))
+    (update-agent-toggle)
+    (gobject:connect agent-toggle :clicked
+                     (lambda (button) (declare (ignore button)) (toggle-agents)))
     (gtk:header-bar-pack-start header folder)
     (gtk:header-bar-pack-start header (make-history-button))
     (gobject:connect terminal-shortcut :clicked
                      (lambda (button) (declare (ignore button)) (toggle-terminal)))
     (gtk:header-bar-pack-end header tools)
     (gtk:header-bar-pack-end header terminal-shortcut)
+    (gtk:header-bar-pack-end header agent-toggle)
     header))
 
 ;;; Checking the CLIs
