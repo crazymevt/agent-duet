@@ -2972,6 +2972,104 @@ and summary, with Changes and, when the work can be committed, Commit changes."
   (setf (adw:color-scheme) (third (assoc theme *themes*)))
   (restyle-terminals))
 
+(defun panel-shortcut-label (name)
+  (let ((text (panel-shortcut-text name)))
+    (if (eq (parse-panel-shortcut text) :disabled) "Disabled" text)))
+
+(defun update-shortcut-tooltips ()
+  (dolist (spec '((:agent-toggle :agents-shortcut "Show or hide agents")
+                  (:checklist-toggle :checklist-shortcut "Show or hide the checklist")
+                  (:terminal :terminal-shortcut "Show or hide the terminal")
+                  (:terminal-button :terminal-shortcut "Show or hide the terminal")))
+    (destructuring-bind (control-name shortcut title) spec
+      (when (control control-name)
+        (gtk:widget-set-tooltip-text
+         (control control-name)
+         (format nil "~a (~a~a)" title (panel-shortcut-label shortcut)
+                 (if (eq shortcut :terminal-shortcut) "; Ctrl+` also works" "")))))))
+
+(defun show-shortcut-settings ()
+  (let* ((window (make-instance 'gtk:window :title "Keyboard shortcuts"
+                                :transient-for *window* :modal t :default-width 480))
+         (box (make-instance 'gtk:box :orientation :vertical :spacing 12
+                             :margin-start 18 :margin-end 18 :margin-top 18 :margin-bottom 18))
+         (help (make-instance 'gtk:label :wrap t :xalign 0.0
+                             :label "Type a shortcut such as Alt+A or Ctrl+Shift+F1. Modifiers: Cmd, Option, Ctrl, Alt, Shift, Super. Leave blank to disable. Desktop shortcuts may take priority; editing and terminal shortcuts can also conflict."))
+         (message (make-instance 'gtk:label :wrap t :xalign 0.0))
+         (entries nil)
+         (buttons (make-instance 'gtk:box :spacing 8))
+         (reset (make-instance 'gtk:button :label "Restore defaults"))
+         (cancel (make-instance 'gtk:button :label "Cancel"))
+         (apply (make-instance 'gtk:button :label "Apply" :css-classes '("suggested-action"))))
+    (gtk:window-set-child window box)
+    (gtk:box-append box help)
+    (dolist (spec *panel-shortcuts*)
+      (let* ((name (first spec))
+             (entry (make-instance 'gtk:entry :hexpand t))
+             (row (make-instance 'gtk:box :spacing 12)))
+        (gtk:editable-set-text entry (panel-shortcut-text name))
+        (push (cons name entry) entries)
+        (gtk:box-append row (make-instance 'gtk:label :label (second spec) :xalign 0.0 :width-chars 10))
+        (gtk:box-append row entry)
+        (gtk:box-append box row)))
+    (setf entries (nreverse entries))
+    (gtk:box-append box (make-instance 'gtk:label :xalign 0.0 :label "Ctrl+` remains an additional terminal shortcut."))
+    (gtk:box-append box message)
+    (dolist (button (list reset cancel apply)) (gtk:box-append buttons button))
+    (gtk:box-append box buttons)
+    (flet ((show-message (text errorp)
+             (gtk:label-set-text message text)
+             (if errorp
+                 (gtk:widget-add-css-class message "error")
+                 (gtk:widget-remove-css-class message "error"))))
+      (gobject:connect cancel :clicked (lambda (b) (declare (ignore b)) (gtk:window-close window)))
+      (gobject:connect reset :clicked
+                       (lambda (b)
+                         (declare (ignore b))
+                         (dolist (entry entries)
+                           (gtk:editable-set-text (cdr entry) (default-panel-shortcut (car entry))))
+                         (show-message "Press Apply to save the defaults." nil)))
+      (gobject:connect apply :clicked
+                       (lambda (b)
+                         (declare (ignore b))
+                         (let* ((texts (mapcar (lambda (entry) (gtk:editable-get-text (cdr entry))) entries))
+                                (error (panel-shortcut-error texts)))
+                           (if error
+                               (show-message error t)
+                               (progn
+                                 (loop for entry in entries for text in texts
+                                       do (setf (getf *settings* (car entry)) (string-trim '(#\Space #\Tab) text)))
+                                 (save-settings)
+                                 (update-shortcut-tooltips)
+                                 (gtk:window-close window)))))))
+    (gtk:window-present window)
+    window))
+
+(defun run-panel-shortcut (action)
+  "Toggle the panel for ACTION, a name from *PANEL-SHORTCUTS*; true if it did."
+  (case action
+    (:agents-shortcut (toggle-agents))
+    (:terminal-shortcut (toggle-terminal))
+    (:checklist-shortcut
+     (let ((checklist (control :checklist-toggle)))
+       (gtk:check-button-set-active checklist (not (gtk:check-button-get-active checklist))))))
+  (not (null action)))
+
+(defun event-panel-shortcut (event keyval modifiers)
+  ;; GDK compares modifiers itself, ignoring those the layout consumed to
+  ;; produce the key (such as Shift for digits on AZERTY). A signal emitted
+  ;; without an event can only be compared directly.
+  (panel-shortcut-action
+   (lambda (key required)
+     (cond (event (gdk:key-event-matches event (gdk:keyval-from-name key) required))
+           ((and (= (gdk:keyval-to-lower keyval) (gdk:keyval-from-name key))
+                 (null (set-exclusive-or
+                        required
+                        (intersection modifiers '(:control-mask :alt-mask :shift-mask
+                                                  :meta-mask :super-mask)))))
+            :exact)
+           (t :none)))))
+
 (defun make-header ()
   (let* ((header (make-instance 'gtk:header-bar))
          (folder-label (make-instance 'gtk:label :ellipsize :start :max-width-chars 24))
@@ -2981,10 +3079,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*)))
          (view (gtk:drop-down-new-from-strings (mapcar #'second *views*)))
          (agent-toggle (make-instance 'gtk:button
-                                      :tooltip-text "Hide agents or restore the last selected agent layout"))
+                                      :tooltip-text "Show or hide agents"))
          (terminal-shortcut (make-instance 'gtk:button :label ">_"
                                            :css-classes '("duet-terminal-shortcut" "monospace")
-                                           :tooltip-text "Show or hide terminal (Ctrl+`)"))
+                                           :tooltip-text "Show or hide the terminal"))
          (tools (make-instance 'gtk:menu-button :label "Workspace"))
          (box (make-instance 'gtk:box :orientation :vertical :spacing 10
                              :margin-start 12 :margin-end 12 :margin-top 12 :margin-bottom 12))
@@ -2992,7 +3090,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (gtk:widget-set-tooltip-text folder "Choose a workspace folder or reopen a recent folder")
     (gtk:menu-button-set-popover tools popover)
     (setf *controls* (list* :folder folder :folder-label folder-label :permission permission
-                                 :view view :agent-toggle agent-toggle *controls*))
+                                 :view view :agent-toggle agent-toggle :terminal-button terminal-shortcut *controls*))
     (flet ((row (label widget)
              (gtk:box-append box
                              (gtk:build (gtk:box :spacing 8
@@ -3004,12 +3102,14 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                   (gtk:popover-popdown popover) (funcall callback)))
                (gtk:box-append box button))))
       (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
-                                     :tooltip-text "Show or hide the terminal (Ctrl+`)"))
+                                     :tooltip-text "Show or hide the terminal"))
             (checklist (make-instance 'gtk:check-button :label "Checklist"
-                                      :active (setting :checklist-visible nil)))
+                                      :active (setting :checklist-visible nil)
+                                      :tooltip-text "Show or hide the checklist"))
             (notes (make-instance 'gtk:check-button :label "Share project instructions" :active *shared-notes*
                                   :tooltip-text "Give each agent the other agent's project instructions too.")))
-        (setf (getf *controls* :terminal) terminal)
+        (setf (getf *controls* :terminal) terminal
+              (getf *controls* :checklist-toggle) checklist)
         (gobject:connect terminal :toggled
                          (lambda (b)
                            (let ((visible (gtk:toggle-button-get-active b)))
@@ -3024,6 +3124,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                          (lambda (b) (setf *shared-notes* (gtk:check-button-get-active b)
                                            (setting :shared-notes) *shared-notes*)))
         (gtk:box-append box terminal)
+        (action "Keyboard shortcuts…" #'show-shortcut-settings)
         (action "Documents" #'show-documents)
         (action "Changes" #'show-task-changes)
         (gtk:box-append box checklist)
@@ -3052,6 +3153,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        (let ((selected (first (nth (gtk:drop-down-get-selected d) *views*))))
                          (unless (eq selected *view*) (set-view selected)))))
     (update-agent-toggle)
+    (update-shortcut-tooltips)
     (gobject:connect agent-toggle :clicked
                      (lambda (button) (declare (ignore button)) (toggle-agents)))
     (gtk:header-bar-pack-start header folder)
@@ -3173,22 +3275,23 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (gtk:event-controller-set-propagation-phase keys :capture)
     (gobject:connect keys :key-pressed
                      (lambda (c keyval keycode state)
-                       (declare (ignore c keycode))
+                       (declare (ignore keycode))
                        (let ((key (gdk:keyval-name keyval))
                              (modifiers (modifier-list state)))
                          (cond
-                          ((and (string= key "q")
-                                (member :meta-mask modifiers)
-                                (not (intersection '(:control-mask :alt-mask :shift-mask) modifiers)))
+                          ((quit-shortcut-p key modifiers)
                            ;; Closing the window runs the normal cleanup for
                            ;; agents, terminals and document previews before quit.
                            (gtk:window-close window)
                            t)
-                          ((and (member key '("grave" "dead_grave") :test #'string=)
-                                (member :control-mask modifiers))
+                          ((run-panel-shortcut
+                            (event-panel-shortcut (gtk:event-controller-get-current-event c)
+                                                  keyval modifiers)))
+                          ((terminal-grave-shortcut-p key modifiers)
                            (toggle-terminal)
                            t)))))
-    (gtk:widget-add-controller window keys)))
+    (gtk:widget-add-controller window keys)
+    keys))
 
 (defun apply-settings-to (agent)
   (setf (agent-permission agent) *permission*)
@@ -3196,6 +3299,49 @@ and summary, with Changes and, when the work can be committed, Commit changes."
         (effort (setting (agent-setting-key agent "EFFORT"))))
     (when model (setf (agent-model agent) model))
     (setf (agent-effort agent) effort)))
+
+(defun make-main-content ()
+  "The agent panes, shared conversation, checklist and Terminal panel."
+  (multiple-value-bind (claude-pane claude-widget) (make-agent-pane *claude*)
+    (multiple-value-bind (codex-pane codex-widget) (make-agent-pane *codex*)
+      (setf *panes* (list (cons :claude claude-pane) (cons :codex codex-pane)))
+      ;; Controls wrap within each pane, so the dividers can respect their
+      ;; actual minimum widths without forcing all options onto one row.
+      (let* ((middle (make-middle-pane))
+             (inner (make-instance 'gtk:paned :orientation :horizontal
+                                   :position (if (setting :checklist-visible nil) 470 600)
+                                   :shrink-start-child nil :shrink-end-child nil))
+             (outer (make-instance 'gtk:paned :orientation :horizontal
+                                   :position (if (setting :checklist-visible nil) 336 420)
+                                   :shrink-start-child nil :shrink-end-child nil)))
+        (gtk:paned-set-start-child inner middle)
+        (gtk:paned-set-end-child inner codex-widget)
+        (gtk:paned-set-start-child outer claude-widget)
+        (gtk:paned-set-end-child outer inner)
+        ;; A separate, resizable checklist to the right of the agent panes.
+        (let ((content (make-instance 'gtk:paned :orientation :horizontal :position 1120
+                                      :shrink-start-child nil :shrink-end-child nil
+                                      :resize-end-child nil)))
+          (setf (getf *controls* :checklist-split) content
+                (getf *controls* :agent-split) outer
+                (getf *controls* :conversation-split) inner
+                (getf *controls* :middle-widget) middle
+                (getf *controls* :claude-widget) claude-widget
+                (getf *controls* :codex-widget) codex-widget)
+          (arrange-conversation *view*)
+          (gtk:paned-set-start-child content outer)
+          (gtk:paned-set-end-child content (make-checklist-panel))
+          (when (setting :checklist-visible nil)
+            (setf (getf *controls* :restore-checklist-width)
+                  (or (saved-checklist-width) 300)))
+          ;; The Terminal panel below the panes, hidden until asked for.
+          (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
+                                         :shrink-start-child nil :shrink-end-child nil
+                                         :resize-end-child nil)))
+            (setf (getf *controls* :terminal-split) vertical)
+            (gtk:paned-set-start-child vertical content)
+            (gtk:paned-set-end-child vertical (make-terminal-panel))
+            vertical))))))
 
 (defun activate (app)
   "Open the main window."
@@ -3216,46 +3362,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (apply-settings-to *claude*)
     (apply-settings-to *codex*)
     (gtk:window-set-titlebar window (make-header))
-    (multiple-value-bind (claude-pane claude-widget) (make-agent-pane *claude*)
-      (multiple-value-bind (codex-pane codex-widget) (make-agent-pane *codex*)
-        (setf *panes* (list (cons :claude claude-pane) (cons :codex codex-pane)))
-        ;; Controls wrap within each pane, so the dividers can respect their
-        ;; actual minimum widths without forcing all options onto one row.
-        (let* ((middle (make-middle-pane))
-               (inner (make-instance 'gtk:paned :orientation :horizontal
-                                     :position (if (setting :checklist-visible nil) 470 600)
-                                     :shrink-start-child nil :shrink-end-child nil))
-               (outer (make-instance 'gtk:paned :orientation :horizontal
-                                     :position (if (setting :checklist-visible nil) 336 420)
-                                     :shrink-start-child nil :shrink-end-child nil)))
-          (gtk:paned-set-start-child inner middle)
-          (gtk:paned-set-end-child inner codex-widget)
-          (gtk:paned-set-start-child outer claude-widget)
-          (gtk:paned-set-end-child outer inner)
-          ;; A separate, resizable checklist to the right of the agent panes.
-          (let ((content (make-instance 'gtk:paned :orientation :horizontal :position 1120
-                                        :shrink-start-child nil :shrink-end-child nil
-                                        :resize-end-child nil)))
-            (setf (getf *controls* :checklist-split) content
-                  (getf *controls* :agent-split) outer
-                  (getf *controls* :conversation-split) inner
-                  (getf *controls* :middle-widget) middle
-                  (getf *controls* :claude-widget) claude-widget
-                  (getf *controls* :codex-widget) codex-widget)
-            (arrange-conversation *view*)
-            (gtk:paned-set-start-child content outer)
-            (gtk:paned-set-end-child content (make-checklist-panel))
-            (when (setting :checklist-visible nil)
-              (setf (getf *controls* :restore-checklist-width)
-                    (or (saved-checklist-width) 300)))
-            ;; The Terminal panel below the panes, hidden until asked for.
-            (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
-                                           :shrink-start-child nil :shrink-end-child nil
-                                           :resize-end-child nil)))
-              (setf (getf *controls* :terminal-split) vertical)
-              (gtk:paned-set-start-child vertical content)
-              (gtk:paned-set-end-child vertical (make-terminal-panel))
-              (gtk:window-set-child window vertical))))))
+    (gtk:window-set-child window (make-main-content))
     (setup-window-keys window)
     (let ((directory (or *directory*
                          (let ((saved (setting :directory)))

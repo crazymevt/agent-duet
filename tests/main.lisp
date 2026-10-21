@@ -3614,3 +3614,42 @@ VERDICT: APPROVED" nil)
     (is = 300 (ai::saved-terminal-height))
     (false (ai::update-terminal-layout-settings t 300 nil))
     (false (ai::update-terminal-layout-settings t 0 nil))))
+
+(define-test configurable-panel-shortcuts
+    :parent agent-duet
+  (is equal (ai::parse-panel-shortcut "Cmd+Option+A")
+      (ai::parse-panel-shortcut "alt+meta+a"))
+  (is equal '("F12" (:CONTROL-MASK :SHIFT-MASK))
+      (ai::parse-panel-shortcut "Ctrl+Shift+F12"))
+  (is eq :disabled (ai::parse-panel-shortcut "  "))
+  (dolist (text '("a" "Shift+A" "Ctrl+" "Hyper+A" "Ctrl+Ctrl+A" "Ctrl+F13"))
+    (false (ai::parse-panel-shortcut text)))
+  (true (ai::panel-shortcut-error '("Alt+A" "Option+a" "Alt+T")))
+  (true (ai::panel-shortcut-error '("Cmd+Q" "Alt+L" "Alt+T")))
+  (true (ai::panel-shortcut-error '("Ctrl+Grave" "Alt+L" "Alt+T")))
+  ;; The window's Quit and Ctrl+` handlers accept these too, so they're reserved.
+  (true (ai::panel-shortcut-error '("Cmd+Super+Q" "Alt+L" "Alt+T")))
+  (true (ai::panel-shortcut-error '("Ctrl+Shift+Grave" "Alt+L" "Alt+T")))
+  (false (ai::panel-shortcut-error '("Cmd+Shift+Q" "Alt+L" "Alt+T")))
+  (false (ai::panel-shortcut-error '("" "" "Alt+T")))
+  ;; Matching is left to GDK, which sees the binding's key name and modifiers.
+  (let ((ai::*settings* '(:agents-shortcut "Ctrl+1" :checklist-shortcut "" :terminal-shortcut "Super+F3"))
+        (calls nil))
+    (is eq :agents-shortcut
+        (ai::panel-shortcut-action
+         (lambda (key mods) (push (list key mods) calls)
+           (if (equal key "1") :exact :none))))
+    (is equal '(("1" (:control-mask))) calls)
+    (is eq :terminal-shortcut
+        (ai::panel-shortcut-action (lambda (key mods) (declare (ignore mods))
+                                     (if (equal key "F3") :partial :none))))
+    (false (ai::panel-shortcut-action (constantly :none))))
+  (let ((ai::*settings* '(:agents-shortcut 42 :checklist-shortcut "" :terminal-shortcut "Super+F3")))
+    (is equal (ai::default-panel-shortcut :agents-shortcut) (ai::panel-shortcut-text :agents-shortcut))
+    (is equal "" (ai::panel-shortcut-text :checklist-shortcut))
+    (uiop:with-temporary-file (:pathname file)
+      (ai::save-settings file)
+      (setf ai::*settings* nil)
+      (ai::load-settings file)
+      (is equal "Super+F3" (ai::panel-shortcut-text :terminal-shortcut))
+      (is equal "" (ai::panel-shortcut-text :checklist-shortcut)))))

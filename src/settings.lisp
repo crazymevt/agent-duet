@@ -188,3 +188,74 @@ Sidebar and responsive layouts split the child space in half."
   "The last visible checklist width, ignoring malformed preferences."
   (let ((width (setting :checklist-width)))
     (when (and (integerp width) (<= 1 width 100000)) width)))
+
+(defparameter *panel-shortcuts*
+  '((:agents-shortcut "Agents" "a")
+    (:checklist-shortcut "Checklist" "l")
+    (:terminal-shortcut "Terminal" "t")))
+
+(defun default-panel-shortcut (name)
+  (format nil "~a+~a" #+darwin "Cmd+Option" #-darwin "Ctrl+Alt"
+          (string-upcase (third (assoc name *panel-shortcuts*)))))
+
+(defun parse-panel-shortcut (text)
+  "Return (key-name modifiers), :DISABLED for blank, or NIL for invalid input."
+  (when (stringp text)
+    (let* ((text (string-trim '(#\Space #\Tab) text))
+           (parts (mapcar (lambda (s) (string-downcase (string-trim '(#\Space) s)))
+                          (uiop:split-string text :separator "+")))
+           (key (car (last parts)))
+           (mods (loop for part in (butlast parts)
+                       collect (cdr (assoc part '(("cmd" . :meta-mask) ("meta" . :meta-mask)
+                                                  ("option" . :alt-mask) ("alt" . :alt-mask)
+                                                  ("ctrl" . :control-mask) ("control" . :control-mask)
+                                                  ("super" . :super-mask) ("shift" . :shift-mask))
+                                           :test #'string=)))))
+      (cond ((zerop (length text)) :disabled)
+            ((and mods (every #'identity mods)
+                  (= (length mods) (length (remove-duplicates mods)))
+                  (intersection mods '(:meta-mask :alt-mask :control-mask :super-mask))
+                  (or (and (= (length key) 1) (find (char key 0) "abcdefghijklmnopqrstuvwxyz0123456789"))
+                      (member key '("grave" "space" "f1" "f2" "f3" "f4" "f5" "f6"
+                                    "f7" "f8" "f9" "f10" "f11" "f12") :test #'equal)))
+             (list (if (and (> (length key) 1) (char= (char key 0) #\f))
+                       (string-upcase key) key)
+                   (sort mods #'string< :key #'symbol-name)))))))
+
+(defun panel-shortcut-text (name)
+  (let ((saved (setting name)))
+    (if (and (stringp saved) (parse-panel-shortcut saved))
+        saved (default-panel-shortcut name))))
+
+(defun quit-shortcut-p (key modifiers)
+  "Cmd+Q, with or without Super, which the window handles before panel shortcuts."
+  (and (string= key "q")
+       (member :meta-mask modifiers)
+       (not (intersection '(:control-mask :alt-mask :shift-mask) modifiers))))
+
+(defun terminal-grave-shortcut-p (key modifiers)
+  "Ctrl+`, with any other modifiers, the fixed terminal toggle."
+  (and (member key '("grave" "dead_grave") :test #'string=)
+       (member :control-mask modifiers)))
+
+(defun panel-shortcut-error (texts)
+  "Validate all three bindings before saving any of them."
+  (let ((seen nil))
+    (loop for text in texts
+          for parsed = (parse-panel-shortcut text)
+          do (cond ((null parsed) (return "Use modifiers plus a letter, digit, F1–F12, Space or Grave."))
+                   ((eq parsed :disabled))
+                   ((or (apply #'quit-shortcut-p parsed)
+                        (apply #'terminal-grave-shortcut-p parsed))
+                    (return "That shortcut is reserved for Quit or the terminal toggle."))
+                   ((member parsed seen :test #'equal) (return "Choose a different shortcut for each action."))
+                   (t (push parsed seen))))))
+
+(defun panel-shortcut-action (matches)
+  "The first enabled panel shortcut for which MATCHES, called with its key
+name and modifiers, returns :EXACT or :PARTIAL (a GdkKeyMatch)."
+  (loop for (name) in *panel-shortcuts*
+        for parsed = (parse-panel-shortcut (panel-shortcut-text name))
+        when (and (consp parsed)
+                  (member (funcall matches (first parsed) (second parsed)) '(:exact :partial)))
+          return name))

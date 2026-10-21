@@ -39,6 +39,28 @@ The window has a shared conversation and a panel for each agent:
   answers that agent), with a line saying what each is doing, its CLI's
   readiness and its remaining usage.
 
+Use **Cmd+Option** on macOS or **Ctrl+Alt** on Linux with these keys:
+
+| Key | Toggle |
+| --- | --- |
+| **A** | Agents (restores the last agent layout) |
+| **L** | Checklist |
+| **T** | Terminal |
+
+These shortcuts work from any pane, including the terminal. **Ctrl+`** also
+continues to toggle the terminal. On Linux, desktop shortcuts can take priority:
+Ctrl+Alt+L may lock the screen, Ctrl+Alt+T may launch a terminal, and
+Ctrl+Alt+A may activate a window requesting attention. Reassign those desktop
+shortcuts to use these bindings in Agent Duet.
+
+Choose **Workspace › Keyboard shortcuts…** to change any of these three
+bindings. Enter a combination such as `Alt+A`, `Super+L` or `Ctrl+Shift+F1`,
+then press **Apply**. Changes take effect immediately and survive restarts.
+Leave a field blank to disable that binding; **Restore defaults** fills in
+the original combinations for you to apply. Duplicate bindings and the fixed
+Quit and Ctrl+Grave shortcuts are rejected. Choose combinations that do not
+conflict with your desktop, text editing or terminal shortcuts.
+
 Switching layout keeps everything running: the same panels move, so a
 streaming reply, a pending approval or a half-typed message carries on. The
 layout is remembered, and each layout remembers its own divider positions.
@@ -268,7 +290,7 @@ long a turn may be quiet (see above).
 
 ## Terminal
 
-**Workspace › Terminal** (or Ctrl+`) opens a panel below the panes with
+**Workspace › Terminal** (or Cmd+Option+T on macOS, Ctrl+Alt+T on Linux, or Ctrl+`) opens a panel below the panes with
 a shell in the agents' folder. *+ New* opens another (each gets a tab), *Clear*
 (⌘K) clears one, *Kill* ends one, and *Hide* closes the panel while the shells
 keep running. ⌘C and ⌘V copy and paste. New shells start in the current folder;

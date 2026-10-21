@@ -172,4 +172,5 @@
       (assert (not (gtk:widget-get-visible (agent-pane-conversation-activity claude)))))))
 (format t "~&Conversation UI checks passed.~%")
 (load (merge-pathnames "test-layout-ui.lisp" *load-truename*))
+(load (merge-pathnames "test-shortcut-ui.lisp" *load-truename*))
 
