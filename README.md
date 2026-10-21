@@ -6,8 +6,9 @@ command-line tools: Claude Code (`claude -p`, stream-json) and Codex
 
 ![Agent Duet: shared conversation with agent panels on the right](docs/screenshot.png)
 
-*Current Agents on right layout, using synthetic approval and question cards
-for UI acceptance; no CLI command is running.*
+*Agents on right, the default layout, partway through a write-and-review task:
+ChatGPT is asking to run the tests. The conversation is a made-up demo; no CLI
+command is running.*
 
 The window has a shared conversation and a panel for each agent:
 
@@ -48,6 +49,10 @@ contrast in both.
 - **Conversation only**: the agents' panels are hidden, and the conversation
   has a line saying what each agent is doing, its CLI's readiness and its
   remaining usage.
+
+![Three panes: Claude on the left, the conversation in the middle, ChatGPT on the right](docs/screenshot-three-panes.png)
+
+![Conversation only: each agent's status, model and thinking above the shared conversation](docs/screenshot-conversation-only.png)
 
 In every layout, each agent's approval cards and questions appear in the
 conversation as well as in its transcript. Answering either copy answers the

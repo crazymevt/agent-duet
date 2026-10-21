@@ -6,7 +6,7 @@ TEST_JOBS ?= 8
 LISP_FLAGS ?= --dynamic-space-size 2048
 RUN = $(LISP) $(LISP_FLAGS) --non-interactive --eval '(require :asdf)' --eval '(push (truename ".") asdf:*central-registry*)'
 
-.PHONY: load test test-ui test-parallel run dev build app install-app clean
+.PHONY: load test test-ui test-parallel screenshots run dev build app install-app clean
 
 # Load the system, fetching its dependencies
 load:
@@ -20,6 +20,10 @@ test:
 # GTK conversation checks (requires GTK and a working display).
 test-ui:
 	$(LISP) $(LISP_FLAGS) --non-interactive --load scripts/test-conversation-ui.lisp
+
+# Regenerate the README screenshots in docs/ (requires GTK and a working display).
+screenshots:
+	$(LISP) $(LISP_FLAGS) --non-interactive --load scripts/screenshots.lisp
 
 # Warm the compilation cache before starting independent Lisp workers.
 test-parallel:
