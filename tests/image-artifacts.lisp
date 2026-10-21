@@ -70,3 +70,55 @@
       (false (ai::resolve-image-artifact "mock up.html" directory))
       (is equal '("Unsupported artifact: other")
           (ai::visualization-link (body "other" "{}") directory)))))
+
+(define-test unsupported-directive-name-bounded :parent agent-duet
+  (let ((caption (first (ai::visualization-link (make-string 10000 :initial-element #\x) nil))))
+    (true (< (length caption) 80))))
+
+(define-test generated-image-protocol-delivery :parent agent-duet
+  (with-temp-folder (directory)
+    (let* ((path (merge-pathnames "image (one).png" directory))
+           (events nil)
+           (server (ai::make-codex-app-server :deliver #'funcall
+                     :on-event (lambda (event) (push event events)))))
+      (write-file path "fixture")
+      (flet ((notify (method status saved)
+               (ai::codex-handle-notification server
+                 (ai::jobj "method" method "params"
+                   (ai::jobj "threadId" "thread" "turnId" "turn" "item"
+                     (ai::jobj "type" "imageGeneration" "id" "image" "status" status
+                               "savedPath" saved "revisedPrompt" "A mockup"
+                               "result" (make-string 100000 :initial-element #\A)))))))
+        (notify "item/started" "inProgress" nil)
+        (is eq :activity (ai::codex-event-kind (first events)))
+        (is equal "Generate image" (ai::codex-event-text (first events)))
+        (setf events nil)
+        (notify "item/completed" "completed" (namestring path))
+        (is = 2 (length events))
+        (true (find :activity-completed events :key #'ai::codex-event-kind))
+        (let* ((image (find :image events :key #'ai::codex-event-kind))
+               (agent (make-instance 'ai:codex-agent))
+               (seen nil))
+          (true image)
+          (is equal (namestring path) (ai::codex-event-text image))
+          (is equal "A mockup" (ai::codex-event-name image))
+          (setf (ai::codex-agent-server agent) server
+                (ai::codex-agent-last-text agent) "Real final reply"
+                (ai:agent-listener agent)
+                (lambda (a kind &rest plist) (declare (ignore a)) (push (cons kind plist) seen)))
+          (ai::codex-agent-event agent server image)
+          (is eq :text (caar seen))
+          (let* ((markdown (getf (cdar seen) :text))
+                 (node (first (ai::markdown-inlines markdown))))
+            (is eq :image (first node))
+            (is equal (truename path)
+                (ai::resolve-image-artifact (nth 8 node) directory)))
+          (is equal "Real final reply" (ai::codex-agent-last-text agent)))
+        (dolist (case '(("completed" nil) ("completed" "") ("failed" "ignored.png")))
+          (setf events nil)
+          (notify "item/completed" (first case) (second case))
+          (is = 1 (length events))
+          (is eq :activity-completed (ai::codex-event-kind (first events)))
+          (if (equal (first case) "failed")
+              (true (ai::codex-event-error (first events)))
+              (false (ai::codex-event-error (first events)))))))))

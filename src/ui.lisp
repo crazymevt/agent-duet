@@ -260,22 +260,31 @@ though labels show it. Text in markup is escaped, so each < starts a tag."
                (setf i (1+ end)))
           finally (write-string markup out :start i))))
 
+(defparameter *local-document-extensions*
+  (append *image-artifact-extensions*
+          '("html" "htm" "pdf" "txt" "md" "markdown" "csv" "tsv"
+            "json" "xml" "log" "doc" "docx" "odt" "rtf" "xls" "xlsx"
+            "ods" "ppt" "pptx" "odp")))
+
 (defun activate-prose-link (widget uri)
-  "Handle bare absolute file paths; let GTK launch ordinary URI links."
-  (when (and (plusp (length uri)) (char= (char uri 0) #\/))
-    (let ((path (resolve-image-artifact uri nil :extensions nil)))
-      ;; A click on an agent-supplied path must not run scripts. Check both
-      ;; the link's name and its resolved target, including all execute bits.
-      (when (and path
-                 (ignore-errors
-                   (and (not (some (lambda (name)
-                                     (member (pathname-type name)
-                                             '("command" "tool" "sh" "app" "terminal")
-                                             :test #'equalp))
-                                   (list (uiop:parse-native-namestring uri) path)))
-                        (zerop (logand #o111 (sb-posix:stat-mode (sb-posix:stat path)))))))
-        (open-image-artifact path widget)))
-    t))
+  "Handle local paths and file URIs, including refused links; defer web URIs to GTK."
+  (let ((file-uri (and (>= (length uri) 5) (string-equal uri "file:" :end1 5))))
+    (when (or file-uri (and (plusp (length uri)) (char= (char uri 0) #\/)))
+      (let* ((path (resolve-image-artifact uri nil :extensions *local-document-extensions*))
+             (original (and path
+                            (if file-uri
+                                (image-artifact-decode
+                                 (subseq uri 5 (position-if (lambda (ch) (find ch "?#")) uri)))
+                                uri))))
+        ;; Check the displayed name and resolved target, plus every execute bit.
+        ;; Consume refused file URIs too, so GTK cannot launch them itself.
+        (when (and path
+                   (ignore-errors
+                     (and (member (pathname-type (uiop:parse-native-namestring original))
+                                  *local-document-extensions* :test #'equalp)
+                          (zerop (logand #o111 (sb-posix:stat-mode (sb-posix:stat path)))))))
+          (open-image-artifact path widget)))
+      t)))
 
 (defun prose-label (text)
   "A label showing TEXT's prose, or nil when only shown images were in it."

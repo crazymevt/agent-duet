@@ -100,4 +100,5 @@ Never evaluate HTML or launch anything while rendering."
                 (if path (list "Open mockup" (image-artifact-uri path))
                     (list "Mockup (not found)"))))
           (error () (list "Mockup (invalid directive)")))
-        (list (format nil "Unsupported artifact: ~a" name)))))
+        (list (format nil "Unsupported artifact: ~a~a" (subseq name 0 (min 40 (length name)))
+                           (if (> (length name) 40) "…" ""))))))

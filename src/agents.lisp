@@ -871,6 +871,9 @@ rather than using a server with no thread."
       (:text-delta (agent-emit agent :delta :text (codex-event-text event)))
       (:text (setf (codex-agent-last-text agent) (codex-event-text event))
        (agent-emit agent :text :text (codex-event-text event)))
+      (:image
+       (agent-emit agent :text :text (format nil "![Generated image](~a)"
+                                           (image-artifact-uri (codex-event-text event)))))
       (:activity (agent-emit agent :tool :id (codex-event-id event) :title (codex-event-text event)))
       (:activity-completed (agent-emit agent :tool :id (codex-event-id event) :title (codex-event-name event))
        (agent-emit agent :tool-result :id (codex-event-id event) :text (codex-event-text event)

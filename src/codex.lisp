@@ -63,6 +63,7 @@ call it off the GUI thread."
   :thread-started  THREAD-ID
   :text-delta      TEXT, more of a reply being written
   :text            TEXT, a finished agent message
+  :image           TEXT (saved path), NAME (revised prompt)
   :activity        NAME (the item type), ID, TEXT: a command or file change starting
   :activity-completed  ID, TEXT (its output), ERROR
   :result          ERROR, TEXT (the error message), TURN-ID: the turn ended
@@ -202,6 +203,7 @@ the rest of the session) or :deny."
                              when (stringp path) collect (file-namestring path))
                        '("files"))))
           ((equal type "mcpToolCall") (format nil "~a.~a" (jget item "server") (jget item "tool")))
+          ((equal type "imageGeneration") "Generate image")
           ((equal type "webSearch") (format nil "Search: ~a" (or (jget item "query") "")))
           (t type))))
 
@@ -219,7 +221,7 @@ the rest of the session) or :deny."
           (t ""))))
 
 (defparameter *codex-activity-types*
-  '("commandExecution" "fileChange" "mcpToolCall" "webSearch"))
+  '("commandExecution" "fileChange" "mcpToolCall" "webSearch" "imageGeneration"))
 
 (defun codex-handle-notification (server object)
   (let* ((method (jget object "method"))
@@ -242,6 +244,14 @@ the rest of the session) or :deny."
      ((equal method "item/completed")
       (let* ((item (jget params "item"))
              (type (jget item "type")))
+        (when (and (equal type "imageGeneration")
+                   (equal (jget item "status") "completed")
+                   (stringp (jget item "savedPath"))
+                   (plusp (length (jget item "savedPath"))))
+          (codex-deliver-event server (make-codex-event :kind :image :id (jget item "id")
+                                                       :text (jget item "savedPath")
+                                                       :name (jget item "revisedPrompt")
+                                                       :thread-id thread-id :turn-id turn-id)))
         (cond ((equal type "agentMessage")
                (codex-deliver-event server (make-codex-event :kind :text :text (or (jget item "text") "")
                                                              :id (jget item "id")
