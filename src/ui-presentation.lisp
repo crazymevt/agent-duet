@@ -156,10 +156,16 @@
     (when expander (gtk:expander-set-expanded expander t))))
 
 (defun make-progress-details ()
-  (let ((box (make-instance 'gtk:box :orientation :vertical :spacing 6)))
+  (let* ((box (make-instance 'gtk:box :orientation :vertical :spacing 6))
+         (expander (make-instance 'gtk:expander :label "Workflow progress" :child box
+                                  :expanded (setting :workflow-progress-expanded nil)
+                                  :margin-start 12 :margin-end 12 :margin-bottom 6)))
     (setf (getf *controls* :progress-details) box)
-    (make-instance 'gtk:expander :label "Workflow progress" :child box
-                   :margin-start 12 :margin-end 12 :margin-bottom 6)))
+    (gobject:connect expander "notify::expanded"
+                     (lambda (widget param)
+                       (declare (ignore param))
+                       (setf (setting :workflow-progress-expanded) (gtk:expander-get-expanded widget))))
+    expander))
 
 (defun make-progress-stages (stages)
   "Wrap status cards without FlowBox's otherwise actionable child wrappers."
