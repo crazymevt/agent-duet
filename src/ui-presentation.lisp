@@ -57,7 +57,7 @@
     ("expander-widget.duet-workflow-settings > box > title" :color "alpha(@view_fg_color, 0.75)")
     ;; Composers: one rounded field, outlined in the accent while typing.
     ;; A composer is a frame in a .duet-composer box, or (unmarked) directly in a
-    ;; pane or in a box there. The box itself also holds Send: no border.
+    ;; pane or in a box there. Only the field gets a border; the action row does not.
     (".duet-composer > frame, .duet-pane > box > frame, .duet-pane > box > box > frame"
      :border-radius "10px" :border "1px solid alpha(@view_fg_color, 0.16)"
      :background-color "alpha(@view_fg_color, 0.03)")

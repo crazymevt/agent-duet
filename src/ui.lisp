@@ -407,11 +407,12 @@ and the images follow it as thumbnails."
 
 (defun composer (input send)
   (gtk:build
-   (gtk:box :css-classes '("duet-composer") :spacing 8 :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 8
-            (gtk:frame :hexpand t
-                       (gtk:scrolled-window :max-content-height 180 :propagate-natural-height t
-                                            :hscrollbar-policy :never :child input))
-            send)))
+   (gtk:box :orientation :vertical :css-classes '("duet-composer") :spacing 8
+            :margin-start 8 :margin-end 8 :margin-top 6 :margin-bottom 8
+            (gtk:frame
+             (gtk:scrolled-window :max-content-height 180 :propagate-natural-height t
+                                  :hscrollbar-policy :never :child input))
+            (gtk:box :halign :end :spacing 8 send))))
 
 (defun make-input ()
   (make-instance 'gtk:text-view :wrap-mode :word-char :top-margin 6 :bottom-margin 6
@@ -636,9 +637,9 @@ for Codex, the one marked as the default)."
     (let* ((status (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")
                                   :label "Checking…"))
            (input (make-input))
-           (send (make-instance 'gtk:button :label "Send" :valign :end :css-classes '("suggested-action")
+           (send (make-instance 'gtk:button :label "Send" :css-classes '("suggested-action")
                                 :tooltip-text (format nil "Talk to ~a alone" (agent-name agent))))
-           (stop (make-instance 'gtk:button :label "Stop" :valign :end :visible nil
+           (stop (make-instance 'gtk:button :label "Stop" :visible nil
                                 :css-classes '("destructive-action")
                                 :tooltip-text (format nil "Stop ~a" (agent-name agent))))
            (chips (make-instance 'gtk:flow-box :selection-mode :none :visible nil :row-spacing 4
@@ -684,8 +685,7 @@ for Codex, the one marked as the default)."
                                       (gtk:box :orientation :vertical
                                                chips
                                                (composer input
-                                                         (gtk:build (gtk:box :orientation :vertical :spacing 6
-                                                                             :valign :end send stop)))))))
+                                                         (gtk:build (gtk:box :spacing 8 stop send)))))))
                             (gtk:widget-set-tooltip-text
                              input (format nil "Drop files or images here to attach them to the message to ~a"
                                            (agent-name agent)))
@@ -3081,8 +3081,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
            (chips (make-instance 'gtk:flow-box :selection-mode :none :visible nil
                                  :row-spacing 4 :column-spacing 4 :margin-start 12 :margin-end 12))
            (attachments (new-agent-pane :chips chips))
-           (send (make-instance 'gtk:button :label "Start collaboration" :valign :end :css-classes '("suggested-action")))
-           (stop (make-instance 'gtk:button :label "Stop collaboration" :valign :end :visible nil
+           (send (make-instance 'gtk:button :label "Start collaboration" :css-classes '("suggested-action")))
+           (stop (make-instance 'gtk:button :label "Stop collaboration" :visible nil
                                 :css-classes '("destructive-action")))
            (mode (gtk:drop-down-new-from-strings '("Write & review" "Split the work" "Compare proposals" "Review only")))
            (review-target (gtk:drop-down-new-from-strings '("Uncommitted changes" "Branch (merge base)" "Branch (compare tips)" "Last N commits")))
@@ -3181,7 +3181,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                   (setf (getf *controls* :routing-note) note)
                   note)
                 chips
-                (composer input (gtk:build (gtk:box :orientation :vertical :spacing 8 :valign :end send stop))))))))
+                (composer input (gtk:build (gtk:box :spacing 8 stop send))))))))
 
 
 ;;; The folder, what the agents may do, and the look
