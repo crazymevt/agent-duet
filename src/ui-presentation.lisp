@@ -41,7 +41,7 @@
         (setf (getf *controls* :last-progress) presentation)
         (clear-box (control :progress-details))
         (gtk:box-append (control :progress-details)
-                        (apply #'wrapping-controls (mapcar #'make-progress-stage stages)))))
+                        (make-progress-stages stages))))
   (dolist (agent (list *claude* *codex*))
       (let* ((pane (and agent (agent-pane-of agent)))
              (label (and agent (control (agent-setting-key agent "WORKFLOW-ACTIVITY"))))
@@ -119,13 +119,30 @@
     (make-instance 'gtk:expander :label "Workflow progress" :child box
                    :margin-start 12 :margin-end 12 :margin-bottom 6)))
 
+(defun make-progress-stages (stages)
+  "Wrap status cards without FlowBox's otherwise actionable child wrappers."
+  (let ((flow (apply #'wrapping-controls (mapcar #'make-progress-stage stages))))
+    (gtk:widget-add-css-class flow "duet-progress")
+    (gtk:widget-set-can-target flow nil)
+    (gtk:widget-set-can-focus flow nil)
+    (loop for child = (gtk:widget-get-first-child flow) then (gtk:widget-get-next-sibling child)
+          while child do (gtk:widget-set-focusable child nil))
+    flow))
+
 (defun make-progress-stage (stage)
   "Independent cards also describe concurrent parts without implying an order."
   (make-instance 'gtk:label :xalign 0.0 :wrap t :max-width-chars 34
                  :label (format nil "~a · ~(~a~)~@[~%~a~]"
                                 (getf stage :label) (getf stage :state) (getf stage :detail))
-                 :css-classes (if (or (getf stage :attention-p) (eq (getf stage :state) :error))
-                                  '("duet-stage" "warning") '("duet-stage"))))
+                 :css-classes
+                 (list "duet-stage"
+                       (cond ((eq (getf stage :state) :error) "duet-stage-error")
+                             ((getf stage :attention-p) "duet-stage-attention")
+                             (t (case (getf stage :state)
+                                  (:active "duet-stage-active")
+                                  (:complete "duet-stage-complete")
+                                  (:skipped "duet-stage-skipped")
+                                  (otherwise "duet-stage-pending")))))))
 
 (defun agent-layout-size ()
   (let ((outer (control :agent-split)))

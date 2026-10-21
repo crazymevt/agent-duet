@@ -2870,7 +2870,19 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (".duet-claude" :color "mix(@view_fg_color, #d97757, 0.55)")
     (".duet-codex" :color "mix(@view_fg_color, #10a37f, 0.55)")
     (".duet-note" :font-size "smaller")
-    (".duet-stage" :background-color "alpha(@view_fg_color, 0.08)" :border-radius "8px" :padding "10px")
+    (".duet-progress > flowboxchild" :background-color "transparent" :box-shadow "none"
+     :border "none" :padding "0" :outline "none")
+    (".duet-stage" :background-color "alpha(@view_fg_color, 0.06)" :border-radius "8px" :padding "10px"
+     :border "1px solid alpha(@view_fg_color, 0.12)")
+    (".duet-stage-active" :background-color "alpha(@accent_bg_color, 0.16)"
+     :border-color "alpha(@accent_color, 0.55)")
+    (".duet-stage-complete" :background-color "alpha(@success_bg_color, 0.16)"
+     :border-color "alpha(@success_color, 0.5)")
+    (".duet-stage-attention" :background-color "alpha(@warning_bg_color, 0.18)"
+     :border-color "alpha(@warning_color, 0.55)")
+    (".duet-stage-error" :background-color "alpha(@error_bg_color, 0.16)"
+     :border-color "alpha(@error_color, 0.55)")
+    (".duet-stage-skipped" :color "alpha(@view_fg_color, 0.6)" :border-style "dashed")
     (".duet-chip" :background-color "alpha(@view_fg_color, 0.08)" :border-radius "12px")
     (".duet-summary" :background-color "alpha(@success_bg_color, 0.14)" :border-radius "8px" :padding "10px"
      :border "1px solid alpha(@success_color, 0.45)")
