@@ -821,15 +821,19 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
                 (format out "**~a (~d)**~%~%" title (length group))
                 (dolist (f group)
                   (format out "- ~a **F~d** ~(~a~)~@[ · `~a`~] — ~a~%"
-                          (ecase status (:open "○") (:fixed "✓") (:dismissed "✕"))
+                          (ecase status (:open "☐") (:fixed "☑") (:dismissed "☒"))
                           (finding-id f) status (finding-location f) (finding-text f)))
                 (terpri out)))))
 
 (defun checklist-text (loop)
   "LOOP's checklist, in Markdown, for the conversation."
   (let ((findings (loop-findings loop)))
-    (format nil "**Task checklist~@[, ~a~]**~%~%Assigned to: **~a** · Progress: **~a** · Review rounds: ~d~%~%~d open, ~d fixed, ~d dismissed~%~%~a~%~%**Task**~%~%~a"
+    (format nil "**Task checklist~@[, ~a~]**~%~%~a Assigned to: **~a** · Progress: **~a** · Review rounds: ~d~%~%~d open, ~d fixed, ~d dismissed~%~%~a~%~%**Task**~%~%~a"
             (loop-label loop)
+            (case (loop-state loop)
+              ((:approved :unreviewed) "☑")
+              ((:failed :unresolved :stopped) "☒")
+              (otherwise "☐"))
             (agent-name (loop-author loop))
             (ecase (loop-state loop)
               (:assigned "Assigned") (:working (if (plusp (loop-round loop)) "Addressing review" "Working"))
@@ -847,6 +851,29 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
                                              (loop-task loop)))
                 (loop for line = (read-line in nil) while line
                       do (format out "> ~a~%" line)))))))
+
+(defun checklist-sections (text)
+  "Separate a saved checklist snapshot into assignment and findings Markdown.
+Accept older snapshots too, so replay uses the same grouped presentation."
+  (let* ((progress-end (search (format nil "~%~%") text
+                               :start2 (or (search "Assigned to:" text) 0)))
+         (task-start (search (format nil "**Task**~%~%") text)))
+    (if (and progress-end task-start (< progress-end task-start))
+        (values (concatenate 'string (subseq text 0 progress-end)
+                             (format nil "~%~%")
+                             (subseq text (+ task-start (length (format nil "**Task**~%~%")))))
+                (let ((body (subseq text (+ progress-end 2) task-start)))
+                  (if (string= (string-trim '(#\Space #\Newline #\Return) body)
+                               (format nil "0 open, 0 fixed, 0 dismissed~%~%No review findings."))
+                      ""
+                      (let* ((heading (subseq text 0 (or (position #\Newline text) 0)))
+                             (comma (position #\, heading)))
+                        (format nil "**~a**~%~%~a"
+                                (if comma
+                                    (subseq heading (+ comma 2) (- (length heading) 2))
+                                    "Review findings")
+                                body)))))
+        (values text ""))))
 
 (defun publish-checklist (workflow loop)
   "Publish a complete snapshot, retaining the same heading throughout LOOP."

@@ -3653,3 +3653,35 @@ VERDICT: APPROVED" nil)
       (ai::load-settings file)
       (is equal "Super+F3" (ai::panel-shortcut-text :terminal-shortcut))
       (is equal "" (ai::panel-shortcut-text :checklist-shortcut)))))
+
+(define-test checklist-separates-assignments-and-findings
+    :parent agent-duet
+  (let ((part (ai::make-review-loop
+               :author (make-instance 'fake-agent :name "Claude")
+               :task "Implement the widget"
+               :findings (list (ai::make-finding :id 1 :text "Fix the widget")))))
+    (dolist (state '(:assigned :working :reviewing :approved :unreviewed :failed :stopped :paused))
+      (setf (ai::loop-state part) state)
+      (multiple-value-bind (task findings) (ai::checklist-sections (ai::checklist-text part))
+        (true (search "Implement the widget" task))
+        (false (search "Fix the widget" task))
+        (true (search "Fix the widget" findings))
+        (false (search "Implement the widget" findings))
+        (true (search (case state
+                        ((:approved :unreviewed) "☑")
+                        ((:failed :stopped) "☒")
+                        (otherwise "☐")) task))))))
+
+(define-test checklist-findings-empty-and-legacy
+    :parent agent-duet
+  (let ((part (ai::make-review-loop :author (make-instance 'fake-agent :name "Claude")
+                                   :label "Claude's part" :task "Work")))
+    (is equal "" (nth-value 1 (ai::checklist-sections (ai::checklist-text part))))
+    (setf (ai::loop-findings part) (list (ai::make-finding :id 1 :text "Issue")))
+    (let ((findings (nth-value 1 (ai::checklist-sections (ai::checklist-text part)))))
+      (true (uiop:string-prefix-p "**Claude's part**" findings))
+      (false (search "Task checklist" findings))))
+  (let ((legacy (format nil "**Review checklist**~%~%F1 old issue")))
+    (multiple-value-bind (task findings) (ai::checklist-sections legacy)
+      (is equal legacy task)
+      (is equal "" findings))))

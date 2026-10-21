@@ -14,7 +14,8 @@
 (defvar *panes* '() "Agent id → AGENT-PANE.")
 (defvar *middle* nil "The conversation's PANE.")
 (defvar *checklist* nil "The task checklist panel's PANE.")
-(defvar *checklist-boxes* nil "Checklist heading → current Markdown box, one per loop.")
+(defvar *checklist-findings* nil "The consolidated findings pane.")
+(defvar *checklist-boxes* nil "Checklist heading → assignment/findings Markdown boxes, one pair per loop.")
 (defvar *workflow* nil "The running or last workflow.")
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
@@ -1198,6 +1199,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun clear-checklist ()
   "Reset the checklist when changing conversations or folders."
   (setf *checklist-boxes* nil)
+  (when *checklist-findings*
+    (clear-box (pane-messages *checklist-findings*))
+    (setf (getf *controls* :findings-placeholder)
+          (pane-note *checklist-findings* "No findings yet" "dim-label")))
   (when *checklist*
     (clear-box (pane-messages *checklist*))
     (pane-note *checklist* "Each task will appear here once it's assigned, with its progress and review findings." "dim-label")))
@@ -1211,19 +1216,33 @@ comes without one (a turn stopped as the folder changes) isn't kept."
            (heading (subseq text 0 (if heading-end (+ heading-end 2)
                                       (or (position #\Newline text) (length text)))))
            (box (cdr (assoc heading *checklist-boxes* :test #'string=))))
-      (if box
-          (progn (clear-box box) (render-markdown box text)
-                 (pane-scroll-to-end *checklist*))
-          (progn
-            ;; Clear the placeholder only when the first loop arrives.
-            (unless *checklist-boxes* (clear-box (pane-messages *checklist*)))
-            (setf box (markdown-box text "duet-checklist"))
-            (push (cons heading box) *checklist-boxes*)
-            (pane-append *checklist* box)
-            ;; One live notice per loop; replacements and replay stay quiet.
-            (when (and notify (not (gtk:widget-get-visible (control :checklist-panel))))
-              (pane-note *middle* "Checklist updated. Open Workspace › Checklist to see the tasks' progress and findings."
-                         "dim-label" "duet-note")))))))
+      (multiple-value-bind (task findings) (checklist-sections text)
+        (if box
+            (progn
+              (clear-box (car box)) (render-markdown (car box) task)
+              (pane-scroll-to-end *checklist*))
+            (progn
+              (unless *checklist-boxes* (clear-box (pane-messages *checklist*)))
+              (setf box (cons (markdown-box task "duet-checklist") nil))
+              (push (cons heading box) *checklist-boxes*)
+              (pane-append *checklist* (car box))
+              (when (and notify (not (gtk:widget-get-visible (control :checklist-panel))))
+                (pane-note *middle* "Checklist updated. Open Workspace › Checklist to see the tasks' progress and findings."
+                           "dim-label" "duet-note"))))
+        (when *checklist-findings*
+          (cond
+            ((plusp (length findings))
+             (if (cdr box)
+                 (progn (clear-box (cdr box)) (render-markdown (cdr box) findings))
+                 (progn
+                   (setf (cdr box) (markdown-box findings "duet-checklist"))
+                   (pane-append *checklist-findings* (cdr box)))))
+            ((cdr box)
+             (gtk:box-remove (pane-messages *checklist-findings*) (cdr box))
+             (setf (cdr box) nil)))
+          (gtk:widget-set-visible
+           (control :findings-placeholder)
+           (notany (lambda (entry) (cdr (cdr entry))) *checklist-boxes*)))))))
 
 (defun remember-checklist-width ()
   "Persist only a visible, allocated checklist after restoration has finished."
@@ -1275,18 +1294,23 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun make-checklist-panel ()
   (multiple-value-bind (messages scroller) (make-message-list)
-    (setf *checklist* (make-pane :messages messages :scroller scroller))
-    (clear-checklist)
-    (let ((panel (gtk:build
-                  (gtk:box :orientation :vertical :width-request 260
-                           (gtk:label :label "Checklist" :xalign 0.0
-                                      :margin-start 12 :margin-top 8 :margin-bottom 8
-                                      :css-classes '("title-4"))
-                           (gtk:separator)
-                           scroller))))
-      (setf (getf *controls* :checklist-panel) panel)
-      (gtk:widget-set-visible panel (setting :checklist-visible nil))
-      panel)))
+    (multiple-value-bind (findings findings-scroller) (make-message-list)
+      (setf *checklist* (make-pane :messages messages :scroller scroller)
+            *checklist-findings* (make-pane :messages findings :scroller findings-scroller))
+      (clear-checklist)
+      (let ((panel (gtk:build
+                    (gtk:box :orientation :vertical :width-request 260
+                             (gtk:label :label "Assigned tasks" :xalign 0.0
+                                        :margin-start 12 :margin-top 8 :margin-bottom 8
+                                        :css-classes '("title-4"))
+                             (gtk:separator)
+                             scroller
+                             (gtk:separator)
+                             (gtk:expander :label "Findings" :expanded t
+                                           :child findings-scroller)))))
+        (setf (getf *controls* :checklist-panel) panel)
+        (gtk:widget-set-visible panel (setting :checklist-visible nil))
+        panel))))
 
 (defun middle-check (text)
   "The check command's progress or result, in the conversation."
