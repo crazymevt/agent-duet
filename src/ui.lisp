@@ -1225,6 +1225,29 @@ comes without one (a turn stopped as the folder changes) isn't kept."
               (pane-note *middle* "Checklist updated. Open Workspace › Checklist to see the tasks' progress and findings."
                          "dim-label" "duet-note")))))))
 
+(defun remember-checklist-width ()
+  "Persist only a visible, allocated checklist after restoration has finished."
+  (let ((panel (control :checklist-panel)))
+    (when (and panel (gtk:widget-get-visible panel)
+               (not (control :restore-checklist-width)))
+      (let ((width (gtk:widget-get-width panel)))
+        (when (and (plusp width) (not (eql width (saved-checklist-width))))
+          (setf (setting :checklist-width) width))))))
+
+(defun restore-checklist-width ()
+  "Restore the saved width once the visible panel has an allocation."
+  (let ((width (control :restore-checklist-width))
+        (panel (control :checklist-panel))
+        (split (control :checklist-split)))
+    (when (and width panel split (gtk:widget-get-visible panel)
+               (plusp (gtk:widget-get-width panel)))
+      (let* ((position (gtk:paned-get-position split))
+             (target (max 0 (+ position (- (gtk:widget-get-width panel) width)))))
+        (remf *controls* :restore-checklist-width)
+        (unless (= position target)
+          (gtk:paned-set-position split target)
+          t)))))
+
 (defun set-checklist-visible (visible)
   "Keep the checklist at a useful width, preserving the wide conversation layout."
   (let ((panel (control :checklist-panel))
@@ -1241,13 +1264,14 @@ comes without one (a turn stopped as the folder changes) isn't kept."
         (setf (getf *controls* :restore-checklist-positions)
               (control :pre-checklist-positions))
         (remf *controls* :pre-checklist-positions))
-      (when (gtk:widget-get-visible panel)
-        (setf (getf *controls* :checklist-width) (gtk:widget-get-width panel)))
+      (unless visible
+        (remember-checklist-width)
+        (remf *controls* :restore-checklist-width))
       (gtk:widget-set-visible panel (not (null visible)))
       (when visible
-        (gtk:paned-set-position content
-                                (max 1 (- (gtk:widget-get-width content)
-                                          (max 260 (or (control :checklist-width) 300)))))))))
+        (setf (getf *controls* :restore-checklist-width)
+              (or (saved-checklist-width) 300))
+        (gtk:widget-queue-allocate content)))))
 
 (defun make-checklist-panel ()
   (multiple-value-bind (messages scroller) (make-message-list)
@@ -3221,6 +3245,9 @@ and summary, with Changes and, when the work can be committed, Commit changes."
             (arrange-conversation *view*)
             (gtk:paned-set-start-child content outer)
             (gtk:paned-set-end-child content (make-checklist-panel))
+            (when (setting :checklist-visible nil)
+              (setf (getf *controls* :restore-checklist-width)
+                    (or (saved-checklist-width) 300)))
             ;; The Terminal panel below the panes, hidden until asked for.
             (let ((vertical (make-instance 'gtk:paned :orientation :vertical :position 560
                                            :shrink-start-child nil :shrink-end-child nil
@@ -3257,6 +3284,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        (remember-layout)
                        (remember-window-geometry window)
                        (remember-terminal-layout)
+                       (remember-checklist-width)
                        (when (control :layout-save-timeout)
                          (glib:source-remove (control :layout-save-timeout))
                          (remf *controls* :layout-save-timeout))

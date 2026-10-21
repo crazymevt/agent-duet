@@ -183,3 +183,8 @@ Sidebar and responsive layouts split the child space in half."
                (not (eql height (saved-terminal-height))))
       (setf (getf *settings* :terminal-height) height changed t))
     changed))
+
+(defun saved-checklist-width ()
+  "The last visible checklist width, ignoring malformed preferences."
+  (let ((width (setting :checklist-width)))
+    (when (and (integerp width) (<= 1 width 100000)) width)))

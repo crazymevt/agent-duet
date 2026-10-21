@@ -148,3 +148,51 @@
     (gtk:window-destroy window)
     (settle-layout-test-window)))
 (format t "~&Terminal toggle and height UI checks passed.~%")
+
+;; Checklist widths survive fresh widgets and an on-disk settings reload.
+(let ((*settings* nil) (*controls* nil) (*checklist* nil) (*checklist-boxes* nil))
+  (dolist (bad '(nil -1 0 100001 "wide" (300)))
+    (setf *settings* (list :checklist-width bad))
+    (assert (null (saved-checklist-width))))
+  (setf *settings* (list :checklist-visible t))
+  (dotimes (restart 2)
+    (let* ((window (make-instance 'gtk:window :default-width 1100 :default-height 600))
+           (split (make-instance 'gtk:paned :orientation :horizontal :position 700
+                                 :resize-end-child nil))
+           (panel (make-checklist-panel)))
+      (unwind-protect
+           (progn
+             (setf (getf *controls* :narrow-layout) t
+                   (getf *controls* :checklist-split) split
+                   (getf *controls* :restore-checklist-width)
+                   (or (saved-checklist-width) 300))
+             (gtk:paned-set-start-child split (make-instance 'gtk:box))
+             (gtk:paned-set-end-child split panel)
+             (gtk:window-set-child window split)
+             (gtk:window-present window)
+             (settle-layout-test-window)
+             ;; Pending startup allocations cannot overwrite the saved width.
+             (remember-checklist-width)
+             (when (= restart 1) (assert (= 380 (saved-checklist-width))))
+             (restore-checklist-width)
+             (settle-layout-test-window)
+             (assert (= (if (zerop restart) 300 380) (gtk:widget-get-width panel)))
+             (when (zerop restart)
+               (gtk:paned-set-position split
+                 (+ (gtk:paned-get-position split) (- (gtk:widget-get-width panel) 380)))
+               (settle-layout-test-window))
+             (remember-checklist-width)
+             (set-checklist-visible nil)
+             (settle-layout-test-window)
+             (remember-checklist-width)
+             (setf *settings* nil)
+             (load-settings)
+             (assert (= 380 (saved-checklist-width)))
+             (set-checklist-visible t)
+             (settle-layout-test-window)
+             (restore-checklist-width)
+             (settle-layout-test-window)
+             (assert (= 380 (gtk:widget-get-width panel))))
+        (gtk:window-destroy window)
+        (setf *controls* nil)))))
+(format t "~&Checklist layout checks passed.~%")

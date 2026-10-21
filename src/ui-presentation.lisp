@@ -238,6 +238,10 @@
         (and (control :terminal-split)
              (gtk:widget-get-height (gtk:paned-get-end-child (control :terminal-split))))
         (control :restore-terminal-height)
+        (control :restore-checklist-width)
+        (and (control :checklist-panel)
+             (gtk:widget-get-visible (control :checklist-panel))
+             (gtk:widget-get-width (control :checklist-panel)))
         *view* (agent-layout-size)
         (gtk:paned-get-position (control :agent-split))
         (gtk:paned-get-position (control :conversation-split))
@@ -267,7 +271,8 @@
                                                :equalize-agent-panels))
                         (remember-layout))
                       (remember-window-geometry window)
-                      (remember-terminal-layout)))
+                      (remember-terminal-layout)
+                      (remember-checklist-width)))
                   nil)))))))
 
 (defun watch-conversation-allocation (widget)
@@ -293,7 +298,9 @@
             (declare (ignore clock))
             ;; A terminal divider change needs another allocation before agent
             ;; dividers can be restored against the new available height.
-            (unless (or *closing* (restore-terminal-height)
+            (unless (or *closing* (restore-checklist-width)
+                        (control :restore-checklist-width)
+                        (restore-terminal-height)
                         (control :restore-terminal-height))
               (observe-agent-layout-size)
               (schedule-window-layout-save)
