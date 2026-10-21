@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Claude indexed results now use a per-turn baseline within the process-wide
+  sequence to wait for replies to mid-turn messages before completing the turn. Saved Codex thinking levels survive delayed model
+  catalog discovery.
+
+- Agent presentation now identifies direct messages during tasks and exposes
+  exhausted usage for idle/waiting agents, including Conversation only.
 - Closing the checklist restores the outer divider, waits for allocation,
   then restores the inner divider, avoiding a shifted Three panes divider
   when opening the checklist enlarged the window.

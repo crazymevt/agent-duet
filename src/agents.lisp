@@ -433,6 +433,10 @@ Running a command may need the user's approval; if one is denied, carry on witho
    (config :initform nil :accessor claude-agent-config :documentation "What the process was started with")
    (session-id :initform nil :accessor claude-agent-session-id)
    (started :initform nil :accessor claude-agent-started :documentation "Whether the session exists, to resume")
+   (next-result-index :initform 0 :accessor claude-agent-next-result-index
+                      :documentation "One past the last result index in this CLI process")
+   (turn-result-start :initform 0 :accessor claude-agent-turn-result-start
+                      :documentation "The process result index at the start of this turn")
    (limits :initform nil :accessor claude-agent-limits :documentation "The last rate_limit_info")
    (prompts :initform '() :accessor claude-agent-prompts
             :documentation "The running turn's prompt and what was sent while it ran, to send again:
@@ -501,6 +505,10 @@ when it isn't running with the current settings."
                                   :on-stderr (lambda (line) (agent-note-stderr agent line))
                                   :on-exit (lambda (code) (claude-agent-exited agent new code))))
           (setf (claude-agent-process agent) new
+                ;; A new process starts numbering at zero, including when
+                ;; failed resume recovery resends the current turn's prompts.
+                (claude-agent-next-result-index agent) 0
+                (claude-agent-turn-result-start agent) 0
                 (claude-agent-config agent) config
                 (claude-agent-started agent) t)
           new))))
@@ -620,14 +628,28 @@ folder): carry on the turn in a new conversation."
   ;; behind: a later sign-in failure is a sign-in failure.
   (let* ((text (event-text event))
          (error (event-error event))
+         (index (event-result-index event))
          (hit (shiftf (claude-agent-limit-hit agent) nil)))
+    ;; Advance before publishing completion: its callback may start the next
+    ;; turn immediately on this same process. Use the index, not a received
+    ;; result count, so gaps in delivery do not shift subsequent turns.
+    (setf (claude-agent-next-result-index agent)
+          (if (integerp index)
+              (max (claude-agent-next-result-index agent) (1+ index))
+              (1+ (claude-agent-next-result-index agent))))
     (when (and error (or hit (claude-limit-text-p text)))
       ;; This turn's reset time, replacing any earlier one.
       (agent-ran-out agent (or (claude-limit-text-reset text) (and (integerp hit) hit)))
       (setf error :out-of-usage))
-    ;; Streaming input can leave another response queued in the CLI.
-    ;; Keep the workflow callback until that response has completed.
-    (unless (and (not error) (plusp (or (event-queued-turn-count event) 0)))
+    ;; Indexed results correspond to individual input messages, even when the
+    ;; CLI reports no queued turns. Keep the callback until the last message's
+    ;; result. Older CLIs without indexes retain their queue-count behavior.
+    (unless (and (not error)
+                 (if (integerp index)
+                     (and (car (agent-turn-token agent))
+                          (< (- (1+ index) (claude-agent-turn-result-start agent))
+                             (length (claude-agent-prompts agent))))
+                     (plusp (or (event-queued-turn-count event) 0))))
       (agent-turn-finished agent text error))))
 
 (defmethod agent-usage-windows ((agent claude-agent))
@@ -703,6 +725,7 @@ unless that turn is over by then."
   (let ((images (agent-turn-images agent)))
     (setf (claude-agent-prompts agent) (list (cons prompt images)))
     (let ((cp (claude-agent-ensure-process agent)))
+      (setf (claude-agent-turn-result-start agent) (claude-agent-next-result-index agent))
       (capture-agent-process-baseline agent)
       (claude-agent-send agent cp prompt images :on-error (turn-failure agent)))))
 
@@ -749,6 +772,10 @@ unless that turn is over by then."
     (setf (claude-agent-session-id agent) handle (claude-agent-started agent) t)))
 
 ;;; Codex
+
+(defun catalog-effort (effort choices catalog-ready-p)
+  "Keep EFFORT until the catalog is ready, then validate it against CHOICES."
+  (if (or (not catalog-ready-p) (member effort choices :test #'equal)) effort nil))
 
 (defclass codex-agent (agent)
   ((server :initform nil :accessor codex-agent-server)

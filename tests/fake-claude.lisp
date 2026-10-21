@@ -50,7 +50,8 @@
 
 (let* ((resume (fake-argument "--resume"))
        (sessions (and (probe-file "sessions") (uiop:read-file-lines "sessions")))
-       (session (or resume (fake-argument "--session-id") "new")))
+       (session (or resume (fake-argument "--session-id") "new"))
+       (result-index 0))
   (when (and resume (not (member resume sessions :test #'equal)))
     (fake-read)
     (when (probe-file "expect-steer") (fake-read))
@@ -62,11 +63,20 @@
   (loop for message = (fake-read) while message do
     (when (equal (jget message "type") "user")
       (let ((reply "fresh reply"))
-        (when (probe-file "expect-steer")
+        (when (and (probe-file "expect-steer") (not (probe-file "indexed-results")))
           (setf reply (format nil "~a: ~a + ~a" reply (fake-text message) (fake-text (fake-read)))))
         (fake-send (jobj "type" "system" "subtype" "init" "session_id" session))
         (fake-disconnect)
         (when (probe-file "permission-request")
           (setf reply (format nil "~a (~a)" reply (fake-ask-permission))))
-        (fake-send (jobj "type" "result" "subtype" "success" "is_error" :false
-                         "result" reply "session_id" session))))))
+        (if (probe-file "indexed-results")
+            (let ((steer (and (or (probe-file "expect-steer") (equal (fake-text message) "SECOND"))
+                              (fake-read))))
+              (dolist (text (if steer (list (fake-text message) (fake-text steer))
+                               (list (fake-text message))))
+                (fake-send (jobj "type" "result" "subtype" "success" "is_error" :false
+                                 "result" text "session_id" session
+                                 "result_index" result-index "queued_turn_count" 0))
+                (incf result-index)))
+            (fake-send (jobj "type" "result" "subtype" "success" "is_error" :false
+                             "result" reply "session_id" session)))))))

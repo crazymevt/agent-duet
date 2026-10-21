@@ -3310,3 +3310,114 @@ VERDICT: APPROVED" nil)
         (is equal (list mine) (ai::loop-dependencies theirs))
         (is eq :deadlock (ai::step-reason (find theirs (ai::workflow-paused workflow) :key #'ai::step-loop))))
       (is = prompts (length (fake-prompts codex)))))))
+
+(define-test claude-indexed-steered-results :parent agent-duet
+  ;; The real CLI reports queued_turn_count=0 on BOTH results. The callback
+  ;; must remain untouched until the last reply.
+  (let ((agent (make-instance 'ai:claude-agent)) (results nil))
+    (setf (ai:agent-busy agent) t
+          (ai::agent-turn-token agent) (list t)
+          (ai::claude-agent-prompts agent) '(("FIRST") ("SECOND"))
+          (ai::agent-callback agent) (lambda (text error) (push (list text error) results)))
+    (flet ((reply (index text &optional error)
+             (first (ai::parse-claude-event
+                     (ai:json-string (ai:jobj "type" "result" "subtype" (if error "error" "success")
+                                             "result" text "result_index" index "queued_turn_count" 0))))))
+      (ai::claude-agent-result agent (reply 0 "FIRST"))
+      (true (ai:agent-busy agent))
+      (false results)
+      ;; A third message may be sent after the first result was received.
+      (setf (ai::claude-agent-prompts agent) '(("FIRST") ("SECOND") ("THIRD")))
+      (ai::claude-agent-result agent (reply 1 "SECOND"))
+      (true (ai:agent-busy agent))
+      (false results)
+      (ai::claude-agent-result agent (reply 2 "THIRD"))
+      (false (ai:agent-busy agent))
+      (is equal '(("THIRD" nil)) results)
+      ;; The same process continues numbering in the next application turn.
+      (setf (ai:agent-busy agent) t
+            (ai::agent-turn-token agent) (list t)
+            (ai::claude-agent-turn-result-start agent) (ai::claude-agent-next-result-index agent)
+            (ai::claude-agent-prompts agent) '(("NEXT") ("STEER"))
+            (ai::agent-callback agent) (lambda (text error) (push (list text error) results)))
+      (is = 3 (ai::claude-agent-turn-result-start agent))
+      (ai::claude-agent-result agent (reply 3 "NEXT"))
+      (true (ai:agent-busy agent))
+      (is = 1 (length results))
+      (ai::claude-agent-result agent (reply 4 "STEER"))
+      (false (ai:agent-busy agent))
+      (is equal '("STEER" nil) (first results))
+      ;; A gap represents a lost result, not a reason to wait forever. The
+      ;; next turn's baseline follows the actual index rather than a count.
+      (setf (ai:agent-busy agent) t
+            (ai::agent-turn-token agent) (list t)
+            (ai::claude-agent-turn-result-start agent) (ai::claude-agent-next-result-index agent)
+            (ai::agent-callback agent) (lambda (text error) (push (list text error) results)))
+      (ai::claude-agent-result agent (reply 6 "AFTER GAP"))
+      (false (ai:agent-busy agent))
+      (is = 7 (ai::claude-agent-next-result-index agent))
+      (is equal '("AFTER GAP" nil) (first results))
+      ;; Errors must finish even when more messages were sent.
+      (setf (ai:agent-busy agent) t
+            (ai::agent-turn-token agent) (list t)
+            (ai::agent-callback agent) (lambda (text error) (push (list text error) results)))
+      (ai::claude-agent-result agent (reply 7 "failed" t))
+      (false (ai:agent-busy agent))
+      (is equal '("failed" t) (first results)))))
+
+(define-test claude-indexed-results-across-turns :parent agent-duet
+  (with-fake-claude (agent directory notes)
+    (touch directory "indexed-results")
+    (let ((results nil))
+      (ai:agent-submit agent "FIRST" (lambda (text error) (push (list text error) results)))
+      (true (wait-until (lambda () (= 1 (length results)))))
+      (let ((process (ai::claude-agent-process agent)))
+        (ai:agent-submit agent "SECOND" (lambda (text error) (push (list text error) results)))
+        (ai:agent-send-now agent "STEER")
+        ;; A premature completion would credit STEER to this queued turn.
+        (ai:agent-submit agent "NEXT" (lambda (text error) (push (list text error) results)))
+        (true (wait-until (lambda () (= 3 (length results)))))
+        (is eq process (ai::claude-agent-process agent))
+        (is equal '(("NEXT" nil) ("STEER" nil) ("FIRST" nil)) results)
+        (is = 4 (ai::claude-agent-next-result-index agent))
+        ;; A model/effort change creates a process whose first index is zero.
+        (setf (ai::agent-effort agent) "low")
+        (ai:agent-submit agent "SECOND" (lambda (text error) (push (list text error) results)))
+        (ai:agent-send-now agent "RESTARTED")
+        (true (wait-until (lambda () (= 4 (length results)))))
+        (isnt eq process (ai::claude-agent-process agent))
+        (is = 0 (ai::claude-agent-turn-result-start agent))
+        (is = 2 (ai::claude-agent-next-result-index agent))
+        (is equal '("RESTARTED" nil) (first results))))))
+
+(define-test claude-indexed-results-after-failed-resume :parent agent-duet
+  (with-fake-claude (agent directory notes)
+    (touch directory "indexed-results")
+    (touch directory "expect-steer")
+    (let ((results nil))
+      (ai::agent-resume-conversation agent "gone")
+      ;; Simulate the previous process having produced many results.
+      (setf (ai::claude-agent-next-result-index agent) 20
+            (ai::claude-agent-turn-result-start agent) 18)
+      (ai:agent-submit agent "RESEND" (lambda (text error) (push (list text error) results)))
+      (ai:agent-send-now agent "STEER")
+      (true (wait-until (lambda () results)))
+      (is equal '(("STEER" nil)) results)
+      (is = 0 (ai::claude-agent-turn-result-start agent))
+      (is = 2 (ai::claude-agent-next-result-index agent))
+      (true (find-if (lambda (note) (search "Couldn't resume" note)) notes)))))
+
+(define-test saved-effort-before-catalog :parent agent-duet
+  (let* ((ai::*settings* '(:codex-effort "medium"))
+         (agent (make-instance 'ai:codex-agent :effort (ai::setting :codex-effort)))
+         (model (ai:jobj "supportedReasoningEfforts" #("low" "medium" "high"))))
+    ;; Dropdown construction before discovery offers only Default. Keep the
+    ;; loaded preference so catalog arrival can select it, without rereading
+    ;; settings over a user's subsequent choice.
+    (setf (ai::agent-effort agent) (ai::catalog-effort (ai::agent-effort agent) '(nil) nil))
+    (is string= "medium" (ai::agent-effort agent))
+    (setf (ai::agent-effort agent)
+          (ai::catalog-effort (ai::agent-effort agent) (cons nil (ai::codex-model-efforts model)) t))
+    (is string= "medium" (ai::agent-effort agent))
+    (false (ai::catalog-effort "max" (cons nil (ai::codex-model-efforts model)) t))
+    (false (ai::catalog-effort nil '(nil "medium") t))))

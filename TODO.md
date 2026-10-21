@@ -3,14 +3,12 @@
 For the current redesign checkpoint, acceptance checks, and remaining milestone
 sequence, see [the implementation plan](docs/implementation-plan.md).
 
-- [ ] **Redesign milestone 1 acceptance:** Live GTK layout, narrow-width,
-  divider restoration, draft continuity and preference-application checks were
-  performed on 2026-10-21; the screenshot is current. Real CLI delivery,
-  authentication/usage transitions and physical divider drags remain before
-  sign-off. The acceptance continuation attempted native pointer drags but
-  could not confirm divider movement; it does not close that check. Combined
-  validation and Claude’s CLI report still need reconciliation after integration.
-  See the plan for evidence and limits.
+- [ ] **Redesign milestone 1 acceptance:** Combined UI and CLI results were
+  reconciled on 2026-10-21. Layout/checklist restoration, presentation fixes,
+  and substantial real CLI checks passed. Claude reply attribution and saved
+  Codex thinking-level restoration now have fixes and regression coverage.
+  Physical divider drags and the remaining live-window checks
+  are still unverified. See the plan for evidence and limits.
 
 - [x] **Structured review checklist:** Track each review finding as open, fixed, or dismissed, with file locations, so unresolved findings remain visible across review rounds.
 - [x] **Plan approval before coding:** Offer an optional pause after the lead proposes a plan, allowing the user to edit the scope or assignments before implementation starts.

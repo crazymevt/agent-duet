@@ -198,12 +198,105 @@ was sent and no real user preferences were changed.
   replacement is needed for this divider-restoration fix. No successful
   physical-input check is claimed from unsuccessful pointer automation.
 
-Claude's real-CLI acceptance report and changes are not yet integrated in
-this worktree. Keep its authenticated-protocol evidence separate from these
-GTK fixtures. After integration, reconcile the remaining checks above with
-that report and rerun `make load`, `make test-parallel` and
-`git diff --check` on the combined result before sign-off. No commit or later
-milestone work is part of this continuation.
+### Combined acceptance review, 2026-10-21
+
+Both worktrees are integrated. The earlier evidence above remains historical;
+this section reconciles the continuation with Claude's final report. The
+review inspected the merged source and tests. CLI observations below are
+reported from Claude's runs, not independently repeated during integration.
+The assigned `src/ui-agents.lisp` and `src/ui-events.lisp` do not exist here;
+Claude changed only workflow presentation and its tests.
+
+Merged fixes:
+
+- Checklist closing restores the outer divider before the inner divider,
+  preserving Three panes positions when opening enlarged the window.
+- Direct messages during a task show "Answering your message", with queued
+  work described next; pauses and failed tasks retain precedence.
+- Idle/waiting agents expose exhausted usage in presentation detail, including
+  Conversation only. Two regression tests cover the presentation changes.
+
+Real CLI evidence (Claude Code 2.1.289, Codex 0.163.0-alpha.10.2) used
+`/tmp/ad-accept/proj` and temporary configuration/data/state directories.
+It consumed real usage and created CLI history for that temporary folder.
+
+- Both CLIs streamed. Headless Claude accepted an AskUserQuestion answer
+  ("Red"), retained context across a sonnet/medium restart, and reported usage
+  windows. Headless Codex retained context across a thinking-level change,
+  refreshed usage, folded a mid-turn message into its turn, and executed an
+  approved command.
+- Missing CLIs failed immediately with the expected missing-tool messages.
+  Signed-out CLIs failed as authentication errors rather than exhausted usage.
+  Codex retried five times, taking roughly 16 seconds to report its 401.
+- In the valid second live-window run, Claude streaming retained the same
+  widget through all four layouts; a draft survived two layout cycles.
+  A Codex approval card survived a layout cycle, showed "Waiting for you",
+  and Allow in Conversation only executed its command. Both catalogs arrived
+  within about one second.
+- Saved Claude model/effort (haiku/low) and Codex model (gpt-6-luna) restored.
+  Saved Codex effort (medium) did not: `refresh-effort-dropdown` resets it to
+  nil before the catalog arrives, and catalog arrival does not restore it.
+
+Findings from the live runs and remaining acceptance limits:
+
+- Claude mid-turn direct messages misattributed later replies in the live run.
+  `claude-agent-result` previously finished on a result with `queued_turn_count: 0` even
+  when another submitted message's response is still pending. The live report
+  observed PINEAPPLE credited to the SECOND request, then SECOND to the next
+  turn. This was fixed during review in `src/agents.lisp` (see below).
+- Saved Codex effort restoration was fixed during review in `src/ui.lisp`
+  (see below).
+- Physical divider drags remain inconclusive; all 16 layout/width combinations
+  passed programmatic allocation/checklist checks, not physical drag checks.
+- Claude approval was not cleanly verified: the headless touch command was
+  auto-allowed. The live-window question stalled and required a manual click,
+  so that scenario remains unverified.
+- Live-window model/effort changes, out-of-usage display, and saved layout after
+  closing were not completed. Real account exhaustion was not induced;
+  exhausted-usage presentation is covered by unit tests only. Codex draft and
+  streaming observations from the first live run were invalid because the
+  harness accidentally submitted the draft.
+
+Milestone 1 remains open. No later milestone work or commit is authorized by
+this continuation. The existing screenshot was retained.
+
+Post-integration `make load` and `make test-parallel` passed (277 selected
+tests across eight workers). Working-tree and full baseline diffs passed
+`git diff --check` after documentation reconciliation.
+
+### Review fixes for F1 and F2
+
+F1, F2 and F5 are accepted and fixed. The first F1 patch incorrectly treated
+`result_index` as turn-local; Claude's review established that it counts across
+the CLI process. The corrected code tracks the next process result index and
+captures it as each turn's starting point. Indexed successful results finish
+the application turn only after the last message submitted in that turn has a
+result relative to that starting point. The next index advances before callbacks
+can start another turn and follows the received index even across gaps.
+Starting a new process resets both values, including failed-resume resends. Errors and cancellation still
+finish promptly. CLI versions without indexes retain the queue-count fallback.
+Regression coverage reproduces zero queued turns on intermediate results,
+including another message submitted between results, error completion, a
+second turn on the same process, and a gap in numbering. Fake-CLI integration
+checks exercise actual turn startup, a queued next task, process reuse, an
+effort-triggered restart, and failed-resume resending with indexes restarting
+at zero. These fixtures do not constitute live authenticated CLI acceptance.
+
+The effort dropdown preserves the agent's loaded effort before Codex's model
+catalog is available, then validates it against the model's supported levels.
+Preserving the preference avoids rereading saved settings over a newer user
+choice. A headless regression covers delayed catalog arrival and unsupported
+levels. This implements F2's intended behavior by retaining the saved value
+rather than discarding and reapplying it. F3 and F4 remain dismissed.
+
+These are source/test fixes; real CLI reply attribution and the live dropdown
+have not been rerun since these changes. The physical-input and live-window
+acceptance limits above remain open.
+
+After the initial review fixes, `make load` and `make test-parallel` passed:
+279 selected tests, 2,443 passed assertions across eight workers. After the
+process-wide-index correction, both passed again: 281 selected tests, 2466
+passed assertions across eight workers, zero failed or skipped. Working-tree and full baseline `git diff --check` also passed.
 
 ## Milestone 2: task summary, usage, and time
 

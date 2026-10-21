@@ -308,8 +308,12 @@ drop before WIDGET's children, so a text view doesn't take it as text."
 agent's effort when the model has it."
   (let* ((agent (agent-pane-agent pane))
          (choices (pane-effort-choices pane)))
-    (unless (member (agent-effort agent) choices :test #'equal)
-      (setf (agent-effort agent) nil))
+    ;; Before Codex's asynchronous catalog arrives only Default is displayed;
+    ;; that placeholder must not discard the effort loaded from preferences.
+    (setf (agent-effort agent)
+          (catalog-effort (agent-effort agent) choices
+                          (or (eq (agent-id agent) :claude)
+                              (not (null (agent-pane-models pane))))))
     (setf (agent-pane-refreshing pane) t)
     (unwind-protect
         (progn
