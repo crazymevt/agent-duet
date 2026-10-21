@@ -662,3 +662,84 @@
         (is = 3 (getf progress :max-rounds))
         (true (getf p :attention-p))
         (true (search "disconnected" (getf p :detail)))))))
+
+(define-test presentation-direct-message-during-task :parent agent-duet
+  ;; A message sent from an agent's pane during a task is said to be
+  ;; answered, not hidden behind what its part of the task waits for.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let* ((workflow (presented-workflow lead partner :max-rounds 3))
+           (loop (ai::make-review-loop :author lead :reviewer partner :task "Do it" :state :working)))
+      (setf (ai:workflow-loops workflow) (list loop))
+      (presented-step workflow lead :work :loop loop)
+      ;; The lead's step is a workflow turn: someone waits on its reply.
+      (setf (fake-replies lead) (list (says :hang)))
+      (ai:agent-submit lead "Do it" (lambda (text error) (declare (ignore text error))))
+      (is string= "Working" (getf (ai::workflow-agent-presentation workflow lead) :label))
+      (is string= "Waiting to review" (getf (ai::workflow-agent-presentation workflow partner) :label))
+      (setf (fake-replies partner) (list (says :hang) (says :hang) (says :hang)))
+      (ai:agent-send-now partner "What do you think so far?")
+      (let ((p (ai::workflow-agent-presentation workflow partner)))
+        (is eq :working (getf p :state))
+        (is string= "Answering your message" (getf p :label))
+        (false (getf p :detail))
+        (false (getf p :attention-p)))
+      ;; Its review, submitted meanwhile, waits behind the message.
+      (presented-step workflow partner :review :loop loop)
+      (is string= "Then reviewing" (getf (ai::workflow-agent-presentation workflow partner) :detail))
+      (ai:agent-turn-finished partner "Looks fine." nil)
+      (is string= "Reviewing" (getf (ai::workflow-agent-presentation workflow partner) :label))
+      ;; Stopping the message: it's no longer being answered.
+      (ai:agent-send-now partner "And now?")
+      (setf (ai::workflow-steps workflow) (remove partner (ai::workflow-steps workflow) :key #'ai::step-agent))
+      (true (ai::presentation-direct-message-p partner))
+      (ai:agent-cancel partner)
+      (false (ai::presentation-direct-message-p partner))
+      (ai:agent-turn-finished partner ai::*stopped-text* :interrupted)
+      ;; After the task, stopped or finished, a message is still answered;
+      ;; a failed task keeps saying it failed.
+      (ai:agent-send-now partner "One more thing")
+      (dolist (state '(:stopped :finished))
+        (setf (ai:workflow-state workflow) state)
+        (is string= "Answering your message" (getf (ai::workflow-agent-presentation workflow partner) :label)))
+      (setf (ai::workflow-completion-error workflow) "The check failed")
+      (is eq :error (getf (ai::workflow-agent-presentation workflow partner) :state)))))
+
+(define-test presentation-out-of-usage-without-paused-step :parent agent-duet
+  ;; Usage running out shows on an idle agent even when no step is paused
+  ;; for it; the conversation-only view shows only this, not the status line.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let ((reset (+ (get-universal-time) 3600)))
+      (ai::agent-ran-out lead reset)
+      (let ((p (ai::workflow-agent-presentation nil lead)))
+        (is eq :out-of-usage (getf p :state))
+        (is string= "Out of usage" (getf p :label))
+        (is string= (format nil "Out of usage until ~a" (ai::format-reset-time reset)) (getf p :detail)))
+      (ai::agent-ran-out lead nil)
+      (is string= "Out of usage" (getf (ai::workflow-agent-presentation nil lead) :detail))
+      ;; Usage back: idle again.
+      (ai::agent-has-usage lead)
+      (is eq :idle (getf (ai::workflow-agent-presentation nil lead) :state))
+      (false (getf (ai::workflow-agent-presentation nil lead) :detail))
+      ;; A reset time gone by is no longer out.
+      (setf (ai::agent-out-until lead) (- (get-universal-time) 60))
+      (is eq :idle (getf (ai::workflow-agent-presentation nil lead) :state))
+      (setf (ai::agent-out-until lead) nil)
+      ;; In a task: what it waits for stays, with the usage after it.
+      (let* ((workflow (presented-workflow lead partner :max-rounds 3))
+             (loop (ai::make-review-loop :author lead :reviewer partner :task "Do it" :state :working)))
+        (setf (ai:workflow-loops workflow) (list loop))
+        (presented-step workflow lead :work :loop loop)
+        (ai::agent-ran-out partner reset)
+        (let ((p (ai::workflow-agent-presentation workflow partner)))
+          (is eq :waiting (getf p :state))
+          (is string= "Waiting to review" (getf p :label))
+          (true (search "Out of usage until" (getf p :detail))))
+        ;; A step paused for it says so once.
+        (setf (ai::workflow-steps workflow) '())
+        (presented-step workflow partner :review :loop loop :paused t :reason :out-of-usage)
+        (let ((p (ai::workflow-agent-presentation workflow partner)))
+          (is eq :out-of-usage (getf p :state))
+          (false (search "Out of usage until" (or (getf p :detail) ""))))
+        ;; Busy, it isn't idle: a turn may have started as usage came back.
+        (setf (ai:agent-busy partner) t)
+        (false (search "Out of usage" (or (getf (ai::workflow-agent-presentation nil partner) :detail) "")))))))
