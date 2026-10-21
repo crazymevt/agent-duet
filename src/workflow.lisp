@@ -116,6 +116,8 @@
    (retention-id :initform (make-uuid) :accessor workflow-retention-id)
    (integrated :initform nil :accessor workflow-integrated :documentation "True once merging has begun")
    (stopping-checks :initform nil :accessor workflow-stopping-checks)
+   (start-retry :initform nil :accessor workflow-start-retry
+                :documentation "True while a dependent part waits for stopped work to stop (RETRY-WHEN-STOPPED)")
    (saved-agent-context :initform nil :accessor workflow-saved-agent-context)
    (merged-refs :initform nil :accessor workflow-merged-refs)
    (integration-journal :initform nil :accessor workflow-integration-journal)
@@ -703,10 +705,13 @@ section). The order (PLAN-ORDER) is :parallel without an ORDER line."
                          (clean-section (subseq text (+ lead-at (length "LEAD TASK:")) partner-at))
                          (clean-section (subseq text 0 partner-at))))
                (partner (clean-section (subseq text (+ partner-at (length "PARTNER TASK:"))))))
-          (values lead
-                  (unless (or (zerop (length partner))
-                              (and (>= (length partner) 4) (string-equal "NONE" partner :end2 4)))
-                    partner))))))
+          (values lead (unless (no-task-p partner) partner))))))
+
+(defun no-task-p (task)
+  "Whether TASK, a part from a plan, is no task: empty, or NONE."
+  (let ((task (string-trim '(#\Space #\Tab #\Newline #\Return) (or task ""))))
+    (or (zerop (length task))
+        (and (>= (length task) 4) (string-equal "NONE" task :end2 4)))))
 
 ;;; The review checklist
 
@@ -1169,6 +1174,10 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
 (defun loop-check (workflow loop &optional (fixes 0))
   "Check the current work before review; FIXES does not count review rounds."
   (setf (loop-check-fixes loop) fixes)
+  ;; Work on a prerequisite merge that isn't concluded can't be checked or reviewed.
+  (let ((problem (prerequisite-merge-problem workflow loop)))
+    (when problem
+      (return-from loop-check (prerequisite-unmerged workflow loop problem fixes))))
   (let ((command (blank-to-nil (workflow-check-command workflow))))
     (if (null command)
         (loop-checked workflow loop)
@@ -2333,6 +2342,9 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
     (unless (member step (workflow-paused workflow)) (return-from recover-workflow :blocked))
     (unless (agent-quiescent-p (step-agent step))
       (return-from recover-workflow :pending-shutdown))
+    (when (and (waiting-step-p step) (step-loop step) (not (eq action :hand-off))
+               (not (dependent-can-start-p workflow step)))
+      (return-from recover-workflow :pending-shutdown))
     (let ((agent (if (eq action :hand-off) (other-agent workflow (step-agent step)) (step-agent step))))
       (when (agent-out-of-usage-p agent) (return-from recover-workflow :unavailable))
       (unless (agent-quiescent-p agent) (return-from recover-workflow :pending-shutdown))
@@ -2528,6 +2540,71 @@ the merge can't touch it. MERGE-PREREQUISITE-INTO-WORKTREE's status and files."
               (checkpoint-changed workflow))
             (values status files))))))
 
+(defun conflict-marker-files (tree head)
+  "The files in TREE with conflict markers added since HEAD."
+  (multiple-value-bind (output errors status)
+      (uiop:run-program (list "git" "-C" (namestring (uiop:ensure-directory-pathname tree)) "diff" "--check" head)
+                        :output :string :error-output :string :ignore-error-status t)
+    (declare (ignore errors status))
+    (remove-duplicates
+     (loop for line in (uiop:split-string output :separator '(#\Newline))
+           when (search "conflict marker" line)
+             collect (subseq line 0 (position #\: line)))
+     :test #'equal)))
+
+(defun prerequisite-merge-problem (workflow l)
+  "Why L's worktree doesn't hold its prerequisites' work, merged, or nil: a
+merge isn't concluded, a prerequisite's commit isn't in its history, or
+conflict markers are left. Merges found done are recorded (WORKFLOW-PREREQUISITE-MERGES)."
+  (let ((tree (loop-tree l))
+        (done '()))
+    (when (and tree (loop-dependencies l))
+      (handler-case
+          (progn
+            (when (repository-operation-p tree)
+              (return-from prerequisite-merge-problem
+                "The merge of the work your part builds on isn't concluded in your worktree: resolve any ~
+conflicts, stage the files and conclude it with `git commit --no-edit`."))
+            (dolist (dep (loop-dependencies l))
+              (when (loop-tree dep)
+                (let ((head (worktree-git-line (loop-tree dep) "rev-parse" "HEAD")))
+                  (unless (zerop (nth-value 2 (uiop:run-program
+                                               (list "git" "-C" (namestring (uiop:ensure-directory-pathname tree))
+                                                     "merge-base" "--is-ancestor" head "HEAD")
+                                               :ignore-error-status t)))
+                    (return-from prerequisite-merge-problem
+                      (format nil "~a (commit ~a), which your part builds on, isn't merged into your worktree. ~
+Merge it (`git merge ~a`), resolving any conflicts, and conclude the merge."
+                              (string-capitalize (part-name dep) :end 1) head head)))
+                  (let ((markers (conflict-marker-files tree head)))
+                    (when markers
+                      (return-from prerequisite-merge-problem
+                        (format nil "Conflict markers are left from merging ~a in:~%~%~{- ~a~%~}~%Resolve them, ~
+keeping what both parts meant to do."
+                                (part-name dep) markers))))
+                  (push (list (namestring tree) (namestring (loop-tree dep)) head) done))))
+            (dolist (entry done)
+              (unless (member entry (workflow-prerequisite-merges workflow) :test #'equal)
+                (setf (workflow-prerequisite-merges workflow)
+                      (cons entry (remove (subseq entry 0 2) (workflow-prerequisite-merges workflow)
+                                          :key (lambda (e) (subseq e 0 2)) :test #'equal)))
+                (checkpoint-changed workflow)))
+            nil)
+        (error (e) (format nil "The work your part builds on couldn't be verified in your worktree: ~a" e))))))
+
+(defun prerequisite-unmerged (workflow l problem fixes)
+  "L's work came back on a prerequisite merge that isn't done, PROBLEM: it
+pauses (:integration-unresolved) for its author to finish the merge once resumed."
+  (note workflow "~a can't be checked yet: ~a" (string-capitalize (part-name l) :end 1) problem)
+  (let ((step (make-step :agent (loop-author l) :role :work :loop l :reason :integration-unresolved
+                         :check-fixes fixes
+                         :prompt (format nil "~a~%~%Your part:~%~%~a~%~%~a" problem (loop-task l)
+                                         (work-reply-instruction l)))))
+    (setf (step-original-prompt step) (step-prompt step)
+          (step-then step) (restored-step-continuation workflow step))
+    (push step (workflow-steps workflow))
+    (pause-step workflow step)))
+
 (defun prerequisite-context (workflow l)
   "What L's prerequisites did, for its author. In worktrees, each one's work
 is first committed and merged into L's. Returns the text; or nil and, when a
@@ -2565,11 +2642,43 @@ It's merged into your worktree. Files it changed: ~:*~{~a~^, ~}.~]"
               parts)))
     (values (format nil "Your part builds on work that is now done.~%~%~{~a~^~%~%~}" (nreverse parts)) nil)))
 
+(defun dependent-can-start-p (workflow step)
+  "Whether what was stopped before STEP starts has stopped: checks, old
+processes, its agent's turns, and, in worktrees, its prerequisites' authors'."
+  (and (workflow-checks-quiescent-p workflow)
+       (workflow-old-processes-stopped-p workflow)
+       (agent-quiescent-p (step-agent step))
+       ;; A prerequisite's worktree is committed: nothing of its author's may still edit it.
+       (every (lambda (dep) (or (null (loop-tree dep)) (agent-quiescent-p (loop-author dep))))
+              (loop-dependencies (step-loop step)))))
+
+(defun retry-when-stopped (workflow)
+  "Have CHECK-FINISHED start the ready dependent parts again shortly, on the
+workflow's thread, until what they wait for has stopped."
+  (unless (workflow-start-retry workflow)
+    (setf (workflow-start-retry workflow) t)
+    (note workflow "Waiting for stopped work to stop before a dependent part starts.")
+    (sb-thread:make-thread
+     (lambda ()
+       (sleep 0.25)
+       (funcall (agent-deliver (workflow-lead workflow))
+                (lambda ()
+                  (setf (workflow-start-retry workflow) nil)
+                  (when (workflow-live-p workflow) (check-finished workflow)))))
+     :name "dependent part start")))
+
 (defun start-dependent-step (workflow step)
   "STEP's prerequisites are ready: bring their work into its worktree, tell
 its agent what they did, and start it. A merge that conflicts pauses it
 instead (:integration-unresolved), for its agent to resolve once resumed."
   (let ((l (step-loop step)))
+    ;; Cancelled checks and turns must be gone before worktrees are committed and merged.
+    (unless (dependent-can-start-p workflow step)
+      (unless (member step (workflow-paused workflow))
+        (unless (waiting-step-p step) (setf (step-reason step) :dependency))
+        (pause-step workflow step))
+      (retry-when-stopped workflow)
+      (return-from start-dependent-step nil))
     (when (eq (step-role step) :work)
       (multiple-value-bind (context problem) (prerequisite-context workflow l)
         (let ((prompt (format nil "~a~%~%~a" (or (step-original-prompt step) (step-prompt step))
@@ -2674,7 +2783,10 @@ RECOVER-WORKFLOW has checked the repositories, INSPECTION."
   (format nil "The overall request:~%~%~a~%~%You split it into parts, but no part can go on: each is waiting ~
 for another, or for one that can't finish as it is. Each part as it stands:~%~%~{~a~^~%~%~}~%~%~
 Revise the plan so the parts can go on, using what's already done: change the order, or the tasks. ~
-Don't change anything yet. ~a"
+Don't change anything yet. Reply in exactly this form, giving both parts' tasks in full, even one that ~
+doesn't change (neither can be NONE now):~%~%LEAD TASK:~%<your part>~%~%PARTNER TASK:~%<~a's part, complete ~
+in itself: ~:*~a won't see this conversation>~%~%ORDER: PARALLEL~%~%~
+Write ORDER: LEAD FIRST (yours is done first) or ORDER: PARTNER FIRST (~:*~a's is) if one part needs the other's result."
           (workflow-request workflow)
           (loop for l in (part-loops workflow)
                 collect (format nil "~a, by ~a: ~a~@[, builds on ~{~a~^ and ~}~].~%Task:~%~a~%Done so far:~%~a~@[~%Last review:~%~a~]"
@@ -2683,7 +2795,7 @@ Don't change anything yet. ~a"
                                 (mapcar #'part-name (loop-dependencies l)) (loop-task l)
                                 (if (plusp (length (loop-summary l))) (loop-summary l) "Nothing yet.")
                                 (loop-last-review l)))
-          (plan-form (workflow-partner workflow))))
+          (agent-name (workflow-partner workflow))))
 
 (defun revise-order (workflow waiting)
   "Have the lead revise the plan from both parts' progress; the WAITING steps
@@ -2729,6 +2841,9 @@ and the parts it changes, or that aren't done, carry on from their progress."
       (declare (ignore others))
       (let* ((before (mapcar (lambda (l) (cons l (copy-list (loop-dependencies l)))) (workflow-loops workflow)))
              (problem (cond ((null theirs) "there aren't two parts to order")
+                            ;; A part can't be dropped here: its work and worktree would be left behind.
+                            ((or (no-task-p lead-task) (no-task-p partner-task))
+                             "it must give both parts a task. To carry on without the order, run the parts independently.")
                             ((plan-order-problem order))
                             (t (handler-case
                                    (progn (set-workflow-dependencies workflow (order-assignments order mine theirs))

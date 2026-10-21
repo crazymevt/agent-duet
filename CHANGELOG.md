@@ -14,7 +14,10 @@
   earlier version aren't merged. A prerequisite that fails or runs out of
   usage only holds its dependents up. When no part can go on, the task
   pauses with *Revise the order* (the lead re-plans from both parts'
-  progress) and *Run independently*.
+  progress) and *Run independently*. A revised plan must keep both parts.
+- A dependent part's work isn't checked, reviewed or merged until the merge
+  of its prerequisite into its worktree is concluded, without conflict
+  markers; and it doesn't start until stopped checks and turns have stopped.
 - Handing off a failed or stopped step tells the other agent how it stopped,
   not only running out of usage.
 

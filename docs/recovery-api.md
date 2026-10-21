@@ -159,8 +159,21 @@ the dependent's own work committed first), recorded in
 `"prerequisite-merges"` so it isn't merged twice. A conflict pauses the step
 with `:integration-unresolved`, the merge left open in that worktree and the
 prompt saying how to resolve it; `:resume` may then go on with that worktree
-mid-merge. `:resume` or `:retry` of a `:dependency` or `:prerequisite-changed`
-step whose prerequisites are ready starts it the same way.
+mid-merge. Before a dependent part's work is checked or reviewed, its
+worktree must have no merge or other operation in progress, each
+prerequisite's head in its history, and no conflict markers added since that
+head; otherwise the work isn't accepted and pauses again with
+`:integration-unresolved`, saying what's left. A merge found concluded is
+recorded then. `:resume` or `:retry` of a `:dependency` or
+`:prerequisite-changed` step whose prerequisites are ready starts it the
+same way.
+
+A dependent part starts, by itself or on `:resume`/`:retry`, only once
+cancelled checks, old processes and its agent's turns have stopped, and, in
+worktrees, its prerequisites' authors' (since their worktrees are committed
+and merged). Until then the step stays paused (`:resume` and `:retry` are
+`:pending-shutdown`) and `check-finished` tries again shortly, on the
+workflow's thread.
 
 Each part has a revision, bumped whenever its work starts (first, a fix, a
 retry, a hand-off, more rounds), and the revisions of its prerequisites its
@@ -188,7 +201,7 @@ get reason `:deadlock` and `:on-pause` is called for each. Two more actions,
 
 | action | result |
 | --- | --- |
-| `:revise-order` | `:started`: the lead revises the plan (a `:replan` step) from both parts' tasks, progress and last reviews; its tasks and order go to the parts, and those it changes, or that aren't done, carry on from their progress. A revised plan that still can't go on pauses the unfinished parts with `:deadlock` again |
+| `:revise-order` | `:started`: the lead revises the plan (a `:replan` step) from both parts' tasks, progress and last reviews; its tasks and order go to the parts, and those it changes, or that aren't done, carry on from their progress. A revised plan that still can't go on, or that leaves a part without a task (`NONE`), changes nothing and pauses the unfinished parts with `:deadlock` again |
 | `:run-independently` | `:started`: every part's prerequisites are dropped and the waiting steps start |
 
 Both first check the repositories and pause snapshots as the other actions
