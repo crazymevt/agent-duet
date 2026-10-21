@@ -110,6 +110,14 @@ Entries with circular values are dropped, keeping the rest."
     (:agents-left :agents-left-positions)
     (:panes :pane-positions)))
 
+(defun saved-window-size ()
+  "Validated window dimensions, with the original defaults for old settings."
+  (let ((size (setting :window-size)))
+    (if (and (proper-list-p size) (eql (list-length size) 2)
+             (every (lambda (extent) (and (integerp extent) (<= 1 extent 100000))) size))
+        size
+        '(1440 900))))
+
 (defun sidebar-view-p (view)
   (not (null (member view '(:sidebar :agents-left)))))
 

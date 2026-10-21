@@ -387,13 +387,25 @@
            (is equal '(600 250) (ai::layout-positions view)))
       (when (probe-file file) (delete-file file)))))
 
+(define-test saved-window-size-validation
+    :parent agent-duet
+  (let ((ai::*settings* nil))
+    (dolist (value '(nil (0 900) (1440 -1) (100001 900) (1440) (1440 900 1)
+                     (1440 . 900) ("1440" 900) (1440 900.0)))
+      (setf ai::*settings* (list :window-size value))
+      (is equal '(1440 900) (ai::saved-window-size)))
+    (setf ai::*settings* (list :window-size '(1920 1080)))
+    (is equal '(1920 1080) (ai::saved-window-size))))
+
 (define-test layout-preferences-survive-restart
     :parent agent-duet
   (let ((file (merge-pathnames (format nil "duet-settings-~d.lisp" (random 1000000)) (uiop:temporary-directory)))
         (ai::*settings* '()))
     (unwind-protect
          (progn
-           (setf ai::*settings* (list :view :agents-left :sidebar-positions '(820 410)
+           (setf ai::*settings* (list :view :agents-left :window-size '(1920 1080)
+                                      :window-maximized t
+                                      :sidebar-positions '(820 410)
                                       :agents-left-positions '(500 380) :pane-positions '(320 960)
                                       :workflow-mode 2 :workflow-lead 1 :workflow-settings-expanded t
                                       :claude-transcript-expanded nil))
@@ -401,6 +413,8 @@
            (setf ai::*settings* '())
            (ai::load-settings file)
            (is eq :agents-left (ai::setting :view))
+           (is equal '(1920 1080) (ai::saved-window-size))
+           (true (ai::setting :window-maximized))
            (is equal '(820 410) (ai::layout-positions :sidebar))
            (is equal '(500 380) (ai::layout-positions :agents-left))
            (is equal '(320 960) (ai::layout-positions :panes))
@@ -415,6 +429,7 @@
            (is eq :dark (ai::setting :theme))
            (false (ai::layout-positions :sidebar))
            (false (ai::layout-positions :panes))
+           (false (ai::setting :window-maximized))
            (is = 0 (ai::saved-choice-index :workflow-mode 4)))
       (ignore-errors (delete-file file)))))
 

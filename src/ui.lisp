@@ -1296,6 +1296,7 @@ and a line saying what each is doing.")
       (setf (getf *controls* :narrow-layout) nil)
       (remf *controls* :last-wide-positions)
       (remf *controls* :pending-layout-positions)
+      (remf *controls* :layout-outer-restored)
       (remf *controls* :equalize-agent-panels)
       (gtk:orientable-set-orientation outer :horizontal)
       ;; The retained three-pane layout must respect each pane's minimum
@@ -2962,9 +2963,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
         *shared-notes* (setting :shared-notes t)
         *view* (if (assoc (setting :view) *views*) (setting :view) :sidebar)
         *view-only* '())
-  (let ((window (make-instance 'gtk:application-window
+  (let ((window (destructuring-bind (width height) (saved-window-size)
+                  (make-instance 'gtk:application-window
                                :application app :title "Agent Duet"
-                               :default-width 1440 :default-height 900)))
+                               :default-width width :default-height height))))
     (setf *window* window
           *claude* (make-instance 'claude-agent :deliver #'deliver)
           *codex* (make-instance 'codex-agent :deliver #'deliver))
@@ -3031,6 +3033,11 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        ;; The last checkpoint saved stands: a task under way
                        ;; now is found interrupted when reopened.
                        (remember-layout)
+                       ;; GTK retains the normal size while maximized.
+                       (multiple-value-bind (width height) (gtk:window-get-default-size window)
+                         (when (and (plusp width) (plusp height))
+                           (setf (setting :window-size) (list width height))))
+                       (setf (setting :window-maximized) (gtk:window-is-maximized window))
                        (setf *closing* t)
                        (dolist (agent (list *claude* *codex*))
                          (ignore-errors (agent-cancel agent))
@@ -3040,6 +3047,8 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        (ignore-errors (close-documents))
                        nil))
     (watch-conversation-allocation (control :agent-split))
+    (when (eq (setting :window-maximized) t)
+      (gtk:window-maximize window))
     (gtk:window-present window)))
 
 (defun main (&optional directory)
