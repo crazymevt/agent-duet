@@ -153,18 +153,42 @@ without rounds. A confirming review is no new round, running or paused."
                                (format nil "~a ~a" (presentation-capitalize (part-name l)) (loop-outcome l))))
                          loops)))))
 
+(defun presentation-direct-message-p (agent)
+  "Whether AGENT's running turn is the user's own message to it (sent from its
+pane, so nobody waits on the reply), not a workflow step."
+  (and (agent-busy agent) (car (agent-turn-token agent))
+       (agent-turn agent) (null (second (agent-turn agent)))))
+
+(defun presentation-out-of-usage (agent)
+  "\"out of usage\", with when it resets if known, while AGENT is out; else nil."
+  (let ((until (agent-out-until agent)))
+    (cond ((agent-out-of-usage-p agent) (format nil "out of usage until ~a" (format-reset-time until)))
+          ((eq until :unknown) "out of usage"))))
+
 (defun workflow-agent-presentation (workflow agent)
   "What AGENT is doing in WORKFLOW (nil: there is none), for its panel: a
 plist of :state, :label, :detail and :attention-p."
-  (let ((workflow (and workflow (workflow-agent-member-p workflow agent) workflow)))
+  (let ((workflow (and workflow (workflow-agent-member-p workflow agent) workflow))
+        (out (and (not (agent-busy agent)) (presentation-out-of-usage agent))))
     (flet ((result (state label &optional detail attention)
-             (list :state state :label label :detail detail :attention-p (and attention t))))
+             ;; Whatever else it says, an idle agent's usage running out shows.
+             (list :state state :label label
+                   :detail (if (and out (not (eq state :out-of-usage)))
+                               (presentation-join detail (presentation-capitalize out))
+                               detail)
+                   :attention-p (and attention t))))
       (cond
         ((agent-waiting-for-user-p agent)
          (result :needs-input "Needs your answer"
                  (format nil "~d request~:p waiting" (length (agent-approvals agent))) t))
         ((or (null workflow) (eq (workflow-state workflow) :new))
-         (if (agent-busy agent) (result :working "Working") (result :idle "Idle")))
+         (cond ((agent-busy agent) (result :working "Working"))
+               (out (result :out-of-usage "Out of usage" (presentation-capitalize out)))
+               (t (result :idle "Idle"))))
+        ;; Talking to it directly, outside its part of the task.
+        ((and (presentation-direct-message-p agent) (presentation-terminal-p workflow)
+              (not (presentation-failed-p workflow)))
+         (result :working "Answering your message"))
         ((eq (workflow-state workflow) :stopped)
          (result :stopped "Stopped"
                  (and (presentation-paused-steps workflow agent) "Its step can be recovered")))
@@ -186,6 +210,10 @@ plist of :state, :label, :detail and :attention-p."
                 (result :paused "Paused"
                         (format nil "~a: ~a" (step-description user-pause) (presentation-pause-reason user-pause))
                         t))
+               ((presentation-direct-message-p agent)
+                (result :working "Answering your message"
+                        (and running
+                             (format nil "Then ~(~a~)" (getf (presentation-step workflow (first running)) :label)))))
                (running
                 (let ((p (presentation-step workflow (first running))))
                   (result (getf p :state) (getf p :label)
