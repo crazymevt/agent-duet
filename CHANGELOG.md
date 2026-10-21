@@ -4,11 +4,17 @@
 
 - A redesigned window: the shared conversation is the large pane on the
   left, with both agents' panels stacked in a resizable sidebar on the
-  right; the three-column layout is still available, and the layout is
-  remembered. Transcripts expand, the shared composer is larger ("Task for
-  both agents"), and the mode, lead and round controls are compact, with
-  the workflow settings expandable. *Start collaboration* starts a task;
-  Stop stays within reach while it runs. Mode, lead, and rounds are remembered.
+  right. Workspace › Layout offers four layouts: *Agents on right*,
+  *Agents on left* (the agents' panels stacked on the left, the conversation
+  on the right), *Three panes*, and *Conversation only*. The layout is
+  remembered, each with its own divider positions, and switching keeps
+  running replies, approvals and questions where they are. Transcripts
+  expand, the shared composer is larger ("Task for both agents"), and the
+  mode, lead and round controls are compact, with the workflow settings
+  expandable. *Start collaboration* starts a task;
+  *Stop collaboration* stays within reach while it runs. Mode, lead, and
+  rounds are remembered; malformed or obsolete saved choices fall back to
+  the defaults.
 - Header tools and appearance, layout, and permission controls are grouped
   in the Workspace menu. The checklist starts hidden; progress notices point
   to Workspace › Checklist. Opening it reserves a resizable width, and the

@@ -26,6 +26,25 @@
          (uiop:delete-directory-tree tree :validate t :if-does-not-exist :ignore))
        (uiop:delete-directory-tree ,repo :validate t :if-does-not-exist :ignore))))
 
+(define-test git-inherits-environment-identity :parent agent-duet
+  (let* ((names '("GIT_AUTHOR_NAME" "GIT_AUTHOR_EMAIL" "GIT_COMMITTER_NAME" "GIT_COMMITTER_EMAIL"))
+         (values '("Environment Test" "environment@example.invalid" "Environment Test" "environment@example.invalid"))
+         (saved (mapcar #'uiop:getenv names))
+         (repo (merge-pathnames (format nil "duet-env-~a/" (ai::make-uuid)) (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (loop for name in names for value in values do (sb-posix:setenv name value 1))
+           (ensure-directories-exist repo)
+           (ai::worktree-git repo "init")
+           (ai::worktree-git repo "config" "commit.gpgsign" "false")
+           (true (search "environment@example.invalid" (ai::worktree-git-line repo "var" "GIT_AUTHOR_IDENT")))
+           (write-worktree-file repo "file.txt" "content")
+           (true (ai::commit-worktree repo "Environment identity"))
+           (is string= "environment@example.invalid" (ai::worktree-git-line repo "log" "-1" "--format=%ae")))
+      (loop for name in names for value in saved
+            do (if value (sb-posix:setenv name value 1) (sb-posix:unsetenv name)))
+      (uiop:delete-directory-tree repo :validate t :if-does-not-exist :ignore))))
+
 (define-test worktree-clean-lifecycle
     :parent agent-duet
   (with-worktree-repository (repo trees)
@@ -388,6 +407,43 @@
           (true (probe-file (merge-pathnames "b.txt" repo)))
           (is = (+ count-before 2) (parse-integer (ai::worktree-git-line repo "rev-list" "--count" "HEAD")))
           (is eq :merged (ai::workflow-integration-state restored))
+          (is = 2 (length (ai::worktree-recovery-refs repo "integration-task"))))))))
+
+(define-test recovery-commit-failure-retains-uncommitted-parts :parent agent-duet
+  (with-worktree-repository (repo trees)
+    (let* ((a (ai::create-worktree repo "part-a"))
+           (b (ai::create-worktree repo "part-b"))
+           (lead (make-instance 'hanging-agent :id :claude :name "Claude" :directory repo :replies nil))
+           (partner (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory repo :replies nil))
+           (workflow (make-instance 'ai:workflow :mode :divide :lead lead :partner partner :request "Combine")))
+      (push a trees) (push b trees)
+      (write-worktree-file a "a.txt" "a") (ai::worktree-git a "add" "-A")
+      (write-worktree-file b "b.txt" "b") (ai::worktree-git b "add" "-A")
+      (let ((count-before (parse-integer (ai::worktree-git-line repo "rev-list" "--count" "HEAD"))))
+        (setf (ai::workflow-home workflow) repo
+              (ai::workflow-state workflow) :paused
+              (ai::workflow-completion-error workflow) "Author identity unknown"
+              (ai::workflow-integrated workflow) t
+              (ai::workflow-integration-state workflow) :interrupted
+              (ai::workflow-base workflow) (ai::worktree-git-line repo "config" (ai::worktree-base-key "agent-duet/part-a"))
+              (ai::workflow-retention-id workflow) "integration-task"
+              (ai::workflow-trees workflow) (list (cons partner b) (cons lead a))
+              (ai::workflow-tree-branches workflow) (list (cons a "agent-duet/part-a") (cons b "agent-duet/part-b"))
+              (ai::workflow-loops workflow)
+              (list (ai::make-review-loop :author lead :reviewer partner :task "A" :tree a :state :approved :summary "A result")
+                    (ai::make-review-loop :author partner :reviewer lead :task "B" :tree b :state :approved :summary "B result")))
+        (setf (ai::workflow-recovery-baseline workflow) (ai::workflow-repositories workflow))
+        (let* ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+               (restored (ai:restore-workflow checkpoint :lead lead :partner partner)))
+          (false (fake-prompts lead))
+          (is eq :started (ai:recover-workflow restored :resume))
+          (true (probe-file (merge-pathnames "a.txt" repo)))
+          (true (probe-file (merge-pathnames "b.txt" repo)))
+          (is = (+ count-before 3) (parse-integer (ai::worktree-git-line repo "rev-list" "--count" "HEAD")))
+          (is eq :merged (ai::workflow-integration-state restored))
+          (false (ai::workflow-completion-error restored))
+          (ai::capture-workflow-completion restored)
+          (false (eq :failed (getf (ai::workflow-completion-data restored) :outcome)))
           (is = 2 (length (ai::worktree-recovery-refs repo "integration-task"))))))))
 
 (define-test recovery-restores-unresolved-integration-without-replay :parent agent-duet

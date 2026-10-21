@@ -6,22 +6,49 @@ command-line tools: Claude Code (`claude -p`, stream-json) and Codex
 
 ![Agent Duet: Claude writes, ChatGPT reviews, with the checklist on the right](docs/screenshot.png)
 
-The window has three panes:
+*The screenshot shows the earlier three-pane window; it predates the redesign
+described below.*
 
-- **Left: Claude.** Everything Claude does: the prompts it gets, its reply as it
-  streams, its tool calls (expand one to see its output).
-- **Middle: the conversation between them.** Your request, each plan, each
-  report of work done, and each review, passed from one agent to the other.
-- **Right: ChatGPT.** The same, for Codex.
+The window has a shared conversation and a panel for each agent:
 
-**View** in the header switches to **Conversation only**: the side panes are
-hidden, and the middle pane shows each agent's approval cards and questions
-(answering one there answers that agent), with a line under its heading
-saying what each is doing: working, reviewing, running the check, waiting for
-the other or for you, paused. **All panes** brings the side panes back. The
-choice is remembered.
+- **The conversation between them.** Your request, each plan, each report of
+  work done, and each review, passed from one agent to the other. Under its
+  heading, a progress line says where the task has got to (planning,
+  working, in review, waiting for you, paused); **Workflow progress** expands
+  into its stages, with a split plan's parts side by side, each with its own
+  round. A plan is shown as approved only once you've approved it, and a
+  check is never shown as passed.
+- **Claude's panel and ChatGPT's panel.** Everything each agent does: the
+  prompts it gets, its reply as it streams, its tool calls (expand one to see
+  its output). A line under each agent's name says what it is doing in the
+  task (planning, working, reviewing, fixing, running the check, waiting,
+  paused, out of usage) and is marked when it needs you. **Transcript**
+  collapses or expands the stream; an approval or a question opens it.
 
-Each side pane also has its own box for talking to that agent alone.
+**Workspace › Layout** (top right) arranges them:
+
+- **Agents on right** (the default): the conversation is the large pane on
+  the left, with both agents' panels stacked in a resizable sidebar on the
+  right.
+- **Agents on left**: the same, mirrored: the agents' panels stacked on the
+  left, the conversation on the right.
+- **Three panes**: Claude on the left, the conversation in the middle,
+  ChatGPT on the right.
+- **Conversation only**: the agents' panels are hidden, and the conversation
+  shows each agent's approval cards and questions (answering one there
+  answers that agent), with a line saying what each is doing, its CLI's
+  readiness and its remaining usage.
+
+Switching layout keeps everything running: the same panels move, so a
+streaming reply, a pending approval or a half-typed message carries on. The
+layout is remembered, and each layout remembers its own divider positions.
+In a window too narrow for a sidebar, both sidebar layouts put the
+conversation above the agents (side by side, or stacked when narrower
+still), and go back when it widens.
+Panes keep a minimum size, so a divider can't hide an approval card; a very
+narrow window may be held wider than requested.
+
+Each agent's panel also has its own box for talking to that agent alone.
 While it works, press Return or **Send now** to send more instructions without
 stopping it. The agent picks them up when its protocol allows; a tool already
 running can finish first. **Stop** is a separate button. Messages sent while
@@ -29,16 +56,22 @@ working use the current turn's model and permissions. If Codex is still starting
 wait for it to begin responding and send again; a delivery failure is shown with
 the message text so you can retry.
 
-Drop files or images on a side pane's message box to attach them to your next
+Drop files or images on an agent panel's message box to attach them to your next
 message to that agent. Each shows as a chip above the box (× takes it off).
 The message lists their paths, so the agent can read them, and images (PNG,
 JPEG, GIF, WebP, up to 3 MB) are also shown to it: as image blocks for Claude,
-as local images for Codex. Dropping files on the middle request box types
+as local images for Codex. Dropping files on the shared task box types
 their paths into the request instead.
 
 ## Working together
 
-Type a request in the middle and press Return. Choose how they work:
+Type a request in **Task for both agents**, under the conversation, and press
+Return or **Start collaboration**. Choose how they work with the controls
+above it (mode, lead and *Rounds*); **Workflow settings** expands to *Approve
+plan*, *Own worktrees*, the check command and the review-only choices. The
+mode, lead, rounds and whether the settings are expanded are remembered.
+
+
 
 - **Review only.** Choose uncommitted changes (including untracked files), a
   branch, or the last N commits along the first-parent history. Branch review
@@ -66,8 +99,8 @@ Type a request in the middle and press Return. Choose how they work:
   where they differed and what it chose), and splits the work as in *Split
   the work*.
 
-*Claude leads* / *ChatGPT leads* picks the lead. Start becomes Stop while they
-work.
+*Claude leads* / *ChatGPT leads* picks the lead. While they work, **Stop
+collaboration** stops both.
 
 **Approve plan** (for *Split the work* and *Compare proposals*) holds the
 lead's plan for you before any work starts. A card shows each agent's part:
@@ -122,9 +155,10 @@ The checklist is useful from the moment work is handed out: each task
 appears as soon as it's assigned, with the agent doing it and its progress
 through work and review, and the review findings join it as they come in.
 It's in a separate, resizable panel on the right, showing the latest
-checklist for each loop, updated in place. Use **Checklist** in the header
-to show or hide it; the app remembers your choice. Hidden updates leave a
-notice in the conversation. Saved conversations restore the latest
+checklist for each loop, updated in place. Use **Workspace › Checklist**
+to show or hide it; it starts hidden, and the conversation takes the space
+left when it's open; the app remembers your choice. While it's hidden, updates
+leave a notice in the conversation pointing to Workspace › Checklist. Saved conversations restore the latest
 checklist for each loop there too, including those saved before tasks were
 tracked. When the task finishes, the conversation says how many findings are
 still open.
@@ -140,8 +174,8 @@ usage, when its turn fails, or when you pause that agent: during a task, the
 **Stop** button in an agent's pane is **Pause**, and pauses only that
 agent's part. Independent parts carry on; checks and reviews wait for their
 required result. The split-plan UI does not yet support declaring dependencies
-between parts. The middle pane's **Stop** stops both agents, but the task can still
-be carried on. A card in the middle pane offers:
+between parts. **Stop collaboration** stops both agents, but the task can still
+be carried on. A card in the conversation offers:
 
 - **Wait until 3:05 PM** (out of usage, when the reset time is known): it's
   sent to the same agent again a minute after its usage resets. Leave the
@@ -183,7 +217,7 @@ be recovered keeps the earlier one in its own conversation in History.
 ## A turn gone quiet
 
 When an agent's turn goes 5 minutes without any event (no text, tool call or
-output), a card asks what to do: in the middle pane during a task, in the
+output), a card asks what to do: in the conversation during a task, in the
 agent's pane otherwise.
 
 - **Keep waiting**: give it another 5 minutes.
@@ -212,12 +246,14 @@ the card is open, the card says so and goes away. The time is
 - **Remaining usage** for both shows in their status lines (for example
   `65% 5h / 56% 7d left`; hover for the reset times), turning orange when
   under 10% is left.
-- **Shared notes** (top right): each CLI reads its own notes file (Claude
+- **Workspace › Share project instructions**: each CLI reads its own notes file (Claude
   `CLAUDE.md`, Codex `AGENTS.md`); with this on, each is also given the
   other's, from the folder, with its instructions, so a project's
   conventions needn't be restated each task. It's read when a conversation
   starts (a new one, or in another folder), and cut at 20,000 characters.
-- **Dark / Light / System** (top right).
+- **Workspace › Appearance**: Dark, Light or System.
+- **History** (top left, beside the folder): start a new conversation, or
+  carry on an earlier one in this folder.
 
 These, the permission setting, the recent folders and each folder's check
 command are remembered in `~/.config/agent-duet/settings.lisp`, with how
@@ -225,7 +261,7 @@ long a turn may be quiet (see above).
 
 ## Terminal
 
-**Terminal** in the header (or Ctrl+`) opens a panel below the three panes with
+**Workspace › Terminal** (or Ctrl+`) opens a panel below the panes with
 a shell in the agents' folder. *+ New* opens another (each gets a tab), *Clear*
 (⌘K) clears one, *Kill* ends one, and *Hide* closes the panel while the shells
 keep running. ⌘C and ⌘V copy and paste. New shells start in the current folder;
@@ -234,7 +270,7 @@ ones already open stay where they are. It needs VTE, GNOME's terminal widget:
 
 ## Documents
 
-**Documents** in the header opens a window listing the folder's Markdown files
+**Workspace › Documents** opens a window listing the folder's Markdown files
 (type to filter) with a read-only preview of the one you pick: headings,
 emphasis, code, lists and task lists, quotes, tables, rules, local images and
 links. Links to other Markdown files open in the preview, `#anchors` scroll to
@@ -251,7 +287,7 @@ untracked files that aren't ignored). This doesn't touch your index, files or
 stash: the snapshots are commits kept under `refs/agent-duet/snapshots/`, the
 latest 50.
 
-**Changes** in the header opens a window with what the latest task changed:
+**Workspace › Changes** opens a window with what the latest task changed:
 the files on the left (A added, M modified, D deleted, R renamed; type to
 filter), and the one you pick's diff on the right. While a task runs, it
 shows the changes so far. It's for viewing only. The comparison is of the
@@ -269,12 +305,12 @@ shows the commit, or why it failed.
 
 ## What they may do
 
-The menu at the top right:
+**Workspace › Permissions**:
 
 - **Ask before commands** (the default): both may edit files in the folder.
   Before running a command — tests, builds, scripts — they ask, with a card in
   their pane: *Allow*, *Always allow* (for the rest of that conversation) or
-  *Deny*. During a workflow, the middle pane says who is waiting. (Read-only
+  *Deny*. During a workflow, the conversation says who is waiting. (Read-only
   commands such as `git diff` or `ls` run without asking.)
 - **Edits only, no prompts**: both edit without asking. Claude runs no commands
   except read-only git; ChatGPT runs commands in Codex's `workspace-write`
@@ -375,7 +411,11 @@ libraries used to build them.
   failed because one ran out.
 - `src/check.lisp`: running a folder's check command in the background.
 - `src/workflow.lisp`: the ways of working together. No GTK.
-- `src/ui.lisp`: the window.
+- `src/workflow-presentation.lisp`: what a task and each agent are doing,
+  as the progress line, its stages and the agents' panels show it. No GTK.
+- `src/ui.lisp`: the window, its layouts and message delivery.
+- `src/ui-presentation.lisp`: the progress and workflow-settings widgets,
+  transcripts, and the sidebar's narrow-window adaptation.
 - `src/terminal.lisp`: the Terminal panel (VTE through CFFI, from Cadre).
 - `src/preview.lisp`: the Documents window (Cadre's Markdown preview, read-only).
 - `src/snapshot.lisp`: recording a folder's state as git commits, and the

@@ -9,7 +9,12 @@
   (apply #'uiop:run-program command
          (append (when (let ((spawn (find-symbol "PSPAWN" "SB-IMPL")))
                          (and spawn (fboundp spawn)))
-                   '(:use-posix-spawn t))
+                   (append '(:use-posix-spawn t)
+                           ;; On macOS a NULL spawn environment is empty,
+                           ;; rather than inherited (including HOME for Git).
+                           (unless (loop for key in options by #'cddr
+                                         thereis (eq key :environment))
+                             (list :environment (sb-ext:posix-environ)))))
                  options)))
 
 ;; Read-only status queries can overlap commits during checkpoint capture.

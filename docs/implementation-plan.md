@@ -7,10 +7,16 @@ a proposed implementation sequence, not a new product commitment.
 
 ## Current checkpoint: interface redesign
 
-Implemented, still uncommitted in `/Users/jessie/projects/lisp/agent-duet`:
+Committed as `bf9eb61` ("UI Resign"); milestone 1 continues on top of it:
 
 - Shared conversation on the left and stacked agent panels in a resizable
   sidebar; optional three-pane and conversation-only layouts.
+- In progress (lead, `src/ui.lisp`, `src/ui-presentation.lisp`,
+  `src/settings.lisp`): a fourth layout, *Agents on left*, with the stacked
+  agent panels on the left and the conversation on the right, its own saved
+  divider positions (`:agents-left-positions`), and the same narrow-window
+  adaptation (conversation first). The layout menu labels become *Agents on
+  right*, *Agents on left*, *Three panes*, *Conversation only*.
 - Saved layout/divider preferences, transcript expansion, workflow settings,
   mode, lead, and round count; invalid saved choices are checked before use.
 - Larger “Task for both agents” composer, compact workflow controls,
@@ -41,6 +47,34 @@ force a narrow window larger than its requested width.
 
 ## Milestone 1: finish redesign acceptance and commit
 
+Automated coverage added in this step (headless; GTK widgets are untested):
+
+- `tests/main.lisp`: `settings-malformed-files` (non-plist, odd-length,
+  dotted, vector, `#.` read-eval and empty settings files load as no
+  settings); `layout-preferences` (each layout's divider positions read
+  independently; missing, wrong-length, dotted, non-integer, negative and
+  out-of-range positions ignored; out-of-range or non-integer dropdown
+  choices fall back to the first); `layout-preferences-agents-left`
+  (*Agents on left* positions independent of the others; needs the lead's
+  `src/settings.lisp` change); `layout-preferences-survive-restart`
+  (layout, positions, workflow choices and expansion states round-trip a
+  save and load, and a hand-edited file with bad layout values still loads
+  its other settings).
+- `tests/workflow-presentation.lisp`: every recoverable pause reason shown on
+  the panel and stage with attention; both agents out of usage; a failed
+  task; work finished unreviewed (never shown as approved, with and without
+  a failing check); a stopped task stays pending and recoverable, while a
+  finished one shows its unfinished part as skipped; a paused step restored
+  from its checkpoint still asks for the user, with its round.
+
+Known gap, reported to the lead: a settings file containing a circular list
+(`#1=(1 . #1#)`, which the reader accepts) hangs `layout-positions`, because
+`length` never returns; `load-settings` has the same problem for a circular
+top-level list. `list-length` (nil for circular lists) would fix both. No
+test is included for it yet, since it would hang the suite until fixed.
+
+Remaining manual acceptance checks (not verified by the automated suite):
+
 - [ ] Review the final combined diff again, including the last review fixes.
 - [ ] Verify readable content and actual on-screen controls at narrow widths,
   rather than treating nonzero allocations alone as sufficient acceptance.
@@ -51,14 +85,25 @@ force a narrow window larger than its requested width.
   1000px the conversation measured 660px before opening the checklist and
   692px after closing it, so exact position restoration is not established.
 - [ ] Check approvals, questions, direct messages, missing/signed-out CLIs,
-  model/effort and usage controls in every layout, including while switching
-  layouts during a run. Preserve message delivery and recovery semantics.
-- [ ] Verify layout and workflow preferences survive a restart, including
-  malformed/obsolete preferences and transitions between narrow/wide views.
-- [ ] Update README layout/control descriptions and screenshot to match the
-  redesigned UI. The current README still describes the old middle pane.
-- [ ] Re-run `make load`, `make test-parallel`, and `git diff --check` after
-  substantive fixes. Full-suite tests must use `make test-parallel`.
+  model/effort and usage controls in all four layouts (*Agents on right*,
+  *Agents on left*, *Three panes*, *Conversation only*), including while
+  switching layouts during a run. Preserve message delivery and recovery
+  semantics.
+- [ ] *Agents on left*: verify on screen that the agents are on the left and
+  the conversation on the right, that its divider positions are kept
+  separately from *Agents on right*, that a narrow window puts the
+  conversation first and restores the mirrored order when widened, and that
+  the checklist opens and closes without moving the other layout's dividers.
+- [ ] Verify layout and workflow preferences survive an actual app restart
+  and narrow/wide transitions in the running window. Saving, loading and
+  validating the preferences themselves is now covered by tests; the GTK
+  side (applying them to dividers and dropdowns) is not.
+- [x] Update README layout/control descriptions to match the redesigned UI,
+  including the four layouts, the Workspace menu and the shared composer.
+- [ ] Replace `docs/screenshot.png`, which still shows the old three-pane
+  window (the README says so under the image).
+- [ ] Re-run `make load`, `make test-parallel`, and `git diff --check` on the
+  merged result of the lead's layout work and these tests. Full-suite tests must use `make test-parallel`.
 - [ ] Check `CHANGELOG.md` under Unreleased, then commit when requested.
 
 ## Milestone 2: task summary, usage, and time

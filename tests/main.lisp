@@ -167,6 +167,90 @@
     (unwind-protect (is equal '() (ai::load-settings file))
       (ignore-errors (delete-file file)))))
 
+(define-test settings-malformed-files
+    :parent agent-duet
+  ;; A file that reads but isn't a plist is no settings; read-time
+  ;; evaluation stays off.
+  (let ((file (merge-pathnames (format nil "duet-settings-~d.lisp" (random 1000000)) (uiop:temporary-directory)))
+        (ai::*settings* '(:theme :dark)))
+    (unwind-protect
+         (dolist (text '("42" "\"settings\"" "(:theme :dark :view)" "(:theme :dark . :light)"
+                         "#(:theme :dark)" "(:view #.(error \"evaluated\"))" ""))
+           (with-open-file (out file :direction :output :if-exists :supersede) (write-string text out))
+           (is equal '() (ai::load-settings file) "~s" text))
+      (ignore-errors (delete-file file)))))
+
+(define-test layout-preferences
+    :parent agent-duet
+  (let ((ai::*settings* '()))
+    (flet ((positions (view key value)
+             (setf ai::*settings* (list key value))
+             (ai::layout-positions view)))
+      ;; Each layout reads its own positions.
+      (is equal '(700 360) (positions :sidebar :sidebar-positions '(700 360)))
+      (is equal '(300 900) (positions :panes :pane-positions '(300 900)))
+      (setf ai::*settings* (list :sidebar-positions '(700 360) :pane-positions '(300 900)))
+      (is equal '(700 360) (ai::layout-positions :sidebar))
+      (is equal '(300 900) (ai::layout-positions :panes))
+      ;; Missing, malformed or obsolete positions are ignored, not used.
+      (dolist (value (list nil 700 "700 360" '(700) '(700 360 200) '(700 . 360) #(700 360)
+                           '(700.5 360) '(-1 360) '(700 100001) '("700" 360) '(:left :right)))
+        (false (positions :sidebar :sidebar-positions value) "~s" value)
+        (false (positions :panes :pane-positions value) "~s" value)))
+    ;; Dropdown choices fall back to the first when out of range or not a number.
+    (dolist (case '((nil 0) (0 0) (3 3) (4 0) (-1 0) (2.0 0) ("2" 0) (:divide 0)))
+      (setf ai::*settings* (list :workflow-mode (first case)))
+      (is = (second case) (ai::saved-choice-index :workflow-mode 4) "~s" (first case)))
+    (setf ai::*settings* '())
+    (is = 0 (ai::saved-choice-index :workflow-lead 2))))
+
+(define-test layout-preferences-agents-left
+    :parent agent-duet
+  ;; Agents on the left keep their own divider positions: switching between
+  ;; the layouts never moves another's.
+  (let ((ai::*settings* (list :sidebar-positions '(950 400) :agents-left-positions '(480 420)
+                              :pane-positions '(300 900))))
+    (is equal '(950 400) (ai::layout-positions :sidebar))
+    (is equal '(480 420) (ai::layout-positions :agents-left))
+    (is equal '(300 900) (ai::layout-positions :panes))
+    (false (ai::layout-positions :conversation))
+    (remf ai::*settings* :agents-left-positions)
+    (false (ai::layout-positions :agents-left))
+    (setf ai::*settings* (list :agents-left-positions '(480 . 420) :sidebar-positions '(950 400)))
+    (false (ai::layout-positions :agents-left))
+    (is equal '(950 400) (ai::layout-positions :sidebar))))
+
+(define-test layout-preferences-survive-restart
+    :parent agent-duet
+  (let ((file (merge-pathnames (format nil "duet-settings-~d.lisp" (random 1000000)) (uiop:temporary-directory)))
+        (ai::*settings* '()))
+    (unwind-protect
+         (progn
+           (setf ai::*settings* (list :view :agents-left :sidebar-positions '(820 410)
+                                      :agents-left-positions '(500 380) :pane-positions '(320 960)
+                                      :workflow-mode 2 :workflow-lead 1 :workflow-settings-expanded t
+                                      :claude-transcript-expanded nil))
+           (ai::save-settings file)
+           (setf ai::*settings* '())
+           (ai::load-settings file)
+           (is eq :agents-left (ai::setting :view))
+           (is equal '(820 410) (ai::layout-positions :sidebar))
+           (is equal '(500 380) (ai::layout-positions :agents-left))
+           (is equal '(320 960) (ai::layout-positions :panes))
+           (is = 2 (ai::saved-choice-index :workflow-mode 4))
+           (is = 1 (ai::saved-choice-index :workflow-lead 2))
+           (true (ai::setting :workflow-settings-expanded))
+           (false (ai::setting :claude-transcript-expanded t))
+           ;; A hand-edited file with bad layout values still loads the rest.
+           (with-open-file (out file :direction :output :if-exists :supersede)
+             (write-string "(:view :sideways :sidebar-positions (1 2 3) :pane-positions \"x\" :workflow-mode 9 :theme :dark)" out))
+           (ai::load-settings file)
+           (is eq :dark (ai::setting :theme))
+           (false (ai::layout-positions :sidebar))
+           (false (ai::layout-positions :panes))
+           (is = 0 (ai::saved-choice-index :workflow-mode 4)))
+      (ignore-errors (delete-file file)))))
+
 ;;; Markdown
 
 (define-test markdown-blocks

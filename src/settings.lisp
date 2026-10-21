@@ -22,7 +22,7 @@
                    (let ((*read-eval* nil)
                          (*package* (find-package '#:agent-duet)))
                      (let ((plist (read in nil nil)))
-                       (and (listp plist) (evenp (length plist)) plist)))))))
+                       (and (listp plist) (evenp (list-length plist)) plist)))))))
             '())))
 
 (defun save-settings (&optional (file (settings-file)))
@@ -66,11 +66,20 @@
             (if (plusp (length command)) (acons path command others) others)))
     command))
 
+(defun layout-position-key (view)
+  (case view
+    (:sidebar :sidebar-positions)
+    (:agents-left :agents-left-positions)
+    (:panes :pane-positions)))
+
+(defun sidebar-view-p (view)
+  (not (null (member view '(:sidebar :agents-left)))))
+
 (defun layout-positions (view)
   "Validated divider positions for VIEW; ignore malformed or old preferences."
-  (let ((positions (setting (if (eq view :sidebar) :sidebar-positions :pane-positions))))
+  (let ((positions (setting (layout-position-key view))))
     (ignore-errors
-      (when (and (listp positions) (= (length positions) 2)
+      (when (and (listp positions) (eql (list-length positions) 2)
                  (every (lambda (n) (and (integerp n) (<= 0 n 100000))) positions))
         positions))))
 

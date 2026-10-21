@@ -2259,8 +2259,16 @@ Git hook/identity errors are returned; a failed commit restores the prior index.
     ;; A part done against an earlier version of its prerequisite isn't merged.
     (when (some #'loop-stale-p (workflow-loops workflow))
       (return-from recover-integration :blocked))
-    (setf (workflow-state workflow) :running)
-    (if (eq (workflow-integration-state workflow) :committing)
+    (setf (workflow-state workflow) :running
+          (workflow-completion-error workflow) nil)
+    ;; Older checkpoints mark even commit failures :INTERRUPTED. Every
+    ;; part needs a retained commit in the journal before we may merge.
+    (if (or (eq (workflow-integration-state workflow) :committing)
+            (some (lambda (l)
+                    (and (loop-tree l)
+                         (not (assoc (namestring (loop-tree l))
+                                     (workflow-integration-journal workflow) :test #'equal))))
+                  (workflow-loops workflow)))
         (integrate workflow)
         (if (and (eq (workflow-integration-state workflow) :merged) (null (workflow-merged-loop workflow)))
             (merged workflow)

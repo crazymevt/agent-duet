@@ -1085,7 +1085,8 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                       (gtk:paned-get-position (control :conversation-split))))))
       (unless visible
         (setf (getf *controls* :restore-checklist-positions)
-              (control :pre-checklist-positions)))
+              (control :pre-checklist-positions))
+        (remf *controls* :pre-checklist-positions))
       (when (gtk:widget-get-visible panel)
         (setf (getf *controls* :checklist-width) (gtk:widget-get-width panel)))
       (gtk:widget-set-visible panel (not (null visible)))
@@ -1209,17 +1210,18 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 ;;; Conversation with a sidebar, the original three panes, or conversation alone
 
 (defvar *view* :sidebar
-  ":sidebar places stacked agents to the right; :panes retains the original layout.
+  ":sidebar places stacked agents to the right; :agents-left places them to the left.
+:panes retains the original layout.
 :conversation
 shows the conversation alone, with the agents' approvals and questions in it,
 and a line saying what each is doing.")
 
-(defparameter *views* '((:sidebar "Conversation + agents") (:panes "Three panes") (:conversation "Conversation only")))
+(defparameter *views* '((:sidebar "Agents on right") (:agents-left "Agents on left") (:panes "Three panes") (:conversation "Conversation only")))
 
 (defvar *view-only* '() "(widget . view)s: shown only in that view.")
 
 (defun visible-in-view-p (only view)
-  (or (eq only view) (and (eq only :panes) (eq view :sidebar))))
+  (or (eq only view) (and (eq only :panes) (sidebar-view-p view))))
 
 (defun view-only (view widget)
   "Show WIDGET only in VIEW. Returns WIDGET."
@@ -1232,9 +1234,11 @@ and a line saying what each is doing.")
 (defun remember-layout ()
   "Remember divider positions for the current layout, independently of other views."
   (when (and (control :agent-split) (not (control :narrow-layout)) (not (eq *view* :conversation)))
-    (setf (setting (if (eq *view* :sidebar) :sidebar-positions :pane-positions))
-          (list (gtk:paned-get-position (control :agent-split))
-                (gtk:paned-get-position (control :conversation-split))))))
+    (setf (setting (layout-position-key *view*))
+          (or (control :restore-checklist-positions)
+              (control :pre-checklist-positions)
+              (list (gtk:paned-get-position (control :agent-split))
+                    (gtk:paned-get-position (control :conversation-split)))))))
 
 (defun arrange-conversation (view)
   "Reuse the live widgets: changing layout never restarts an agent or a stream."
@@ -1245,6 +1249,7 @@ and a line saying what each is doing.")
         (codex (control :codex-widget)))
     (when outer
       (setf (getf *controls* :narrow-layout) nil)
+      (remf *controls* :last-wide-positions)
       (gtk:orientable-set-orientation outer :horizontal)
       ;; The retained three-pane layout must respect each pane's minimum
       ;; size; otherwise dragging a divider can hide approvals and questions.
@@ -1268,19 +1273,23 @@ and a line saying what each is doing.")
           (progn
             (gtk:paned-set-start-child inner claude)
             (gtk:paned-set-end-child inner codex)
-            (gtk:paned-set-start-child outer middle)
-            (unless (eq view :conversation) (gtk:paned-set-end-child outer inner))))
+            (gtk:paned-set-start-child outer (if (eq view :agents-left) inner middle))
+            (unless (eq view :conversation)
+              (gtk:paned-set-end-child outer (if (eq view :agents-left) middle inner)))))
       (unless (eq view :conversation)
         (let* ((saved (layout-positions view))
                (width (let ((width (gtk:widget-get-width outer))) (if (plusp width) width 1440))))
-          (gtk:paned-set-position outer (or (first saved) (round (* width (if (eq view :sidebar) 0.66 0.30)))))
-          (gtk:paned-set-position inner (or (second saved) (if (eq view :sidebar) 360 470))))))))
+          (gtk:paned-set-position outer (or (first saved) (round (* width (case view (:sidebar 0.66) (:agents-left 0.34) (t 0.30))))))
+          (gtk:paned-set-position inner (or (second saved) (if (sidebar-view-p view) 360 470))))))))
 
 (defun set-view (view)
   "Show VIEW and persist the layout and its divider positions."
   (let ((view (if (assoc view *views*) view :sidebar)))
     (unless (eq view *view*)
       (remember-layout)
+      ;; Checklist snapshots belong to the view in which they were captured.
+      (remf *controls* :pre-checklist-positions)
+      (remf *controls* :restore-checklist-positions)
       (setf *view* view)
       (arrange-conversation view))
     (setf (setting :view) view)

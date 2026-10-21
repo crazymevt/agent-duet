@@ -545,3 +545,120 @@
         (is eq :complete (presented-stage-state progress :plan))
         (is eq :complete (presented-stage-state progress :approval))
         (is eq :active (presented-stage-state progress :lead-part))))))
+
+(define-test presentation-pause-reasons :parent agent-duet
+  ;; Each recoverable pause says why, on the panel and on its stage.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let* ((workflow (presented-workflow lead partner))
+           (loop (ai::make-review-loop :author lead :reviewer partner :state :paused))
+           (step (presented-step workflow lead :work :loop loop :paused t :reason :interrupted)))
+      (setf (ai:workflow-loops workflow) (list loop))
+      (loop for (reason text) in '((:disconnected "disconnected")
+                                   (:failed "the turn failed")
+                                   (:continuation-failed "couldn't carry on from the reply")
+                                   (:integration-unresolved "the merge isn't resolved")
+                                   (:something-new "something-new"))
+            do (setf (ai::step-reason step) reason)
+               (let ((p (ai::workflow-agent-presentation workflow lead))
+                     (stage (presented-stage (ai::workflow-progress-presentation workflow) :work)))
+                 (is eq :paused (getf p :state) "~s" reason)
+                 (true (getf p :attention-p) "~s" reason)
+                 (true (search text (getf p :detail)) "~s" reason)
+                 (is eq :active (getf stage :state) "~s" reason)
+                 (true (getf stage :attention-p) "~s" reason)
+                 (true (search text (getf stage :detail)) "~s" reason)))
+      ;; The partner, with nothing of its own paused, isn't asked to act.
+      (false (getf (ai::workflow-agent-presentation workflow partner) :attention-p)))))
+
+(define-test presentation-both-agents-unavailable :parent agent-duet
+  ;; Both parts out of usage: each panel says so, and the task stays paused.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let* ((workflow (presented-workflow lead partner :mode :divide))
+           (mine (ai::make-review-loop :author lead :reviewer partner :label "Claude's part" :state :paused))
+           (theirs (ai::make-review-loop :author partner :reviewer lead :label "ChatGPT's part" :state :paused)))
+      (setf (ai:workflow-loops workflow) (list mine theirs))
+      (presented-step workflow lead :work :loop mine :paused t :reason :out-of-usage)
+      (presented-step workflow partner :work :loop theirs :paused t :reason :out-of-usage)
+      (dolist (agent (list lead partner))
+        (let ((p (ai::workflow-agent-presentation workflow agent)))
+          (is eq :out-of-usage (getf p :state))
+          (true (getf p :attention-p))))
+      (let ((progress (ai::workflow-progress-presentation workflow)))
+        (true (search "is out of usage" (getf progress :label)))
+        (is eq :active (presented-stage-state progress :lead-part))
+        (is eq :active (presented-stage-state progress :partner-part))
+        (is eq :pending (presented-stage-state progress :finish))))))
+
+(define-test presentation-failed-task :parent agent-duet
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let* ((workflow (presented-workflow lead partner :state :finished))
+           (loop (ai::make-review-loop :author lead :reviewer partner :state :failed :round 1)))
+      (setf (ai:workflow-loops workflow) (list loop)
+            (ai::workflow-completion-error workflow) "Claude's turn failed")
+      (let ((progress (ai::workflow-progress-presentation workflow)))
+        (is string= "Failed" (getf progress :label))
+        (is eq :error (presented-stage-state progress :work))
+        (is string= "Failed" (getf (presented-stage progress :work) :detail))
+        (is eq :error (presented-stage-state progress :finish))
+        (is string= "Claude's turn failed" (getf (presented-stage progress :finish) :detail)))
+      (let ((p (ai::workflow-agent-presentation workflow lead)))
+        (is eq :error (getf p :state))
+        (true (getf p :attention-p))
+        (is string= "Claude's turn failed" (getf p :detail))))))
+
+(define-test presentation-unreviewed-work :parent agent-duet
+  ;; Work completed without review is done, never shown as approved.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let* ((workflow (presented-workflow lead partner :state :finished))
+           (loop (ai::make-review-loop :author lead :reviewer partner :state :unreviewed :round 1)))
+      (setf (ai:workflow-loops workflow) (list loop))
+      (let ((progress (ai::workflow-progress-presentation workflow)))
+        (is string= "Finished, not all reviewed" (getf progress :label))
+        (is eq :complete (presented-stage-state progress :work))
+        (is string= "Not reviewed" (getf (presented-stage progress :work) :detail))
+        (false (search "pprove" (format nil "~s" progress))))
+      (is string= "Claude's work not reviewed" (getf (ai::workflow-agent-presentation workflow lead) :detail))
+      (setf (ai::loop-check-failed loop) t)
+      (is string= "Not reviewed; its check still fails"
+          (getf (presented-stage (ai::workflow-progress-presentation workflow) :work) :detail)))))
+
+(define-test presentation-stopped-recoverable :parent agent-duet
+  ;; Stopped is resumable later: the agent whose step was paused is told so,
+  ;; and unfinished stages stay pending rather than skipped.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let* ((workflow (presented-workflow lead partner :state :stopped :mode :divide))
+           (mine (ai::make-review-loop :author lead :reviewer partner :label "Claude's part" :state :paused))
+           (theirs (ai::make-review-loop :author partner :reviewer lead :label "ChatGPT's part" :state :approved
+                                         :round 1)))
+      (setf (ai:workflow-loops workflow) (list mine theirs))
+      (presented-step workflow lead :work :loop mine :paused t :reason :interrupted)
+      (is string= "Its step can be recovered" (getf (ai::workflow-agent-presentation workflow lead) :detail))
+      (let ((progress (ai::workflow-progress-presentation workflow)))
+        (is eq :pending (presented-stage-state progress :lead-part))
+        (true (search "Stopped" (getf (presented-stage progress :lead-part) :detail)))
+        (is eq :complete (presented-stage-state progress :partner-part))
+        (false (find :skipped (getf progress :stages) :key (lambda (s) (getf s :state)))))
+      ;; Finished with that part unfinished, it's skipped, not pending.
+      (setf (ai:workflow-state workflow) :finished)
+      (let ((stage (presented-stage (ai::workflow-progress-presentation workflow) :lead-part)))
+        (is eq :skipped (getf stage :state))
+        (is string= "Not finished" (getf stage :detail))))))
+
+(define-test presentation-restored-pause :parent agent-duet
+  ;; A paused step restored from its checkpoint still asks for the user.
+  (multiple-value-bind (lead partner) (presented-agents)
+    (let ((workflow (presented-workflow lead partner :max-rounds 3)))
+      (setf (ai:workflow-loops workflow)
+            (list (ai::make-review-loop :author lead :reviewer partner :task "Do it" :state :paused :round 1)))
+      (presented-step workflow lead :work :loop (first (ai:workflow-loops workflow)) :paused t
+                                          :reason :disconnected)
+      (let* ((restored (presented-restored workflow lead partner))
+             (progress (ai::workflow-progress-presentation restored))
+             (p (ai::workflow-agent-presentation restored lead)))
+        (is string= "Paused" (getf progress :label))
+        (is eq :active (presented-stage-state progress :work))
+        (true (getf (presented-stage progress :work) :attention-p))
+        (is = 2 (getf progress :round))
+        (is = 3 (getf progress :max-rounds))
+        (true (getf p :attention-p))
+        (true (search "disconnected" (getf p :detail)))))))
