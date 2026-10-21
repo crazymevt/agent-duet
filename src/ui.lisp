@@ -262,6 +262,7 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   chips                                       ; the box showing them
   (stream-box nil) (stream-label nil) (stream-text "")
   (conversation-box nil) (conversation-label nil) (conversation-activity nil)
+  (conversation-placeholder-p nil) ; waiting for the first reply text
   (conversation-replies nil) ; completed text/bubble pairs eligible for a handoff
   (tools (make-hash-table :test 'equal))
   (activity-text "No commands yet") (activity-id nil) (activity-title "") (activity-labels '())
@@ -734,7 +735,8 @@ answer settles it, wherever it was given."
     (let* ((agent (agent-pane-agent pane))
            (bubble (middle-bubble (agent-id agent) (agent-name agent) ""))
            (body (gtk:widget-get-last-child bubble))
-           (label (make-instance 'gtk:label :xalign 0.0 :wrap t :selectable t
+           (label (make-instance 'gtk:label :label (format nil "~a is working…" (agent-name agent))
+                                          :xalign 0.0 :wrap t :selectable t
                                           :wrap-mode :word-char)))
       ;; Only the newest message follows live commands; older messages keep
       ;; the command that accompanied them.
@@ -750,12 +752,20 @@ answer settles it, wherever it was given."
         (gtk:box-append bubble activity)
         (setf (agent-pane-conversation-activity pane) activity))
       (setf (agent-pane-conversation-box pane) body
-            (agent-pane-conversation-label pane) label))))
+            (agent-pane-conversation-label pane) label
+            (agent-pane-conversation-placeholder-p pane) t))))
 
 (defun retire-conversation-activity (pane)
   (setf (agent-pane-activity-labels pane)
         (remove (agent-pane-conversation-activity pane) (agent-pane-activity-labels pane))
         (agent-pane-conversation-activity pane) nil))
+
+(defun clear-conversation-placeholder (pane)
+  "Stop claiming work is in progress when a pending reply ends without text."
+  (when (agent-pane-conversation-placeholder-p pane)
+    (when (agent-pane-conversation-label pane)
+      (gtk:label-set-text (agent-pane-conversation-label pane) ""))
+    (setf (agent-pane-conversation-placeholder-p pane) nil)))
 
 (defun begin-conversation-turn (pane)
   ;; A prompt can also be an injected message during a live text block.
@@ -769,12 +779,15 @@ answer settles it, wherever it was given."
 Finished text, a new turn and clearing the pane explicitly discard that pending state."
   (unless (and preserve-pending
                (agent-pane-conversation-label pane)
-               (zerop (length (gtk:label-get-text (agent-pane-conversation-label pane)))))
+               (agent-pane-conversation-placeholder-p pane))
+    (clear-conversation-placeholder pane)
     (setf (agent-pane-conversation-box pane) nil
-          (agent-pane-conversation-label pane) nil))
+          (agent-pane-conversation-label pane) nil
+          (agent-pane-conversation-placeholder-p pane) nil))
   (setf (agent-pane-stream-box pane) nil (agent-pane-stream-label pane) nil (agent-pane-stream-text pane) ""))
 
 (defun pane-delta (pane text)
+  (when (zerop (length text)) (return-from pane-delta))
   (ensure-conversation-reply pane)
   (unless (agent-pane-stream-box pane)
     (let ((box (make-instance 'gtk:box :orientation :vertical :spacing 6))
@@ -786,6 +799,7 @@ Finished text, a new turn and clearing the pane explicitly discard that pending 
   (setf (agent-pane-stream-text pane) (concatenate 'string (agent-pane-stream-text pane) text))
   (gtk:label-set-text (agent-pane-stream-label pane) (agent-pane-stream-text pane))
   (when (agent-pane-conversation-label pane)
+    (setf (agent-pane-conversation-placeholder-p pane) nil)
     (gtk:label-set-text (agent-pane-conversation-label pane) (agent-pane-stream-text pane))
     (pane-scroll-to-end *middle*))
   (pane-scroll-to-end pane))
@@ -794,6 +808,7 @@ Finished text, a new turn and clearing the pane explicitly discard that pending 
   "A finished block of a reply: rendered in place of what was streamed."
   (ensure-conversation-reply pane)
   (when (agent-pane-conversation-box pane)
+    (setf (agent-pane-conversation-placeholder-p pane) nil)
     (clear-box (agent-pane-conversation-box pane))
     (render-markdown (agent-pane-conversation-box pane) text)
     (push (cons text (gtk:widget-get-parent (agent-pane-conversation-box pane)))
@@ -939,6 +954,7 @@ few such prompts made resizing take a large part of a second.")
          ;; A turn that streamed but never finished its block.
          (when (agent-pane-stream-box pane)
            (pane-text pane (agent-pane-stream-text pane)))
+         (clear-conversation-placeholder pane)
          (retire-conversation-activity pane)
          (when error (pane-note pane (or text "The turn failed.") "error")))))))
 
@@ -1077,7 +1093,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                             (middle-agent-message *codex* header body))
                            (t (middle-bubble :user header body)))))))
              (:error (pane-note *middle* text "error"))
-             (t (pane-note *middle* text "dim-label" "duet-note")))))))))
+             (t (pane-note *middle* text "dim-label" "duet-note")))))))
+    ;; Saved activity cannot indicate a live turn after reopening history.
+    (dolist (entry *panes*)
+      (clear-conversation-placeholder (cdr entry)))))
 
 (defun format-history-time (time)
   (multiple-value-bind (s minute hour day month year) (decode-universal-time time)
@@ -1281,6 +1300,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                                            (string-trim '(#\Space #\Tab #\Return #\Newline) b))))
                     (first replies)))
          (bubble (cdr entry)))
+    (when pane (clear-conversation-placeholder pane))
     (if (and bubble (eq (gtk:widget-get-parent bubble) (pane-messages *middle*)))
         (progn
           (gtk:label-set-text (gtk:widget-get-first-child bubble) header)
