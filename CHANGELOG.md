@@ -1,7 +1,20 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-10-21
 
+- Local images an agent mentions or generates show in its reply as
+  thumbnails up to 640 × 480; click one to open the file. HTML mockup links
+  render as clickable links rather than raw tool tokens.
+- Cmd+Option (macOS) or Ctrl+Alt (Linux) with A, L and T toggle the agents,
+  checklist and terminal from any pane. Workspace › Keyboard shortcuts…
+  rebinds or disables them, and the bindings are remembered.
+- The window size, panel sizes, checklist width, terminal height and whether
+  Workflow progress is expanded are remembered between runs.
+- While an agent works, its reply shows a working placeholder, cleared when
+  the reply ends.
+- New README screenshots of the Agents on right, Three panes and
+  Conversation only layouts; `make screenshots` regenerates them from a demo
+  conversation.
 - Checklists lead with progress and counts, group open findings before fixed
   and dismissed findings, and keep the task text below the review summary.
   Tasks without findings show an explicit empty state.
@@ -20,8 +33,6 @@
 - The conversation reserves 320px and each agent panel 300px so Three panes
   keeps its composer and attention controls readable. Below 680px, responsive
   sidebar layouts stack the agents and reserve more vertical room for them.
-- Refreshed the README screenshot from the redesigned window with explicitly
-  synthetic approval/question cards.
 - Settings loading rejects malformed top-level lists and drops circular or
   dotted values while preserving independent valid preferences. Circular
   nested lists and arrays of any rank no longer reach the settings printer;
