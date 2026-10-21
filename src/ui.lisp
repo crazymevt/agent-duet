@@ -1241,11 +1241,13 @@ and a line saying what each is doing.")
   (when (and (control :agent-split) (not (control :narrow-layout))
              (not (control :equalize-agent-panels)) (not (eq *view* :conversation)))
     (setf (setting (layout-position-key *view*))
-          (or (control :restore-checklist-positions)
+          (agent-layout-preference
+           (or (control :restore-checklist-positions)
               (control :pre-checklist-positions)
               (control :pending-layout-positions)
               (list (gtk:paned-get-position (control :agent-split))
-                    (gtk:paned-get-position (control :conversation-split)))))))
+                    (gtk:paned-get-position (control :conversation-split))))
+           (agent-layout-custom-p)))))
 
 (defun arrange-conversation (view)
   "Reuse the live widgets: changing layout never restarts an agent or a stream."
@@ -1256,6 +1258,9 @@ and a line saying what each is doing.")
         (codex (control :codex-widget)))
     (when outer
       (migrate-agent-panel-positions)
+      (setf (getf *controls* :custom-agent-split)
+            (not (null (second (layout-positions view)))))
+      (remf *controls* :agent-layout-size)
       (setf (getf *controls* :narrow-layout) nil)
       (remf *controls* :last-wide-positions)
       (remf *controls* :pending-layout-positions)
@@ -1300,7 +1305,7 @@ and a line saying what each is doing.")
                                   (if (plusp height) height 720)))
                               (equal-agent-divider-position view
                                 (round (* width 0.70)) (round (* width 0.30)))))))
-          (unless saved
+          (unless (second saved)
             (setf (getf *controls* :equalize-agent-panels) :pending)))))))
 
 (defun set-view (view)

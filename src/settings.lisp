@@ -117,7 +117,9 @@ Entries with circular values are dropped, keeping the rest."
   "Validated divider positions for VIEW; ignore malformed or old preferences."
   (let ((positions (setting (layout-position-key view))))
     (when (and (proper-list-p positions) (eql (list-length positions) 2)
-               (every (lambda (n) (and (integerp n) (<= 0 n 100000))) positions))
+               (integerp (first positions)) (<= 0 (first positions) 100000)
+               (or (null (second positions))
+                   (and (integerp (second positions)) (<= 0 (second positions) 100000))))
       positions)))
 
 (defun equal-agent-divider-position (view available &optional (other-agent-size 0))
@@ -128,13 +130,24 @@ Sidebar and responsive layouts split the child space in half."
              (- available other-agent-size)
              (floor available 2))))
 
+(defun agent-divider-custom-p (position equal-position previous-size current-size)
+  "Ignore rounding and allocation-driven changes; retain an unequal stable split."
+  (and previous-size (equal previous-size current-size)
+       (> (abs (- position equal-position)) 2)))
+
+(defun agent-layout-preference (positions custom-split-p)
+  "Keep the outer divider, but persist an inner pixel position only for a custom split."
+  (list (first positions) (when custom-split-p (second positions))))
+
 (defun migrate-agent-panel-positions ()
-  "Discard legacy defaults once: they were saved without distinguishing drags.
-Subsequent saved positions, including deliberate unequal splits, are retained."
-  (unless (setting :equal-agent-panels-version)
+  "Clear legacy inner defaults once, preserving conversation/sidebar widths."
+  (unless (eql (setting :equal-agent-panels-version) 2)
     (dolist (view '(:sidebar :agents-left :panes))
-      (remf *settings* (layout-position-key view)))
-    (setf (setting :equal-agent-panels-version) 1)))
+      (let ((positions (layout-positions view)))
+        (when positions
+          (setf (getf *settings* (layout-position-key view))
+                (agent-layout-preference positions nil)))))
+    (setf (setting :equal-agent-panels-version) 2)))
 
 (defun saved-choice-index (key count)
   "Return a valid dropdown index, tolerating obsolete or malformed settings."

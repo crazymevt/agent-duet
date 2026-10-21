@@ -80,7 +80,9 @@
                    (not (control :restore-checklist-positions))
                    (not (control :pending-layout-positions))
                    (not (control :equalize-agent-panels)))
-          (setf (setting (layout-position-key *view*)) (control :last-wide-positions)))
+          (setf (setting (layout-position-key *view*))
+                (agent-layout-preference (control :last-wide-positions)
+                                         (control :custom-agent-split))))
         (setf (getf *controls* :narrow-layout) narrow)
         ;; In either sidebar view, narrow windows put the conversation first.
         ;; Reparent only the existing widgets; streams and cards stay live.
@@ -93,7 +95,7 @@
         (gtk:orientable-set-orientation inner (if (and narrow (>= width 680)) :horizontal :vertical))
         (setf (getf *controls* :equalize-agent-panels)
               (when (or narrow (not (or (control :restore-checklist-positions)
-                                        (layout-positions *view*))))
+                                        (second (layout-positions *view*)))))
                 :pending))
         (if narrow
             (setf (getf *controls* :pending-layout-positions)
@@ -125,8 +127,12 @@
                  :css-classes (if (or (getf stage :attention-p) (eq (getf stage :state) :error))
                                   '("duet-stage" "warning") '("duet-stage"))))
 
-(defun equalize-agent-panels ()
-  "Set the default divider from allocated child sizes, excluding the handle."
+(defun agent-layout-size ()
+  (let ((outer (control :agent-split)))
+    (list (gtk:widget-get-width outer) (gtk:widget-get-height outer) *view*)))
+
+(defun equal-agent-position ()
+  "Default position from allocated child space, excluding the handle."
   (let* ((inner (control :conversation-split))
          (claude (control :claude-widget))
          (codex (control :codex-widget))
@@ -134,8 +140,32 @@
          (extent (if horizontal #'gtk:widget-get-width #'gtk:widget-get-height))
          (start (if (eq *view* :panes) (control :middle-widget) claude))
          (available (+ (funcall extent start) (funcall extent codex))))
-    (gtk:paned-set-position
-     inner (equal-agent-divider-position *view* available (funcall extent claude)))))
+    (equal-agent-divider-position *view* available (funcall extent claude))))
+
+(defun equalize-agent-panels ()
+  (gtk:paned-set-position (control :conversation-split) (equal-agent-position)))
+
+(defun agent-layout-custom-p ()
+  "Compare geometry only while the window's allocation is stable."
+  (or (control :custom-agent-split)
+      (and (not (control :pending-layout-positions))
+           (not (control :equalize-agent-panels))
+           (agent-divider-custom-p
+            (gtk:paned-get-position (control :conversation-split))
+            (equal-agent-position) (control :agent-layout-size) (agent-layout-size)))))
+
+(defun observe-agent-layout-size ()
+  "Keep defaults equal through window resizing, without interpreting it as a drag."
+  (let ((size (agent-layout-size)))
+    (unless (or (eq *view* :conversation) (control :narrow-layout)
+                (control :pre-checklist-positions) (control :restore-checklist-positions)
+                (control :pending-layout-positions) (control :equalize-agent-panels))
+      (if (equal size (control :agent-layout-size))
+          (setf (getf *controls* :custom-agent-split) (agent-layout-custom-p))
+          (unless (control :custom-agent-split)
+            (setf (getf *controls* :equalize-agent-panels) :ready)
+            (gtk:widget-queue-allocate (control :agent-split)))))
+    (setf (getf *controls* :agent-layout-size) size)))
 
 (defun watch-conversation-allocation (widget)
   "Observe rendered allocations; queue another only for staged restoration."
@@ -159,6 +189,7 @@
           (lambda (clock)
             (declare (ignore clock))
             (unless *closing*
+              (observe-agent-layout-size)
               ;; Orientation changes queue another allocation. Set positions
               ;; only after that allocation, or GtkPaned scales them using the
               ;; previous axis and loses the user's wide divider positions.

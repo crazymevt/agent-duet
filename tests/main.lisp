@@ -307,8 +307,8 @@
 
 (define-test agent-panel-positions-migrate-once
     :parent agent-duet
-  ;; Positions saved before equal sizing were defaults, not drags: they are
-  ;; discarded once, and positions saved afterwards are respected.
+  ;; Legacy inner positions cannot distinguish defaults from drags.
+  ;; Reset only those positions, and retain all outer divider widths.
   (let* ((config (merge-pathnames (format nil "duet-config-~d/" (random 1000000)) (uiop:temporary-directory)))
          (old (uiop:getenv "XDG_CONFIG_HOME"))
          (ai::*settings* (list :sidebar-positions '(950 400) :agents-left-positions '(480 420)
@@ -318,13 +318,19 @@
          (progn
            (ai::migrate-agent-panel-positions)
            (dolist (view '(:sidebar :agents-left :panes))
-             (false (ai::layout-positions view) "~s" view))
+             (is equal (list (case view (:sidebar 950) (:agents-left 480) (:panes 300)) nil)
+                 (ai::layout-positions view) "~s" view))
            (is eq :panes (ai::setting :view))
            (is eq :dark (ai::setting :theme))
            ;; The migration is recorded on disk, so a restart keeps new drags.
            (setf ai::*settings* '())
            (ai::load-settings)
-           (true (ai::setting :equal-agent-panels-version))
+           (is eql 2 (ai::setting :equal-agent-panels-version))
+           ;; Upgrade settings written by the first equal-sizing fix too.
+           (setf (ai::setting :equal-agent-panels-version) 1
+                 (ai::setting :sidebar-positions) '(950 400))
+           (ai::migrate-agent-panel-positions)
+           (is equal '(950 nil) (ai::layout-positions :sidebar))
            (setf (ai::setting :sidebar-positions) '(900 300)
                  (ai::setting :pane-positions) '(320 960))
            (ai::migrate-agent-panel-positions)
@@ -334,6 +340,52 @@
            (is equal '(320 960) (ai::layout-positions :panes)))
       (setf (uiop:getenv "XDG_CONFIG_HOME") (or old ""))
       (uiop:delete-directory-tree config :validate t :if-does-not-exist :ignore))))
+
+(define-test agent-divider-custom-geometry
+    :parent agent-duet
+  (let ((size '(1440 900 :sidebar)))
+    (false (ai::agent-divider-custom-p 450 450 size size))
+    (false (ai::agent-divider-custom-p 452 450 size size))
+    (false (ai::agent-divider-custom-p 448 450 size size))
+    (true (ai::agent-divider-custom-p 453 450 size size))
+    (true (ai::agent-divider-custom-p 300 450 size size))
+    ;; GTK may scale a default divider while the window changes size. It must
+    ;; be equalized again, not saved as a deliberate split.
+    (false (ai::agent-divider-custom-p 300 450 size '(1440 1000 :sidebar)))
+    (false (ai::agent-divider-custom-p 300 450 nil size))))
+
+(define-test default-agent-layout-survives-restart
+    :parent agent-duet
+  (let ((file (merge-pathnames (format nil "duet-agent-layout-~d.lisp" (random 1000000))
+                              (uiop:temporary-directory)))
+        (ai::*settings* nil))
+    (unwind-protect
+         (dolist (view '(:sidebar :agents-left :panes))
+           ;; Closing, switching views or opening the checklist uses this same
+           ;; preference helper. Automatic allocations must not become a saved
+           ;; inner pixel position, even when the outer width is retained.
+           (setf (getf ai::*settings* (ai::layout-position-key view))
+                 (ai::agent-layout-preference '(600 700)
+                   (ai::agent-divider-custom-p 700 700 '(1440 1400) '(1440 1400))))
+           (ai::save-settings file)
+           (setf ai::*settings* nil)
+           (ai::load-settings file)
+           (let ((saved (ai::layout-positions view)))
+             (is = 600 (first saved))
+             ;; The UI checks SECOND, not the presence of the outer position,
+             ;; to schedule its second-frame equalization after restart.
+             (false (second saved))
+             (let ((available 820))
+               (is = (if (eq view :panes) 520 410)
+                   (ai::equal-agent-divider-position view available 300))))
+           ;; A deliberate split still survives serialization and validation.
+           (setf (getf ai::*settings* (ai::layout-position-key view))
+                 (ai::agent-layout-preference '(600 250)
+                   (ai::agent-divider-custom-p 250 700 '(1440 1400) '(1440 1400))))
+           (ai::save-settings file)
+           (ai::load-settings file)
+           (is equal '(600 250) (ai::layout-positions view)))
+      (when (probe-file file) (delete-file file)))))
 
 (define-test layout-preferences-survive-restart
     :parent agent-duet
