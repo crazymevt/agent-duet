@@ -417,6 +417,13 @@ for Codex, the one marked as the default)."
       (gtk:flow-box-append flow widget))
     flow))
 
+(defun make-workflow-activity-pill (agent key)
+  "Register a workflow pill beside an agent's status and usage."
+  (let ((label (make-instance 'gtk:label :xalign 0.0
+                             :valign :center :css-classes '("caption"))))
+    (setf (getf *controls* (agent-setting-key agent key)) label)
+    label))
+
 (defun make-agent-pane (agent)
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 0.0 :hexpand t :ellipsize :end :css-classes '("dim-label")
@@ -456,13 +463,10 @@ for Codex, the one marked as the default)."
                           (gtk:box :spacing 8 :margin-start 12 :margin-end 6 :margin-top 6
                                    (gtk:label :label (agent-name agent) :css-classes (list "heading" (agent-css-class agent)))
                                    status
+                                   (make-workflow-activity-pill agent "WORKFLOW-ACTIVITY")
                                    (gtk:button :label "New" :css-classes '("flat")
                                                :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
                                                :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
-                          (let ((label (make-instance 'gtk:label :xalign 0.0 :wrap t
-                                                       :margin-start 12 :margin-end 12 :css-classes '("caption"))))
-                            (setf (getf *controls* (agent-setting-key agent "WORKFLOW-ACTIVITY")) label)
-                            label)
                           (wrapping-controls models efforts)
                           (make-agent-activity-label pane)
                           (gtk:separator)
@@ -1359,19 +1363,31 @@ and a line saying what each is doing.")
     (refresh-activity)))
 
 (defun agent-activity (agent)
-  "The same workflow state as the agent panel, with remaining usage."
+  "Workflow detail and remaining usage; the conversation header has a state pill."
   (when (or (null *workflow*) (not (workflow-agent-member-p *workflow* agent)))
     (return-from agent-activity (gtk:label-get-text (pane-status (agent-pane-of agent)))))
   (let* ((presentation (workflow-agent-presentation *workflow* agent))
          (usage (usage-summary (agent-usage-windows agent))))
-    (format nil "~a~@[ · ~a~]~@[ · ~a left~]"
-            (getf presentation :label) (getf presentation :detail)
-            (and (not (agent-out-of-usage-p agent))
-                 (not (eq (agent-out-until agent) :unknown)) usage))))
+    (format nil "~{~a~^ · ~}"
+            (remove nil
+                    (list (unless (eq *view* :conversation) (getf presentation :label))
+                          (getf presentation :detail)
+                          (and (not (agent-out-of-usage-p agent))
+                               (not (eq (agent-out-until agent) :unknown)) usage
+                               (format nil "~a left" usage)))))))
 
 (defun refresh-activity ()
   "Bring the shared conversation's agent status lines up to date."
   (refresh-workflow-presentation)
+  ;; The conversation-only view has its own copy of each header pill.
+  (dolist (agent (list *claude* *codex*))
+    (when agent
+      (let ((source (control (agent-setting-key agent "WORKFLOW-ACTIVITY")))
+            (target (control (agent-setting-key agent "WORKFLOW-STATUS-PILL"))))
+        (when (and source target)
+          (gtk:label-set-text target (gtk:label-get-text source))
+          (gtk:widget-set-tooltip-text target (gtk:widget-get-tooltip-text source))
+          (gtk:widget-set-css-classes target (gtk:widget-get-css-classes source))))))
   (when (and (control :claude-activity) *panes*)
     (loop for (agent . name) in (list (cons *claude* :claude-activity) (cons *codex* :codex-activity))
           for label = (control name)
@@ -1383,8 +1399,8 @@ and a line saying what each is doing.")
                                                    '("warning") '("dim-label"))))))
 
 (defun make-activity-strip ()
-  "Compact status and latest command for each agent in every layout.
-Model controls are also available when the agent panels are hidden."
+  "Keep status and usage beside each name, with command activity underneath.
+Model controls and workflow pills are available when the agent panels are hidden."
   (let ((claude (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label")))
         (codex (make-instance 'gtk:label :xalign 0.0 :ellipsize :end :css-classes '("dim-label"))))
     (flet ((agent-column (agent label)
@@ -1393,8 +1409,15 @@ Model controls are also available when the agent panels are hidden."
                 (gtk:box :orientation :vertical :spacing 4
                          (gtk:box :spacing 6
                                   (gtk:label :label (agent-name agent) :css-classes (list "caption-heading" (agent-css-class agent)))
-                                  (make-agent-activity-label (agent-pane-of agent)))
-                         (view-only :conversation label)
+                                  label
+                                  (view-only :conversation
+                                             (make-workflow-activity-pill agent "WORKFLOW-STATUS-PILL")))
+                         (let ((doing (make-agent-activity-label (agent-pane-of agent))))
+                           ;; The strip already supplies the surrounding margins.
+                           (gtk:widget-set-margin-start doing 0)
+                           (gtk:widget-set-margin-end doing 0)
+                           (gtk:widget-set-margin-bottom doing 0)
+                           doing)
                          (let ((controls (wrapping-controls models efforts)))
                            ;; Lined up with the agent's name, as the strip has its own margins.
                            (gtk:widget-set-margin-start controls 0)
