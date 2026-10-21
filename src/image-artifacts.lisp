@@ -38,11 +38,12 @@
   "Local image artifact formats, independent of agent attachment restrictions.
 The UI can offer opening a file even when its thumbnail decoder lacks support.")
 
-(defun resolve-image-artifact (reference directory)
+(defun resolve-image-artifact (reference directory &key (extensions *image-artifact-extensions*))
   "Resolve a local image reference against DIRECTORY, or return NIL.
 Only file URIs with an empty or localhost authority are local. Plain paths
 are tried literally before decoding URL escapes. Prefix relative names containing
 an apparent URI scheme (such as screens:home.png) with ./ to make them paths.
+EXTENSIONS restricts file types; NIL accepts any file for ordinary local links.
 Actual image decoding remains the responsibility of the UI."
   (ignore-errors
     (unless (or (stringp reference) (pathnamep reference))
@@ -76,9 +77,27 @@ Actual image decoding remains the responsibility of the UI."
                                              (merge-pathnames parsed (uiop:ensure-directory-pathname directory)))))
                           (existing (and absolute (probe-file absolute))))
                      (and existing (not (uiop:directory-pathname-p existing))
-                          (member (pathname-type existing) *image-artifact-extensions*
-                                  :test #'string-equal)
+                          (or (null extensions)
+                              (member (pathname-type existing) extensions :test #'string-equal))
                           existing)))))
         (if file-uri
             (resolve (image-artifact-decode path))
             (or (resolve path) (resolve (image-artifact-decode path))))))))
+
+(defun visualization-link (payload directory)
+  "Decode a directive body into (caption URI), or a readable fallback caption.
+Never evaluate HTML or launch anything while rendering."
+  (let* ((separator (position (code-char #xE202) payload))
+         (name (subseq payload 0 separator)))
+    (if (and separator (string= name "visualize"))
+        (handler-case
+            (multiple-value-bind (object end) (read-json payload :start (1+ separator))
+              (let* ((reference (jget object "path"))
+                     (path (and (stringp reference)
+                                (every (lambda (c) (find c '(#\Space #\Tab #\Newline #\Return)))
+                                       (subseq payload end))
+                                (resolve-image-artifact reference directory :extensions '("html" "htm")))))
+                (if path (list "Open mockup" (image-artifact-uri path))
+                    (list "Mockup (not found)"))))
+          (error () (list "Mockup (invalid directive)")))
+        (list (format nil "Unsupported artifact: ~a" name)))))

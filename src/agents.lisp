@@ -405,6 +405,8 @@ they may ask you to implement something, to review ~a's work, or to address its 
 When you review, inspect the files themselves (and `git diff` if the directory is a git repository) ~
 rather than trusting a summary, and don't change files unless asked to. When you implement, finish your ~
 reply with a short summary of what you changed and in which files, since that summary is what ~a sees. ~
+This client does not render inline visualizations. Link generated HTML files with Markdown ~
+using absolute file:// URLs instead of visualization tokens, including in handoffs. ~
 Running a command may need the user's approval; if one is denied, carry on without it and say so.~
 ~@[~%~%The project's notes for coding agents, from its `~a` (written for ~a, but they apply to you too):~
 ~%~%~a~]"

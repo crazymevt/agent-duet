@@ -184,6 +184,11 @@ otherwise its description and where it was expected."
                             (write-string open out) (mapc #'walk children) (write-string close out)))
                      (case kind
                        ((:text :escape) (write-string (escape (subseq text cs ce)) out))
+                       (:directive
+                        (destructuring-bind (caption &optional uri)
+                            (visualization-link (subseq text cs ce) (or *image-directory* *directory*))
+                          (if uri (format out "<a href=\"~a\">~a</a>" (escape uri) (escape caption))
+                              (write-string (escape caption) out))))
                        (:code (format out "<tt>~a</tt>" (escape (code-span-text text cs ce))))
                        (:strong (wrap "<b>" "</b>"))
                        (:emphasis (wrap "<i>" "</i>"))
@@ -255,6 +260,23 @@ though labels show it. Text in markup is escaped, so each < starts a tag."
                (setf i (1+ end)))
           finally (write-string markup out :start i))))
 
+(defun activate-prose-link (widget uri)
+  "Handle bare absolute file paths; let GTK launch ordinary URI links."
+  (when (and (plusp (length uri)) (char= (char uri 0) #\/))
+    (let ((path (resolve-image-artifact uri nil :extensions nil)))
+      ;; A click on an agent-supplied path must not run scripts. Check both
+      ;; the link's name and its resolved target, including all execute bits.
+      (when (and path
+                 (ignore-errors
+                   (and (not (some (lambda (name)
+                                     (member (pathname-type name)
+                                             '("command" "tool" "sh" "app" "terminal")
+                                             :test #'equalp))
+                                   (list (uiop:parse-native-namestring uri) path)))
+                        (zerop (logand #o111 (sb-posix:stat-mode (sb-posix:stat path)))))))
+        (open-image-artifact path widget)))
+    t))
+
 (defun prose-label (text)
   "A label showing TEXT's prose, or nil when only shown images were in it."
   (let ((markup (prose-markup text)))
@@ -265,13 +287,14 @@ though labels show it. Text in markup is escaped, so each < starts a tag."
         (if (ignore-errors (pango:parse-markup (markup-without-links markup) -1 0) t)
             (gtk:label-set-markup label markup)
             (gtk:label-set-text label text))
+        (gobject:connect label :activate-link #'activate-prose-link)
         label))))
 
 (defun normalize-image-lines (text)
-  "Keep wrapped image syntax together for both prose and thumbnail parsing."
+  "Keep wrapped images and artifact directives together while rendering prose."
   (let ((result (copy-seq text)))
     (labels ((walk (node)
-               (if (eq (first node) :image)
+               (if (member (first node) '(:image :directive))
                    (loop for i from (second node) below (third node)
                          when (char= (char result i) #\Newline)
                            do (setf (char result i) #\Space))
@@ -951,6 +974,7 @@ Finished text, a new turn and clearing the pane explicitly discard that pending 
             (agent-pane-stream-label pane) label
             (agent-pane-stream-text pane) "")))
   (setf (agent-pane-stream-text pane) (concatenate 'string (agent-pane-stream-text pane) text))
+  ;; Streaming intentionally stays literal; completed replies decode directives.
   (gtk:label-set-text (agent-pane-stream-label pane) (agent-pane-stream-text pane))
   (when (agent-pane-conversation-label pane)
     (setf (agent-pane-conversation-placeholder-p pane) nil)

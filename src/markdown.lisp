@@ -5,6 +5,7 @@
 ;;; Nodes: (kind start end content-start content-end children . more)
 ;;;   :text :escape :code :strong :emphasis :strike :autolink
 ;;;   :link and :image, whose MORE is (url-start url-end url)
+;;;   :directive, whose content is a PUA-delimited artifact directive body
 
 (defun md-punctuation-p (c) (and (graphic-char-p c) (not (alphanumericp c)) (char/= c #\Space)))
 
@@ -102,6 +103,13 @@
         (loop while (< i end)
               do (let ((c (char string i)))
                    (cond
+                    ;; Codex artifact directives: U+E200 name U+E202 JSON U+E201.
+                    ((char= c (code-char #xE200))
+                     (let ((close (position (code-char #xE201) string :start (1+ i) :end end)))
+                       (if close
+                           (progn (flush i)
+                             (emit (list :directive i (1+ close) (1+ i) close nil) (1+ close)))
+                           (incf i))))
                     ;; \* is a literal *
                     ((and (char= c #\\) (< (1+ i) end) (md-punctuation-p (char string (1+ i))))
                           (flush i)
