@@ -1,8 +1,8 @@
-;;;; ui.lisp — three panes: Claude, the conversation between them, ChatGPT
+;;;; ui.lisp — a shared conversation with live agent panels
 ;;;;
-;;;; The side panes show everything each agent does: the prompts it gets, its
+;;;; The agent panels show everything each agent does: the prompts it gets, its
 ;;;; replies as they stream, its tool calls. Each has its own box for talking
-;;;; to that agent alone. The middle pane is the conversation between them:
+;;;; to that agent alone. The shared pane is the conversation between them:
 ;;;; the user's request and each finished reply passed from one to the other.
 ;;;; Its box starts a workflow (workflow.lisp) with the chosen mode and lead.
 
@@ -161,7 +161,7 @@
   status input send)
 
 (defun make-message-list ()
-  (let* ((messages (make-instance 'gtk:box :orientation :vertical :spacing 10
+  (let* ((messages (make-instance 'gtk:box :orientation :vertical :spacing 14
                                   :margin-start 12 :margin-end 12 :margin-top 8 :margin-bottom 8))
          (scroller (make-instance 'gtk:scrolled-window :child messages :vexpand t :hexpand t
                                   :hscrollbar-policy :never)))
@@ -454,9 +454,13 @@ for Codex, the one marked as the default)."
                                    (gtk:button :label "New" :css-classes '("flat")
                                                :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
                                                :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
+                          (let ((label (make-instance 'gtk:label :xalign 0.0 :wrap t
+                                                       :margin-start 12 :margin-end 12 :css-classes '("caption"))))
+                            (setf (getf *controls* (agent-setting-key agent "WORKFLOW-ACTIVITY")) label)
+                            label)
                           (wrapping-controls models efforts)
                           (gtk:separator)
-                          scroller
+                          (make-transcript agent scroller)
                           (gtk:separator)
                           (let ((box (gtk:build
                                       (gtk:box :orientation :vertical
@@ -572,6 +576,7 @@ for Codex, the one marked as the default)."
 (defun pane-approval (pane id title text)
   "The approval card, in the agent's pane and, for the conversation-only
 view, in the conversation; either answers it, and both show the answer."
+  (reveal-agent-transcript pane)
   (let ((agent (agent-pane-agent pane)))
     (flet ((card ()
              (let ((buttons (approval-buttons agent id)))
@@ -592,12 +597,9 @@ view, in the conversation; either answers it, and both show the answer."
       (when (workflow-running-p)
         (pane-append *middle*
                      (view-only :panes
-                                (pane-note-label (format nil "~a is waiting for you to approve a command (~a pane)."
-                                                         (agent-name agent) (agent-side agent))
+                                (pane-note-label (format nil "~a is waiting for you to approve a command in its transcript."
+                                                         (agent-name agent))
                                                  "warning" "duet-note")))))))
-
-(defun agent-side (agent)
-  (if (eq (agent-id agent) :claude) "left" "right"))
 
 (defun question-choices (question)
   "Widgets for one of AskUserQuestion's QUESTIONS, and a function giving the
@@ -685,6 +687,7 @@ answer settles it, wherever it was given."
     card))
 
 (defun pane-question (pane id questions)
+  (reveal-agent-transcript pane)
   (let ((agent (agent-pane-agent pane)))
     (pane-finish-stream pane)
     (pane-append pane (question-card pane id questions))
@@ -694,8 +697,8 @@ answer settles it, wherever it was given."
     (when (workflow-running-p)
       (pane-append *middle*
                    (view-only :panes
-                              (pane-note-label (format nil "~a is waiting for you to answer a question (~a pane)."
-                                                       (agent-name agent) (agent-side agent))
+                              (pane-note-label (format nil "~a is waiting for you to answer a question in its transcript."
+                                                       (agent-name agent))
                                                "warning" "duet-note"))))))
 
 (defun pane-approval-answered (pane id decision)
@@ -991,7 +994,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
           "Start new conversations with both agents" #'new-duet-conversation)
     (gtk:box-append box (make-instance 'gtk:separator))
     (gtk:box-append box (make-instance 'gtk:label :label (format nil "Earlier in ~a" (folder-label *directory*))
-                                       :xalign 0.0 :margin-start 6 :ellipsize :start :max-width-chars 50
+                                       :xalign 0.0 :margin-start 6 :ellipsize :start :max-width-chars 24
                                        :css-classes '("caption-heading" "dim-label")))
     (let ((summaries (list-histories :directory *directory* :limit 30)))
       (unless summaries
@@ -1003,7 +1006,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
           (item (gtk:build
                  (gtk:box :orientation :vertical
                           (gtk:label :label (format nil "~:[~;• ~]~a" (and *history* (equal id (history-id *history*))) title)
-                                     :xalign 0.0 :ellipsize :end :max-width-chars 50)
+                                     :xalign 0.0 :ellipsize :end :max-width-chars 24)
                           (gtk:label :label (format nil "~a  ·  ~d entries" (format-history-time (getf summary :updated))
                                                     (getf summary :entry-count))
                                      :xalign 0.0 :css-classes '("caption" "dim-label"))))
@@ -1066,55 +1069,30 @@ comes without one (a turn stopped as the folder changes) isn't kept."
             (pane-append *checklist* box)
             ;; One live notice per loop; replacements and replay stay quiet.
             (when (and notify (not (gtk:widget-get-visible (control :checklist-panel))))
-              (pane-note *middle* "Checklist updated. Open Checklist to see the tasks' progress and findings."
+              (pane-note *middle* "Checklist updated. Open Workspace › Checklist to see the tasks' progress and findings."
                          "dim-label" "duet-note")))))))
 
 (defun set-checklist-visible (visible)
-  "Show the checklist temporarily, restoring the conversation dividers on close."
+  "Keep the checklist at a useful width, preserving the wide conversation layout."
   (let ((panel (control :checklist-panel))
-        (content (control :checklist-split))
-        (visible (if visible t nil)))
-    (when (and panel content
-               (not (eql visible (gtk:widget-get-visible panel))))
-      (let* ((width (gtk:widget-get-width content))
-             (agent-split (control :agent-split))
-             (conversation-split (control :conversation-split))
-             (saved (control :pre-checklist-positions))
-             ;; Keep the user's checklist width when reopening the panel.
-             (panel-width (if (gtk:widget-get-visible panel)
-                              (max 260 (gtk:widget-get-width panel))
-                              (- width (gtk:paned-get-position content))))
-             (available (if visible (- width (max 260 panel-width)) width)))
-        (when visible
-          (setf (getf *controls* :pre-checklist-positions)
-                (list (gtk:paned-get-position agent-split)
-                      (gtk:paned-get-position conversation-split))))
-        ;; Explicit positions must survive the allocation caused by this toggle.
-        ;; Restore proportional resizing after that frame's layout and paint,
-        ;; so window resizing and manual checklist drags still share the width.
-        (let ((clock (gtk:widget-get-frame-clock content))
-              (handler nil))
-          (when clock
-            (dolist (split (list agent-split conversation-split))
-              (gtk:paned-set-resize-start-child split nil))
-            (setf handler
-                  (gobject:connect clock :after-paint
-                    (lambda (clock)
-                      (gobject:disconnect clock handler)
-                      (dolist (split (list agent-split conversation-split))
-                        (gtk:paned-set-resize-start-child split t)))))))
-        (gtk:widget-set-visible panel visible)
-        (when (plusp available)
-          (when visible (gtk:paned-set-position content available))
-          ;; A window that starts with the checklist open has no saved layout.
-          (gtk:paned-set-position agent-split
-                                  (if (and (not visible) saved)
-                                      (first saved) (round (* available 0.30))))
-          (gtk:paned-set-position conversation-split
-                                  (if (and (not visible) saved)
-                                      (second saved) (round (* available 0.42)))))
-        (unless visible
-          (remf *controls* :pre-checklist-positions))))))
+        (content (control :checklist-split)))
+    (when (and panel content (not (eql (not (null visible)) (gtk:widget-get-visible panel))))
+      (when visible
+        (remember-layout)
+        (setf (getf *controls* :pre-checklist-positions)
+              (unless (control :narrow-layout)
+                (list (gtk:paned-get-position (control :agent-split))
+                      (gtk:paned-get-position (control :conversation-split))))))
+      (unless visible
+        (setf (getf *controls* :restore-checklist-positions)
+              (control :pre-checklist-positions)))
+      (when (gtk:widget-get-visible panel)
+        (setf (getf *controls* :checklist-width) (gtk:widget-get-width panel)))
+      (gtk:widget-set-visible panel (not (null visible)))
+      (when visible
+        (gtk:paned-set-position content
+                                (max 1 (- (gtk:widget-get-width content)
+                                          (max 260 (or (control :checklist-width) 300)))))))))
 
 (defun make-checklist-panel ()
   (multiple-value-bind (messages scroller) (make-message-list)
@@ -1128,7 +1106,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                            (gtk:separator)
                            scroller))))
       (setf (getf *controls* :checklist-panel) panel)
-      (gtk:widget-set-visible panel (setting :checklist-visible t))
+      (gtk:widget-set-visible panel (setting :checklist-visible nil))
       panel)))
 
 (defun middle-check (text)
@@ -1200,8 +1178,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun update-controls ()
   (when *controls*
     (let ((running (workflow-running-p)))
-      (gtk:button-set-label (control :send) (if running "Stop" "Start"))
-      (gtk:widget-set-css-classes (control :send) (if running '("destructive-action") '("suggested-action")))
+      (gtk:button-set-label (control :send) "Start collaboration")
+      (gtk:widget-set-sensitive (control :send) (not running))
+      (when (control :stop)
+        (gtk:widget-set-visible (control :stop) running))
       (dolist (name '(:mode :lead :rounds :check :folder :permission :review-target :review-base :review-branch :review-count :review-agents))
         (gtk:widget-set-sensitive (control name) (not running)))
       ;; Only the modes that make a plan wait for one.
@@ -1226,89 +1206,105 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                                                '("waiting")))))))
     (refresh-activity)))
 
-;;; The view: all three panes, or the conversation alone
+;;; Conversation with a sidebar, the original three panes, or conversation alone
 
-(defvar *view* :panes
-  ":panes shows each agent's pane beside the conversation; :conversation
+(defvar *view* :sidebar
+  ":sidebar places stacked agents to the right; :panes retains the original layout.
+:conversation
 shows the conversation alone, with the agents' approvals and questions in it,
 and a line saying what each is doing.")
 
-(defparameter *views* '((:panes "All panes") (:conversation "Conversation only")))
+(defparameter *views* '((:sidebar "Conversation + agents") (:panes "Three panes") (:conversation "Conversation only")))
 
 (defvar *view-only* '() "(widget . view)s: shown only in that view.")
+
+(defun visible-in-view-p (only view)
+  (or (eq only view) (and (eq only :panes) (eq view :sidebar))))
 
 (defun view-only (view widget)
   "Show WIDGET only in VIEW. Returns WIDGET."
   ;; Widgets gone from their pane (a new conversation) are forgotten.
   (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
   (push (cons widget view) *view-only*)
-  (gtk:widget-set-visible widget (eq view *view*))
+  (gtk:widget-set-visible widget (visible-in-view-p view *view*))
   widget)
 
-(defun set-view (view)
-  "Show VIEW (see *VIEW*), and remember it."
-  (let ((view (if (assoc view *views*) view :panes))
+(defun remember-layout ()
+  "Remember divider positions for the current layout, independently of other views."
+  (when (and (control :agent-split) (not (control :narrow-layout)) (not (eq *view* :conversation)))
+    (setf (setting (if (eq *view* :sidebar) :sidebar-positions :pane-positions))
+          (list (gtk:paned-get-position (control :agent-split))
+                (gtk:paned-get-position (control :conversation-split))))))
+
+(defun arrange-conversation (view)
+  "Reuse the live widgets: changing layout never restarts an agent or a stream."
+  (let ((outer (control :agent-split))
+        (inner (control :conversation-split))
+        (middle (control :middle-widget))
         (claude (control :claude-widget))
-        (codex (control :codex-widget))
-        (agent-split (control :agent-split))
-        (conversation-split (control :conversation-split)))
-    (setf (setting :view) view)
+        (codex (control :codex-widget)))
+    (when outer
+      (setf (getf *controls* :narrow-layout) nil)
+      (gtk:orientable-set-orientation outer :horizontal)
+      ;; The retained three-pane layout must respect each pane's minimum
+      ;; size; otherwise dragging a divider can hide approvals and questions.
+      (dolist (split (list outer inner))
+        (gtk:paned-set-shrink-start-child split nil)
+        (gtk:paned-set-shrink-end-child split nil))
+      ;; Detach before reparenting; the Lisp widget references keep them alive.
+      (gtk:paned-set-start-child outer nil)
+      (gtk:paned-set-end-child outer nil)
+      (gtk:paned-set-start-child inner nil)
+      (gtk:paned-set-end-child inner nil)
+      (gtk:orientable-set-orientation inner (if (eq view :panes) :horizontal :vertical))
+      (gtk:widget-set-visible claude (not (eq view :conversation)))
+      (gtk:widget-set-visible codex (not (eq view :conversation)))
+      (if (eq view :panes)
+          (progn
+            (gtk:paned-set-start-child inner middle)
+            (gtk:paned-set-end-child inner codex)
+            (gtk:paned-set-start-child outer claude)
+            (gtk:paned-set-end-child outer inner))
+          (progn
+            (gtk:paned-set-start-child inner claude)
+            (gtk:paned-set-end-child inner codex)
+            (gtk:paned-set-start-child outer middle)
+            (unless (eq view :conversation) (gtk:paned-set-end-child outer inner))))
+      (unless (eq view :conversation)
+        (let* ((saved (layout-positions view))
+               (width (let ((width (gtk:widget-get-width outer))) (if (plusp width) width 1440))))
+          (gtk:paned-set-position outer (or (first saved) (round (* width (if (eq view :sidebar) 0.66 0.30)))))
+          (gtk:paned-set-position inner (or (second saved) (if (eq view :sidebar) 360 470))))))))
+
+(defun set-view (view)
+  "Show VIEW and persist the layout and its divider positions."
+  (let ((view (if (assoc view *views*) view :sidebar)))
     (unless (eq view *view*)
-      (when (and agent-split (eq view :conversation))
-        ;; Where the dividers were, to put them back.
-        (setf (getf *controls* :pre-view-positions)
-              (list (gtk:paned-get-position agent-split) (gtk:paned-get-position conversation-split))))
+      (remember-layout)
       (setf *view* view)
-      (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
-      (loop for (widget . only) in *view-only*
-            do (gtk:widget-set-visible widget (eq only view)))
-      (when claude
-        (gtk:widget-set-visible claude (eq view :panes))
-        (gtk:widget-set-visible codex (eq view :panes))
-        (when (eq view :panes)
-          (let ((saved (control :pre-view-positions))
-                (width (gtk:widget-get-width agent-split)))
-            (cond (saved
-                   (gtk:paned-set-position agent-split (first saved))
-                   (gtk:paned-set-position conversation-split (second saved)))
-                  ;; Started in the conversation-only view: no layout yet.
-                  ((plusp width)
-                   (gtk:paned-set-position agent-split (round (* width 0.30)))
-                   (gtk:paned-set-position conversation-split (round (* width 0.42))))))
-          (remf *controls* :pre-view-positions)))
-      (let ((strip (control :activity)))
-        (when strip (gtk:widget-set-visible strip (eq view :conversation))))
-      (refresh-activity))))
+      (arrange-conversation view))
+    (setf (setting :view) view)
+    (setf *view-only* (remove-if-not #'gtk:widget-get-parent *view-only* :key #'car))
+    (loop for (widget . only) in *view-only*
+          do (gtk:widget-set-visible widget (visible-in-view-p only view)))
+    (when (control :activity)
+      (gtk:widget-set-visible (control :activity) (eq view :conversation)))
+    (refresh-activity)))
 
 (defun agent-activity (agent)
-  "What AGENT is doing, in a few words, for the conversation-only view:
-its part in the task (working, reviewing, waiting…), or its own status."
-  (let* ((pane (agent-pane-of agent))
-         (workflow (and (workflow-agent-p *workflow* agent) *workflow*))
-         (loops (and workflow (workflow-loops workflow))))
-    (flet ((in (role state)
-             (find-if (lambda (l) (and (eq (loop-state l) state) (eq (funcall role l) agent))) loops)))
-      (let ((working (in #'loop-author :working))
-            (usage (usage-summary (agent-usage-windows agent))))
-        (cond ((not workflow) (gtk:label-get-text (pane-status pane)))
-              ((find agent (workflow-paused workflow) :key #'step-agent)
-               (format nil "Paused: ~a" (step-reason-text (step-reason (find agent (workflow-paused workflow)
-                                                                             :key #'step-agent)))))
-              ;; Usage left, as the agent's pane shows it, after its part in the task.
-              (t (format nil "~a~@[ · ~a left~]"
-                         (cond ((plusp (hash-table-count (agent-pane-approvals pane))) "Waiting for you")
-                               ((in #'loop-reviewer :reviewing) "Reviewing")
-                               (working (if (plusp (loop-round working)) "Addressing the review" "Working"))
-                               ((in #'loop-author :checking) "Running the check")
-                               ((agent-busy agent) (if loops "Working" "Planning"))
-                               ((workflow-pending-plan workflow) "Waiting for you to approve the plan")
-                               (t (let ((other (other-agent workflow agent)))
-                                    (if (agent-busy other) (format nil "Waiting for ~a" (agent-name other)) "Waiting"))))
-                         (and (not (agent-out-of-usage-p agent)) (not (eq (agent-out-until agent) :unknown))
-                              usage))))))))
+  "The same workflow state as the agent panel, with remaining usage."
+  (when (or (null *workflow*) (not (workflow-agent-member-p *workflow* agent)))
+    (return-from agent-activity (gtk:label-get-text (pane-status (agent-pane-of agent)))))
+  (let* ((presentation (workflow-agent-presentation *workflow* agent))
+         (usage (usage-summary (agent-usage-windows agent))))
+    (format nil "~a~@[ · ~a~]~@[ · ~a left~]"
+            (getf presentation :label) (getf presentation :detail)
+            (and (not (agent-out-of-usage-p agent))
+                 (not (eq (agent-out-until agent) :unknown)) usage))))
 
 (defun refresh-activity ()
   "Bring the conversation-only view's status line up to date."
+  (refresh-workflow-presentation)
   (when (and (eq *view* :conversation) (control :claude-activity) *panes*)
     (loop for (agent . name) in (list (cons *claude* :claude-activity) (cons *codex* :codex-activity))
           for label = (control name)
@@ -1610,9 +1606,16 @@ history, saved at once, so a restart finds where the task had got to."
           (pane-note *middle* (format nil "The task's progress couldn't be saved for recovery: ~a" e) "error"))))))
 
 (defun workflow-callbacks ()
-  "The callbacks every workflow gets, new or restored."
-  (list :on-message #'middle-message :on-pause #'show-paused-step :on-plan #'show-plan-card
-        :on-finish #'workflow-finished :on-checkpoint #'save-workflow-checkpoint))
+  "Keep presentation current after every workflow callback, new or restored."
+  (flet ((present-after (callback)
+           (lambda (&rest arguments)
+             (multiple-value-prog1 (apply callback arguments)
+               (refresh-activity)))))
+    (list :on-message (present-after #'middle-message)
+          :on-pause (present-after #'show-paused-step)
+          :on-plan (present-after #'show-plan-card)
+          :on-finish (present-after #'workflow-finished)
+          :on-checkpoint (present-after #'save-workflow-checkpoint))))
 
 (defun restore-history-workflow (history)
   "HISTORY's task, restored with this app's agents: lead first, as saved.
@@ -2483,7 +2486,9 @@ and summary, with Changes and, when the work can be committed, Commit changes."
   (multiple-value-bind (messages scroller) (make-message-list)
     (let* ((status (make-instance 'gtk:label :xalign 1.0 :hexpand t :ellipsize :end :css-classes '("dim-label")))
            (input (make-input))
-           (send (make-instance 'gtk:button :label "Start" :valign :end :css-classes '("suggested-action")))
+           (send (make-instance 'gtk:button :label "Start collaboration" :valign :end :css-classes '("suggested-action")))
+           (stop (make-instance 'gtk:button :label "Stop collaboration" :valign :end :visible nil
+                                :css-classes '("destructive-action")))
            (mode (gtk:drop-down-new-from-strings '("Write & review" "Split the work" "Compare proposals" "Review only")))
            (review-target (gtk:drop-down-new-from-strings '("Uncommitted changes" "Branch (merge base)" "Branch (compare tips)" "Last N commits")))
            (review-base (make-instance 'gtk:entry :text "HEAD" :placeholder-text "Base branch" :width-chars 10))
@@ -2501,11 +2506,23 @@ and summary, with Changes and, when the work can be committed, Commit changes."
       (gtk:widget-set-tooltip-text review-base "Base for branch review (HEAD by default)")
       (gtk:widget-set-tooltip-text review-count "Number of commits for Last N commits")
       (setf *middle* (make-pane :messages messages :scroller scroller :status status :input input :send send))
-      (gtk:spin-button-set-value rounds (coerce *default-max-rounds* 'double-float))
+      (gtk:drop-down-set-selected mode (saved-choice-index :workflow-mode 4))
+      (gtk:drop-down-set-selected lead (saved-choice-index :workflow-lead 2))
+      (let ((saved (setting :workflow-rounds *default-max-rounds*)))
+        (gtk:spin-button-set-value rounds (coerce (if (and (integerp saved) (<= 1 saved 10))
+                                                                     saved *default-max-rounds*) 'double-float)))
+      (gobject:connect lead "notify::selected"
+                       (lambda (widget spec) (declare (ignore spec))
+                         (setf (setting :workflow-lead) (gtk:drop-down-get-selected widget))))
+      (gobject:connect rounds :value-changed
+                       (lambda (widget) (setf (setting :workflow-rounds) (gtk:spin-button-get-value-as-int widget))))
       (gtk:widget-set-tooltip-text mode "Write & review: the lead does the work and the other reviews it, back and forth until approved. Split the work: the lead divides the task, both work at once, then each reviews the other's part. Compare proposals: both propose an approach on their own, the lead reconciles them into a plan, and then the work is split. Review only: selected agents inspect existing changes with enforced read-only access; Fix these starts a writing task.")
       (gtk:widget-set-tooltip-text approve-plan "Wait for you to look over (and edit) the plan before any work starts")
       (gobject:connect review-target "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
-      (gobject:connect mode "notify::selected" (lambda (d pspec) (declare (ignore d pspec)) (update-controls)))
+      (gobject:connect mode "notify::selected"
+                       (lambda (d pspec) (declare (ignore pspec))
+                         (setf (setting :workflow-mode) (gtk:drop-down-get-selected d))
+                         (update-controls)))
       (gobject:connect approve-plan :toggled
                        (lambda (b) (setf (setting :approve-plan) (gtk:check-button-get-active b))))
       (gtk:widget-set-tooltip-text worktrees "Each agent does its part in its own git worktree, in a new conversation; then the parts are committed and merged into the current branch. Both final replies are combined and reviewed with any file changes. Worktrees and recovery refs are kept until approval. Needs a git repository with nothing uncommitted.")
@@ -2519,33 +2536,43 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                      (setf (folder-check-command *directory*) (gtk:editable-get-text e)))))
       (gtk:widget-set-tooltip-text input "Drop files here to put their paths in the request")
       (on-file-drop input (lambda (paths) (insert-paths input paths)))
-      (setf *controls* (list* :input input :send send :mode mode :lead lead :rounds rounds :check check
+      (setf *controls* (list* :input input :send send :stop stop :mode mode :lead lead :rounds rounds :check check
                               :approve-plan approve-plan :worktrees worktrees
                               :review-options review-options :review-target review-target :review-base review-base
                               :review-branch review-branch :review-count review-count :review-agents review-agents *controls*))
-      (gobject:connect send :clicked (lambda (b) (declare (ignore b)) (start-request)))
+      (gobject:connect send :clicked (lambda (b) (declare (ignore b))
+                                      (unless (workflow-running-p) (start-request))))
+      (gobject:connect stop :clicked (lambda (b) (declare (ignore b))
+                                      (when (workflow-running-p) (stop-workflow *workflow*))))
+      (gtk:widget-set-size-request input -1 100)
       (on-return input (lambda () (unless (workflow-running-p) (start-request))))
-      (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; each side shows that agent's own work in full.~%~%Return starts; Shift+Return starts a new line."))
+      (pane-note *middle* (format nil "Describe what you want done. The agents pass work and reviews back and forth here; the agent panels show their full transcripts.~%~%Return starts; Shift+Return starts a new line."))
       (gtk:build
        (gtk:box :orientation :vertical :css-classes '("duet-pane" "duet-middle")
                 (gtk:box :spacing 8 :margin-start 12 :margin-end 12 :margin-top 6 :margin-bottom 6
                          (gtk:label :label "Conversation" :css-classes '("heading"))
                          status)
+                (let ((progress (make-instance 'gtk:label :xalign 0.0 :wrap t
+                                                :margin-start 12 :margin-end 12 :margin-bottom 6)))
+                  (setf (getf *controls* :progress) progress)
+                  progress)
+                (make-progress-details)
                 (make-activity-strip)
                 (gtk:separator)
                 scroller
                 (gtk:separator)
-                (wrapping-controls
-                 mode lead
+                (wrapping-controls mode lead
+                 (gtk:build (gtk:box :spacing 6 (gtk:label :label "Rounds") rounds)))
+                (make-workflow-settings
                  (gtk:build
-                  (gtk:box :spacing 6
-                           (gtk:label :label "Rounds" :css-classes '("dim-label")) rounds))
-                 approve-plan worktrees
-                 (gtk:build
-                  (gtk:box :spacing 6
-                           (gtk:label :label "Check" :css-classes '("dim-label")) check)))
-                review-options
-                (composer input send))))))
+                  (gtk:box :orientation :vertical :spacing 8
+                           (wrapping-controls approve-plan worktrees)
+                           (wrapping-controls (make-instance 'gtk:label :label "Check command") check)
+                           review-options)))
+                (gtk:label :label "Task for both agents" :xalign 0.0
+                           :margin-start 12 :margin-top 8 :css-classes '("caption-heading"))
+                (composer input (gtk:build (gtk:box :orientation :vertical :spacing 8 :valign :end send stop))))))))
+
 
 ;;; The folder, what the agents may do, and the look
 
@@ -2656,72 +2683,76 @@ and summary, with Changes and, when the work can be committed, Commit changes."
 
 (defun make-header ()
   (let* ((header (make-instance 'gtk:header-bar))
-         (folder-label (make-instance 'gtk:label :ellipsize :start :max-width-chars 50))
+         (folder-label (make-instance 'gtk:label :ellipsize :start :max-width-chars 24))
          (folder (make-instance 'gtk:menu-button
-                                :child (gtk:build
-                                        (gtk:box :spacing 6
-                                                 (gtk:label :label "Folder:" :css-classes '("dim-label"))
-                                                 folder-label
-                                                 (gtk:label :label "▾" :css-classes '("dim-label"))))))
+                                :child (gtk:build (gtk:box :spacing 6 folder-label (gtk:label :label "▾")))))
          (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
-         (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*))))
+         (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*)))
+         (view (gtk:drop-down-new-from-strings (mapcar #'second *views*)))
+         (tools (make-instance 'gtk:menu-button :label "Workspace"))
+         (box (make-instance 'gtk:box :orientation :vertical :spacing 10
+                             :margin-start 12 :margin-end 12 :margin-top 12 :margin-bottom 12))
+         (popover (make-instance 'gtk:popover :child box)))
+    (gtk:widget-set-tooltip-text folder "Choose a workspace folder or reopen a recent folder")
+    (gtk:menu-button-set-popover tools popover)
+    (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
+    (flet ((row (label widget)
+             (gtk:box-append box
+                             (gtk:build (gtk:box :spacing 8
+                                                 (gtk:label :label label :xalign 0.0 :hexpand t) widget))))
+           (action (label callback)
+             (let ((button (make-instance 'gtk:button :label label)))
+               (gobject:connect button :clicked
+                                (lambda (b) (declare (ignore b))
+                                  (gtk:popover-popdown popover) (funcall callback)))
+               (gtk:box-append box button))))
+      (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
+                                     :tooltip-text "Show or hide the terminal (Ctrl+`)"))
+            (checklist (make-instance 'gtk:check-button :label "Checklist"
+                                      :active (setting :checklist-visible nil)))
+            (notes (make-instance 'gtk:check-button :label "Share project instructions" :active *shared-notes*
+                                  :tooltip-text "Give each agent the other agent's project instructions too.")))
+        (setf (getf *controls* :terminal) terminal)
+        (gobject:connect terminal :toggled
+                         (lambda (b) (set-terminal-visible (gtk:toggle-button-get-active b))))
+        (gobject:connect checklist :toggled
+                         (lambda (b)
+                           (let ((visible (gtk:check-button-get-active b)))
+                             (setf (setting :checklist-visible) visible)
+                             (set-checklist-visible visible))))
+        (gobject:connect notes :toggled
+                         (lambda (b) (setf *shared-notes* (gtk:check-button-get-active b)
+                                           (setting :shared-notes) *shared-notes*)))
+        (gtk:box-append box terminal)
+        (action "Documents" #'show-documents)
+        (action "Changes" #'show-task-changes)
+        (gtk:box-append box checklist)
+        (gtk:box-append box (make-instance 'gtk:separator))
+        (row "Layout" view)
+        (row "Permissions" permission)
+        (row "Appearance" theme)
+        (gtk:box-append box notes)))
     (gtk:drop-down-set-selected permission (or (position *permission* *permission-choices* :key #'first) 0))
     (gtk:widget-set-tooltip-text permission
                                  (format nil "~{~a~^~%~%~}"
-                                         (mapcar (lambda (c) (format nil "~a: ~a" (second c) (third c)))
+                                         (mapcar (lambda (choice)
+                                                   (format nil "~a: ~a" (second choice) (third choice)))
                                                  *permission-choices*)))
     (gobject:connect permission "notify::selected"
-                     (lambda (d pspec) (declare (ignore pspec))
+                     (lambda (d spec) (declare (ignore spec))
                        (set-permission (first (nth (gtk:drop-down-get-selected d) *permission-choices*)))))
+    (gtk:widget-set-tooltip-text theme "Choose Dark, Light, or System appearance.")
     (gtk:drop-down-set-selected theme (or (position (setting :theme :dark) *themes* :key #'first) 0))
-    (gtk:widget-set-tooltip-text theme "Light or dark")
     (gobject:connect theme "notify::selected"
-                     (lambda (d pspec) (declare (ignore pspec))
+                     (lambda (d spec) (declare (ignore spec))
                        (apply-theme (first (nth (gtk:drop-down-get-selected d) *themes*)))))
-    (setf *controls* (list* :folder folder :folder-label folder-label :permission permission *controls*))
-    (let ((notes (make-instance 'gtk:check-button :label "Shared notes" :active *shared-notes*
-                                :tooltip-text "Give Claude the folder's AGENTS.md, and ChatGPT its CLAUDE.md, with their instructions (each reads its own already), so both follow the project's conventions. Read again in a new conversation.")))
-      (gobject:connect notes :toggled
-                       (lambda (b) (setf *shared-notes* (gtk:check-button-get-active b)
-                                         (setting :shared-notes) *shared-notes*)))
-      (gtk:header-bar-pack-end header notes))
+    (gtk:drop-down-set-selected view (or (position *view* *views* :key #'first) 0))
+    (gobject:connect view "notify::selected"
+                     (lambda (d spec) (declare (ignore spec))
+                       (set-view (first (nth (gtk:drop-down-get-selected d) *views*)))))
     (gtk:header-bar-pack-start header folder)
-    (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
-                                   :tooltip-text "Show or hide the terminal panel (Ctrl+`)"))
-          (documents (make-instance 'gtk:button :label "Documents"
-                                    :tooltip-text "Preview the folder's Markdown files"))
-          (changes (make-instance 'gtk:button :label "Changes"
-                                  :tooltip-text "What the latest task changed in the folder, file by file (a git repository's)")))
-      (gobject:connect terminal :toggled
-                       (lambda (b)
-                         (let ((active (gtk:toggle-button-get-active b)))
-                           (unless (eq active (terminal-visible-p))
-                             (set-terminal-visible active)))))
-      (gobject:connect documents :clicked (lambda (b) (declare (ignore b)) (show-documents)))
-      (gobject:connect changes :clicked (lambda (b) (declare (ignore b)) (show-task-changes)))
-      (setf *controls* (list* :terminal terminal *controls*))
-      (gtk:header-bar-pack-start header terminal)
-      (gtk:header-bar-pack-start header documents)
-      (gtk:header-bar-pack-start header changes)
-      (gtk:header-bar-pack-start header (make-history-button)))
-    (let ((checklist (make-instance 'gtk:toggle-button :label "Checklist"
-                                    :active (setting :checklist-visible t)
-                                    :tooltip-text "Show or hide the checklist of tasks and review findings on the right")))
-      (gobject:connect checklist :toggled
-                       (lambda (b)
-                         (let ((visible (gtk:toggle-button-get-active b)))
-                           (setf (setting :checklist-visible) visible)
-                           (set-checklist-visible visible))))
-      (gtk:header-bar-pack-start header checklist))
-    (let ((view (gtk:drop-down-new-from-strings (mapcar #'second *views*))))
-      (gtk:drop-down-set-selected view (or (position *view* *views* :key #'first) 0))
-      (gtk:widget-set-tooltip-text view "All panes: each agent's own pane beside the conversation. Conversation only: just the conversation, with the agents' approvals and questions in it and what each is doing.")
-      (gobject:connect view "notify::selected"
-                       (lambda (d pspec) (declare (ignore pspec))
-                         (set-view (first (nth (gtk:drop-down-get-selected d) *views*)))))
-      (gtk:header-bar-pack-start header view))
-    (gtk:header-bar-pack-end header theme)
-    (gtk:header-bar-pack-end header permission)
+    (gtk:header-bar-pack-start header (make-history-button))
+    (gtk:header-bar-pack-end header tools)
     header))
 
 ;;; Checking the CLIs
@@ -2793,16 +2824,17 @@ and summary, with Changes and, when the work can be committed, Commit changes."
     (".duet-pane" :background-color "@view_bg_color")
     (".duet-prompt" :background-color "alpha(@accent_bg_color, 0.18)" :border-radius "8px" :padding ("6px" "10px"))
     (".duet-code" :background-color "alpha(@view_fg_color, 0.07)" :border-radius "6px" :padding "6px")
-    (".duet-tool" :opacity "0.8")
+    (".duet-tool" :opacity "1.0")
     (".duet-approval" :background-color "alpha(@warning_bg_color, 0.22)" :border-radius "8px" :padding "10px"
      :border "1px solid alpha(@warning_color, 0.5)")
     (".duet-message" :border-radius "10px" :padding ("8px" "12px"))
     (".duet-from-user" :background-color "alpha(@accent_bg_color, 0.18)")
-    (".duet-from-claude" :background-color "alpha(#d97757, 0.16)" :margin-right "40px")
-    (".duet-from-codex" :background-color "alpha(#10a37f, 0.16)" :margin-left "40px")
-    (".duet-claude" :color "#e08a6a")
-    (".duet-codex" :color "#19b98f")
+    (".duet-from-claude" :background-color "alpha(#d97757, 0.16)" :margin-right "12px")
+    (".duet-from-codex" :background-color "alpha(#10a37f, 0.16)" :margin-left "12px")
+    (".duet-claude" :color "mix(@view_fg_color, #d97757, 0.55)")
+    (".duet-codex" :color "mix(@view_fg_color, #10a37f, 0.55)")
     (".duet-note" :font-size "smaller")
+    (".duet-stage" :background-color "alpha(@view_fg_color, 0.08)" :border-radius "8px" :padding "10px")
     (".duet-chip" :background-color "alpha(@view_fg_color, 0.08)" :border-radius "12px")
     (".duet-summary" :background-color "alpha(@success_bg_color, 0.14)" :border-radius "8px" :padding "10px"
      :border "1px solid alpha(@success_color, 0.45)")
@@ -2847,7 +2879,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
   (setf *controls* '()
         *permission* (or (setting :permission) :ask)
         *shared-notes* (setting :shared-notes t)
-        *view* (if (assoc (setting :view) *views*) (setting :view) :panes)
+        *view* (if (assoc (setting :view) *views*) (setting :view) :sidebar)
         *view-only* '())
   (let ((window (make-instance 'gtk:application-window
                                :application app :title "Agent Duet"
@@ -2865,10 +2897,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
         ;; actual minimum widths without forcing all options onto one row.
         (let* ((middle (make-middle-pane))
                (inner (make-instance 'gtk:paned :orientation :horizontal
-                                     :position (if (setting :checklist-visible t) 470 600)
+                                     :position (if (setting :checklist-visible nil) 470 600)
                                      :shrink-start-child nil :shrink-end-child nil))
                (outer (make-instance 'gtk:paned :orientation :horizontal
-                                     :position (if (setting :checklist-visible t) 336 420)
+                                     :position (if (setting :checklist-visible nil) 336 420)
                                      :shrink-start-child nil :shrink-end-child nil)))
           (gtk:paned-set-start-child inner middle)
           (gtk:paned-set-end-child inner codex-widget)
@@ -2881,11 +2913,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
             (setf (getf *controls* :checklist-split) content
                   (getf *controls* :agent-split) outer
                   (getf *controls* :conversation-split) inner
+                  (getf *controls* :middle-widget) middle
                   (getf *controls* :claude-widget) claude-widget
                   (getf *controls* :codex-widget) codex-widget)
-            (unless (eq *view* :panes)
-              (gtk:widget-set-visible claude-widget nil)
-              (gtk:widget-set-visible codex-widget nil))
+            (arrange-conversation *view*)
             (gtk:paned-set-start-child content outer)
             (gtk:paned-set-end-child content (make-checklist-panel))
             ;; The Terminal panel below the panes, hidden until asked for.
@@ -2918,6 +2949,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                      (lambda (w) (declare (ignore w))
                        ;; The last checkpoint saved stands: a task under way
                        ;; now is found interrupted when reopened.
+                       (remember-layout)
                        (setf *closing* t)
                        (dolist (agent (list *claude* *codex*))
                          (ignore-errors (agent-cancel agent))
@@ -2926,6 +2958,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                        (ignore-errors (kill-all-terminals))
                        (ignore-errors (close-documents))
                        nil))
+    (watch-conversation-allocation (control :agent-split))
     (gtk:window-present window)))
 
 (defun main (&optional directory)

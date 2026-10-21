@@ -1,0 +1,124 @@
+;;;; ui-presentation.lisp — presentation widgets; delivery stays in ui.lisp.
+(in-package #:agent-duet)
+
+(defun make-workflow-settings (child)
+  (let ((expander (make-instance 'gtk:expander :label "Workflow settings" :child child
+                                 :expanded (setting :workflow-settings-expanded nil)
+                                 :margin-start 12 :margin-end 12 :margin-top 4)))
+    (gobject:connect expander "notify::expanded"
+                     (lambda (widget spec) (declare (ignore spec))
+                       (setf (setting :workflow-settings-expanded) (gtk:expander-get-expanded widget))))
+    expander))
+
+(defun make-transcript (agent scroller)
+  (let* ((key (agent-setting-key agent "TRANSCRIPT-EXPANDED"))
+         (expander (make-instance 'gtk:expander :label "Transcript" :child scroller
+                                  :expanded (setting key t) :vexpand t)))
+    (setf (getf *controls* (agent-setting-key agent "TRANSCRIPT")) expander)
+    (gobject:connect expander "notify::expanded"
+                     (lambda (widget spec) (declare (ignore spec))
+                       (let ((expanded (gtk:expander-get-expanded widget)))
+                         (gtk:widget-set-vexpand widget expanded)
+                         (setf (setting key) expanded))))
+    (gtk:widget-set-vexpand expander (setting key t))
+    expander))
+
+(defun refresh-workflow-presentation ()
+  "Render the shared presentation model alongside CLI readiness and usage."
+  (let* ((presentation (workflow-progress-presentation *workflow*))
+           (stages (getf presentation :stages)))
+      (when (control :progress)
+        (gtk:label-set-text (control :progress)
+                            (format nil "~a~@[ · round ~d~]~@[ of ~d~]"
+                                    (getf presentation :label) (getf presentation :round)
+                                    (and (getf presentation :round) (getf presentation :max-rounds))))
+        (gtk:widget-set-tooltip-text
+         (control :progress)
+         (format nil "~{~a~^~%~}"
+                 (mapcar (lambda (stage)
+                           (format nil "~a: ~(~a~)" (getf stage :label) (getf stage :state))) stages))))
+      (when (and (control :progress-details) (not (equal presentation (control :last-progress))))
+        (setf (getf *controls* :last-progress) presentation)
+        (clear-box (control :progress-details))
+        (gtk:box-append (control :progress-details)
+                        (apply #'wrapping-controls (mapcar #'make-progress-stage stages)))))
+  (dolist (agent (list *claude* *codex*))
+      (let* ((pane (and agent (agent-pane-of agent)))
+             (label (and agent (control (agent-setting-key agent "WORKFLOW-ACTIVITY"))))
+             (presentation (and pane (workflow-agent-presentation *workflow* agent))))
+        (when label
+          (gtk:label-set-text label (getf presentation :label))
+          (gtk:widget-set-tooltip-text label (getf presentation :detail))
+          (gtk:widget-set-css-classes label (if (getf presentation :attention-p) '("caption" "warning") '("caption")))))))
+
+(defun adapt-conversation-width ()
+  "Stack the conversation above the agents when the sidebar would be too narrow."
+  (when (and *window* (control :agent-split) (eq *view* :sidebar))
+    (let* ((outer (control :agent-split))
+           (inner (control :conversation-split))
+           (width (gtk:widget-get-width outer))
+           (narrow (and (plusp width) (< width 940))))
+      (unless (or narrow (control :narrow-layout))
+        (setf (getf *controls* :last-wide-positions)
+              (list (gtk:paned-get-position outer) (gtk:paned-get-position inner))))
+      (unless (eql narrow (control :narrow-layout))
+        (when (and narrow (control :last-wide-positions))
+          (setf (setting :sidebar-positions) (control :last-wide-positions)))
+        (setf (getf *controls* :narrow-layout) narrow)
+        (gtk:orientable-set-orientation outer (if narrow :vertical :horizontal))
+        (gtk:orientable-set-orientation inner (if narrow :horizontal :vertical))
+        (if narrow
+            (progn
+              (gtk:paned-set-position outer (round (* (gtk:widget-get-height outer) 0.60)))
+              (gtk:paned-set-position inner (round (/ width 2))))
+            (let ((saved (layout-positions :sidebar)))
+              (gtk:paned-set-position outer (or (first saved) (round (* width 0.66))))
+              (gtk:paned-set-position inner (or (second saved) 360))))))))
+
+(defun reveal-agent-transcript (pane)
+  "An approval or question should never arrive behind a collapsed transcript."
+  (let ((expander (control (agent-setting-key (agent-pane-agent pane) "TRANSCRIPT"))))
+    (when expander (gtk:expander-set-expanded expander t))))
+
+(defun make-progress-details ()
+  (let ((box (make-instance 'gtk:box :orientation :vertical :spacing 6)))
+    (setf (getf *controls* :progress-details) box)
+    (make-instance 'gtk:expander :label "Workflow progress" :child box
+                   :margin-start 12 :margin-end 12 :margin-bottom 6)))
+
+(defun make-progress-stage (stage)
+  "Independent cards also describe concurrent parts without implying an order."
+  (make-instance 'gtk:label :xalign 0.0 :wrap t :max-width-chars 34
+                 :label (format nil "~a · ~(~a~)~@[~%~a~]"
+                                (getf stage :label) (getf stage :state) (getf stage :detail))
+                 :css-classes (if (or (getf stage :attention-p) (eq (getf stage :state) :error))
+                                  '("duet-stage" "warning") '("duet-stage"))))
+
+(defun watch-conversation-allocation (widget)
+  "Observe rendered allocations without scheduling frames or polling timers."
+  (dolist (split (list widget (control :conversation-split)))
+    (gobject:connect split "notify::position"
+      (lambda (split spec)
+        (declare (ignore split spec))
+        (when (and (eq *view* :sidebar) (not (control :narrow-layout))
+                   (>= (gtk:widget-get-width widget) 940))
+          (setf (getf *controls* :last-wide-positions)
+                (list (gtk:paned-get-position widget)
+                      (gtk:paned-get-position (control :conversation-split))))))))
+  (gobject:connect widget :realize
+    (lambda (widget)
+      (let ((size nil))
+        (gobject:connect (gtk:widget-get-frame-clock widget) :after-paint
+          (lambda (clock)
+            (declare (ignore clock))
+            (unless *closing*
+              (let ((current (list (gtk:widget-get-width widget)
+                                   (gtk:widget-get-height widget) *view*)))
+                (unless (equal size current)
+                  (setf size current)
+                  (adapt-conversation-width)
+                  (let ((saved (control :restore-checklist-positions)))
+                    (when (and saved (not (control :narrow-layout)))
+                      (remf *controls* :restore-checklist-positions)
+                      (gtk:paned-set-position widget (first saved))
+                      (gtk:paned-set-position (control :conversation-split) (second saved)))))))))))))

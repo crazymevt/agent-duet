@@ -65,3 +65,16 @@
       (setf (setting :check-commands)
             (if (plusp (length command)) (acons path command others) others)))
     command))
+
+(defun layout-positions (view)
+  "Validated divider positions for VIEW; ignore malformed or old preferences."
+  (let ((positions (setting (if (eq view :sidebar) :sidebar-positions :pane-positions))))
+    (ignore-errors
+      (when (and (listp positions) (= (length positions) 2)
+                 (every (lambda (n) (and (integerp n) (<= 0 n 100000))) positions))
+        positions))))
+
+(defun saved-choice-index (key count)
+  "Return a valid dropdown index, tolerating obsolete or malformed settings."
+  (let ((index (setting key 0)))
+    (if (and (integerp index) (<= 0 index) (< index count)) index 0)))

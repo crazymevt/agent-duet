@@ -23,7 +23,8 @@
                (:file "read-only")
                (:file "agents")
                (:file "check")
-               (:file "workflow")))
+               (:file "workflow")
+               (:file "workflow-presentation")))
 
 (defsystem "agent-duet"
   :description "Agent Duet: Claude and ChatGPT (Codex) side by side, writing and reviewing each other's code."
@@ -34,6 +35,7 @@
   :pathname "src/"
   :serial t
   :components ((:file "ui")
+               (:file "ui-presentation")
                (:file "terminal")
                (:file "preview")
                (:file "changes")
@@ -55,5 +57,6 @@
                              (:file "prompts")
                              (:file "worktree")
                              (:file "snapshot")
-                             (:file "read-only"))))
+                             (:file "read-only")
+                             (:file "workflow-presentation"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))

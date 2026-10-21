@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- A redesigned window: the shared conversation is the large pane on the
+  left, with both agents' panels stacked in a resizable sidebar on the
+  right; the three-column layout is still available, and the layout is
+  remembered. Transcripts expand, the shared composer is larger ("Task for
+  both agents"), and the mode, lead and round controls are compact, with
+  the workflow settings expandable. *Start collaboration* starts a task;
+  Stop stays within reach while it runs. Mode, lead, and rounds are remembered.
+- Header tools and appearance, layout, and permission controls are grouped
+  in the Workspace menu. The checklist starts hidden; progress notices point
+  to Workspace › Checklist. Opening it reserves a resizable width, and the
+  conversation adapts to the space left. All layouts protect pane minimum
+  sizes; responsive sidebar changes follow rendered allocations without a
+  polling timer. Conversation-only status retains CLI readiness and direct
+  message activity.
+- Each agent's panel says what it is doing in the task (planning, working,
+  reviewing, fixing, running the check, waiting, paused, out of usage) and
+  marks what needs you: a plan to approve, a question, a pause. A progress
+  strip shows the task's stages; a split plan's parts show side by side,
+  each with its own round, rather than as one line. A plan shows as approved
+  only once you've approved it, and a check is never shown as passed.
+
 ## 1.1.0 - 2026-10-20
 
 - Split plans can be ordered: the lead says whether the parts go on at the
