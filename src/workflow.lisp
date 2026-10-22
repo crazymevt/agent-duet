@@ -92,6 +92,10 @@
    (mode :initarg :mode :initform :review :reader workflow-mode)
    (lead :initarg :lead :reader workflow-lead)
    (partner :initarg :partner :reader workflow-partner)
+   (contract-revision :initform 1 :accessor workflow-contract-revision)
+   (contract-directions :initform nil :accessor workflow-contract-directions)
+   (contract-context :initform nil :accessor workflow-contract-context
+                     :documentation "Transient (agent conversation brief) entries; restart sends full briefs")
    (request :initarg :request :reader workflow-request)
    (max-rounds :initarg :max-rounds :initform *default-max-rounds* :accessor workflow-max-rounds)
    (on-message :initarg :on-message :initform nil :accessor workflow-on-message)
@@ -144,6 +148,8 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   author reviewer
   task                                  ; what the author was asked to do
   label                                 ; how to name it in notes: nil, or "Claude's part"
+  (handoff-advisory nil)               ; latest gaps, for change detection
+  (handoff-notice nil)                 ; only changed gaps go to the next review
   (summary "")                          ; the author's latest report
   (review-history nil)                 ; (reviewer conversation) from its last reply
   (work-history nil)                    ; (author conversation) from its last report
@@ -167,7 +173,7 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   "A prompt given to an agent for the workflow, kept so it can be given
 again, or to the other agent, after the first ran out of usage."
   (id (make-uuid))
-  (generation 0) (state :new) reason progress
+  (generation 0) (state :new) reason progress contract-revision
   agent prompt original-prompt then target confirming (check-fixes 0) repositories repository-capture
   role                                  ; :propose, :plan, :replan, :work, :review, :resolve or :check
   loop)                                 ; the review loop it belongs to (not for :plan)
@@ -197,14 +203,86 @@ preserve the step for explicit recovery (PAUSE-STEP)."
   '(:prompt-characters :elapsed-seconds :duration-ms :cost-usd :input-tokens :output-tokens
     :cache-read-tokens :cache-write-tokens :reasoning-tokens :total-tokens))
 
+(defun record-task-direction (workflow text)
+  "Keep direction addressed to both task agents, once per composer submission."
+  (setf (workflow-contract-directions workflow)
+        (append (workflow-contract-directions workflow) (list text)))
+  (incf (workflow-contract-revision workflow))
+  (checkpoint-changed workflow))
+
+(defun task-contract (workflow)
+  "A shared brief from authoritative inputs, without inventing requirements."
+  (with-output-to-string (out)
+    (format out "SHARED TASK CONTRACT — revision ~d~%Goal, acceptance criteria, scope and interfaces are those in the request and subsequent user direction. Do not invent missing requirements.~%Use the original request supplied in the step or conversation; it is not repeated here.~%"
+            (workflow-contract-revision workflow))
+    (dolist (direction (workflow-contract-directions workflow))
+      (format out "~%Subsequent user direction (later direction takes precedence):~%~a~%" direction))
+    (dolist (part (workflow-loops workflow))
+      (format out "~%Assignment for ~a (reviewer: ~a):~%~a~%"
+              (agent-name (loop-author part)) (agent-name (loop-reviewer part))
+              (if (equal (loop-task part) (workflow-request workflow))
+                  "The overall request." (loop-task part))))
+    (format out "~%Reconsider earlier decisions affected by later direction. Report any conflict between an assignment and the current direction.")))
+
+(defun handoff-field (text name)
+  "Read an optional plain NAME: value line, without imposing a reply grammar."
+  (loop for line in (uiop:split-string text :separator '(#\Newline))
+        for clean = (string-trim '(#\Space #\Tab #\Return) line)
+        for colon = (position #\: clean)
+        when (and colon (string-equal name (subseq clean 0 colon)))
+          return (blank-to-nil (subseq clean (1+ colon)))))
+
+(defun handoff-advisory (workflow step text)
+  "Flag reported evidence gaps, never reject a reply or decide its verdict."
+  (let* ((reported (handoff-field text "TASK REVISION"))
+         (revision (and reported (ignore-errors (parse-integer reported))))
+         (gaps (append
+                (unless (eql revision (step-contract-revision step))
+                  (list (format nil "task revision missing or different (expected ~d)" (step-contract-revision step))))
+                (unless (handoff-field text "DECISIONS") (list "decisions not reported"))
+                (unless (handoff-field text "VERIFICATION") (list "verification not reported"))
+                (when (< (step-contract-revision step) (workflow-contract-revision workflow))
+                  (list "task direction changed during this turn; check the result against the current contract")))))
+    (when gaps
+      (format nil "Handoff advisory (reported fields only; no verdict): ~{~a~^; ~}." gaps))))
+
+(defun review-handoff-report (loop)
+  (format nil "~a~@[~%~%~a~]" (loop-summary loop) (loop-handoff-notice loop)))
+
 (defun workflow-agent-submit (workflow step agent prompt callback)
   ;; Persist an unknown entry before dispatch: a crash must not make a
   ;; partially measured task look complete. Retries can publish more than once.
-  (let ((pending (make-uuid)))
+  (setf (step-contract-revision step) (workflow-contract-revision workflow))
+  (let* ((pending (make-uuid))
+         (brief (task-contract workflow))
+         (handle (agent-conversation-handle agent))
+         (seen (assoc agent (workflow-contract-context workflow)))
+         (instructions
+           (when (eq (step-role step) :work)
+             (format nil "In your handoff, include plain lines TASK REVISION: ~d, DECISIONS: <choices and reasons, or NONE>, and VERIFICATION: <checks and results, or NOT RUN with reason>. Keep the substantive answer and existing handoff details. Missing fields produce advisory flags only."
+                     (step-contract-revision step))))
+         (full (format nil "~a~@[~%~%~a~]~%~%~a" brief instructions prompt))
+         (prompt
+           (if (and handle (equal handle (second seen)) (equal brief (third seen)))
+               (let ((compact (format nil "Shared task contract revision ~d is unchanged.~@[~%~%~a~]~%~%~a"
+                                      (workflow-contract-revision workflow) instructions prompt)))
+                 ;; Flatten older compact work/review fallbacks before adding
+                 ;; this one, so losing a session restores both contexts.
+                 (remember-context-fallback agent compact (prompt-without-history agent full))
+                 compact)
+               full)))
     (push (list :id pending :agent (agent-id agent) :role (step-role step) :metrics (list :prompt-characters (length prompt)))
           (workflow-metrics workflow))
     (checkpoint-changed workflow)
-    (agent-submit agent prompt callback nil
+    (agent-submit agent prompt
+                  (lambda (text error)
+                    ;; The first turn creates its conversation. Cache the
+                    ;; resulting handle before a continuation dispatches turn 2.
+                    (setf (workflow-contract-context workflow)
+                          (let ((others (remove agent (workflow-contract-context workflow) :key #'car)))
+                            (if error others
+                                (cons (list agent (agent-conversation-handle agent) brief) others))))
+                    (when callback (funcall callback text error))) nil
                   (lambda (id metrics)
                     (unless (find id (workflow-metrics workflow) :key (lambda (m) (getf m :id)) :test #'equal)
                       (setf (workflow-metrics workflow)
@@ -310,6 +388,14 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                             (pause-step workflow step))
                           (progn
                             (setf (step-state step) :completed (step-progress step) text)
+                            (when (and (eq (step-role step) :work) (step-loop step))
+                              (let* ((part (step-loop step))
+                                     (advisory (handoff-advisory workflow step text)))
+                                (setf (loop-handoff-notice part)
+                                      (unless (equal advisory (loop-handoff-advisory part)) advisory)
+                                      (loop-handoff-advisory part) advisory)
+                                (when (loop-handoff-notice part)
+                                  (note workflow "~a" (loop-handoff-notice part)))))
                             ;; Refresh restart state before the continuation can
                             ;; start another turn or pause. Its newer capture wins.
                             (refresh-recovery-baseline workflow nil)
@@ -571,7 +657,7 @@ Write FINDINGS: NONE if there are none.~%~%~
 End your reply with one line on its own, exactly one of:~%~
 VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
-            author (loop-task loop) author (loop-summary loop)
+            author (loop-task loop) author (review-handoff-report loop)
             (let ((tree (and (loop-tree loop) (worktree-note loop))))
               (if (loop-check-report loop)
                   (format nil "~a~a~%~%" (or tree "") (loop-check-report loop))
@@ -594,7 +680,7 @@ Repeat each finding with its updated status: [fixed] if dealt with, [dismissed] 
 Be brief; put the substance in the FINDINGS lines.~%~
 FINDINGS:~%- F~d [open] `path/to/file:line` Issue and remedy~%~
 Or FINDINGS: NONE. End with exactly VERDICT: APPROVED or VERDICT: CHANGES REQUESTED on its own line."
-                        (agent-name (loop-author loop)) (loop-summary loop)
+                        (agent-name (loop-author loop)) (review-handoff-report loop)
                         (if (loop-tree loop) (worktree-note loop) "")
                         (loop-check-report loop) (findings-lines (loop-findings loop))
                         (next-finding-id (loop-findings loop)))))
@@ -1266,11 +1352,13 @@ why it couldn't start in that order: then nothing has started."
     (cond ((null partner-task)
            (when approved (note workflow (if edited "You edited the plan." "You approved the plan.")))
            (note workflow "~a is doing it alone; ~a will review." (agent-name lead) (agent-name partner))
+           (incf (workflow-contract-revision workflow))
            (run-loop workflow (make-review-loop :author lead :reviewer partner :task (if edited lead-task request))
                      (lead-alone-prompt partner lead-task edited)))
           ((null lead-task)
            (when approved (note workflow (if edited "You edited the plan." "You approved the plan.")))
            (note workflow "~a is doing it alone; ~a will review." (agent-name partner) (agent-name lead))
+           (incf (workflow-contract-revision workflow))
            (run-loop workflow (make-review-loop :author partner :reviewer lead :task partner-task)
                      (partner-task-prompt lead request nil partner-task)))
           (t
@@ -1297,6 +1385,9 @@ why it couldn't start in that order: then nothing has started."
              (when (workflow-worktrees-p workflow)
                (setf (loop-tree mine) (cdr (assoc lead (workflow-trees workflow)))
                      (loop-tree theirs) (cdr (assoc partner (workflow-trees workflow)))))
+             ;; Dependency validation and worktree creation have succeeded.
+             ;; Dispatch must see the new revision; refused starts never do.
+             (incf (workflow-contract-revision workflow))
              (let ((starts
                      (if (workflow-worktrees-p workflow)
                          (list (cons mine (worktree-part-prompt partner request lead-task partner-task (loop-tree mine)))
@@ -2320,7 +2411,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
         "prompt" (step-prompt step) "original-prompt" (step-original-prompt step)
         "repositories" (captured-recovery-repositories (step-repository-capture step) (step-repositories step))
         "target" (step-target step) "confirming" (step-confirming step) "check-fixes" (step-check-fixes step)
-        "role" (step-role step)
+        "role" (step-role step) "contract-revision" (step-contract-revision step)
         "loop" (position (step-loop step) (workflow-loops workflow))
         "state" (step-state step) "reason" (step-reason step)
         "progress" (or (step-progress step)
@@ -2347,6 +2438,8 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                                                  append (list (string-downcase key)
                                                                               (getf (getf record :metrics) key))))))
                                    (workflow-metrics workflow)) 'vector)
+          "contract-revision" (workflow-contract-revision workflow)
+          "contract-directions" (coerce (workflow-contract-directions workflow) 'vector)
           "request" (workflow-request workflow) "max-rounds" (workflow-max-rounds workflow)
           "check-command" (workflow-check-command workflow)
           "review-target" (workflow-review-target workflow) "review-base" (workflow-review-base workflow)
@@ -2395,6 +2488,8 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                    (coerce (mapcar (lambda (entry) (jobj "loop" (position (car entry) (workflow-loops workflow))
                                                                          "revision" (cdr entry)))
                                                    (loop-prerequisite-revisions l)) 'vector)
+                                   "handoff-advisory" (loop-handoff-advisory l)
+                                   "handoff-notice" (loop-handoff-notice l)
                                    "task" (loop-task l) "label" (loop-label l) "summary" (loop-summary l)
                                    "last-review" (loop-last-review l) "state" (loop-state l) "round" (loop-round l)
                                    "tree" (and (loop-tree l) (namestring (loop-tree l)))
@@ -2458,6 +2553,8 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                  :review-agents (recovery-keyword (jget checkpoint "review-agents") :both)
                                  :on-message on-message :on-finish on-finish :on-pause on-pause :on-plan on-plan
                                  :on-checkpoint on-checkpoint)))
+    (setf (workflow-contract-revision workflow) (or (jget checkpoint "contract-revision") 1)
+          (workflow-contract-directions workflow) (jlist (jget checkpoint "contract-directions")))
     (labels ((agent-for (id)
                (or (find (recovery-keyword id) (list lead partner) :key #'agent-id)
                    (error "Unknown checkpoint agent ~a" id)))
@@ -2518,6 +2615,8 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                       (make-review-loop
                        :author (agent-for (jget data "author")) :reviewer (agent-for (jget data "reviewer"))
                        :task (jget data "task") :label (recovery-null (jget data "label"))
+                       :handoff-advisory (recovery-null (jget data "handoff-advisory"))
+                       :handoff-notice (recovery-null (jget data "handoff-notice"))
                        :summary (or (recovery-null (jget data "summary")) "")
                        :last-review (recovery-null (jget data "last-review"))
                        :state (recovery-keyword (jget data "state") :paused) :round (or (jget data "round") 0)
@@ -2551,6 +2650,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
         (let* ((state (recovery-keyword (jget data "state")))
                (step (make-step :id (jget data "id") :agent (agent-for (jget data "agent"))
                                 :repositories (recovery-null (jget data "repositories"))
+                                :contract-revision (recovery-null (jget data "contract-revision"))
                                 :original-prompt (recovery-null (jget data "original-prompt"))
                                 :target (recovery-null (jget data "target"))
                                 :confirming (jtrue-p (jget data "confirming"))

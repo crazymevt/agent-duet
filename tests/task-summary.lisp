@@ -176,7 +176,7 @@
          (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Measure prompts"))
          (step (ai::make-step :agent author :role :work)))
     (ai::workflow-agent-submit workflow step author "12345" nil)
-    (is = 5 (second (assoc :prompt-characters
+    (is = (length (first (fake-prompts author))) (second (assoc :prompt-characters
                            (getf (first (ai::task-metric-totals workflow :work)) :values))))
     (is = 0 (getf (first (ai::task-metric-totals workflow :review)) :turns))
     (let* ((cp (ai::json-copy (ai:workflow-checkpoint workflow)))

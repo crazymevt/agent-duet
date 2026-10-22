@@ -20,6 +20,28 @@ sequence, see [the implementation plan](docs/implementation-plan.md).
 
 - [x] **Preserve split-task results and recovery refs:** Keep each part's written result (its final reply) for the merged-result review, naming parts that changed no files, so a text-only task still ends in a combined answer without needing a nonempty diff. Keep each part's committed state under `refs/agent-duet/tasks/<task>/<part>/{head,base}` (`retain-worktree`, `remove-worktree :recovery-task`), so its worktree and branch can go before the merged result is approved; delete the refs (`delete-worktree-recovery-refs`) only after approval.
 
+## Communication and efficiency follow-up
+
+- [x] **Shared task brief and handoff additions (first slice):** Workflow prompts
+  carry the request, current assignments, shared user direction and a revision.
+  Handoffs request revision, decisions/reasons and verification metadata, with
+  advisory evidence gaps that preserve replies and existing approval behavior.
+  State survives restart; goals and acceptance criteria stay in the request's
+  wording. Implemented for review.
+- [ ] **Questions between turns:** Queue and link partner questions/responses at
+  turn boundaries, distinguishing blocked work from work that can continue.
+  Mid-turn exchanges need separate turn, stall and recovery design.
+- [ ] **Shared evidence index:** Link discoveries, check results and artifacts to
+  the repository state they describe; retain independent reviewer verification.
+- [ ] **Per-task decision record:** Preserve reasons and rejected options, beyond
+  project conventions and recovery state; mark affected decisions stale on steering.
+- [ ] **Review convergence:** Distinguish blockers from optional suggestions and
+  escalate repeated unresolved disagreement. Finding IDs and carry-forward exist.
+- [ ] **Work allocation:** Include dependencies, interface uncertainty, integration
+  and review effort in deciding parallel versus sequential assignments.
+- [ ] **Efficiency feedback:** Extend metrics with blocked time, repeated checks,
+  recurring findings and integration rework, considered alongside defects.
+
 ## Next (agreed by Claude and ChatGPT)
 
 Review-only mode and restart recovery are complete. The task summary card is

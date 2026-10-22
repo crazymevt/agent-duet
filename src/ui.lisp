@@ -3051,7 +3051,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                 (unless targets
                   (pane-note *middle* "No task agents have a live turn. Your message is kept; send when an agent is working." "dim-label")
                   (return-from send-composer-message))
-                (setf pending (list :key key :remaining targets)
+                (setf pending (list :key key :remaining targets :contract-recorded nil)
                       (getf *controls* :composer-delivery) pending)))
             (handler-case
                 (progn
@@ -3062,9 +3062,15 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                     (when (and (eq recipient :both) (workflow-running-p) (not (agent-busy agent)))
                       (error "~a has no live turn. The remaining message is kept for retry." (agent-name agent)))
                     (agent-send-now agent (if (plusp (length text)) text "Take a look at these.") attachments)
-                    ;; Mark success before recording, so even a history error
-                    ;; cannot cause a successful recipient to receive a retry.
+                    ;; Mark delivery first: checkpoint/history errors must not
+                    ;; resend direction to an agent that already received it.
                     (pop (getf pending :remaining))
+                    ;; Keep shared direction once on partial delivery/retry.
+                    ;; Messages addressed to one agent stay private.
+                    (when (and (eq recipient :both) (workflow-running-p)
+                               (not (getf pending :contract-recorded)))
+                      (setf (getf pending :contract-recorded) t)
+                      (record-task-direction *workflow* (prompt-with-attachments text attachments)))
                     (let ((header (format nil "You → ~a" (agent-name agent)))
                           (body (prompt-with-attachments text attachments)))
                       (middle-bubble :user header body)

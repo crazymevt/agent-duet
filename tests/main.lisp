@@ -2228,7 +2228,7 @@ tests/fake-claude, its notes pushed onto NOTES."
                                   :replies (list (says *approve*))))
          (part (ai::make-review-loop :author author :reviewer reviewer :combined-result t
                                      :task "Combine both answers" :summary "Original combined answer"))
-         (workflow (make-instance 'ai:workflow :lead author :partner reviewer))
+         (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Combine both answers"))
          (token (list nil)))
     (setf (ai:workflow-loops workflow) (list part)
           (ai::workflow-state workflow) :running

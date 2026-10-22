@@ -411,3 +411,151 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
       (setf (ai:workflow-loops workflow) (list part))
       (true (search reply (ai::split-results-text workflow)))
       (false (directory (merge-pathnames "artifacts/*.txt" directory))))))
+
+(define-test shared-task-contract-and-recovery :parent agent-duet
+  (multiple-value-bind (workflow messages lead partner)
+      (run-fake :review (list (says "A useful substantive answer"))
+                (list (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    (declare (ignore messages))
+    ;; Missing metadata is visible to reviewers, without losing the answer
+    ;; or changing existing approval behavior.
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (true (search "A useful substantive answer" (first (fake-prompts partner))))
+    (true (search "verification not reported" (first (fake-prompts partner))))
+    (true (search "SHARED TASK CONTRACT" (first (fake-prompts lead))))
+    (ai::record-task-direction workflow "Preserve the public interface.")
+    (is = 2 (ai::workflow-contract-revision workflow))
+    (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (restored (ai:restore-workflow cp :lead lead :partner partner)))
+      (is string= (ai::task-contract workflow) (ai::task-contract restored))
+      (is string= (ai::loop-handoff-advisory (first (ai:workflow-loops workflow)))
+          (ai::loop-handoff-advisory (first (ai:workflow-loops restored)))))
+    ;; Old checkpoints default to revision 1 without inventing direction.
+    (let ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))))
+      (setf (cdr cp) (remove-if (lambda (entry) (member (car entry) '("contract-revision" "contract-directions") :test #'string=)) (cdr cp)))
+      (let ((restored (ai:restore-workflow cp :lead lead :partner partner)))
+        (is = 1 (ai::workflow-contract-revision restored))
+        (false (ai::workflow-contract-directions restored))))))
+
+(define-test handoff-evidence-advisories :parent agent-duet
+  (let* ((lead (make-instance 'fake-agent :id :claude :name "Claude"))
+         (partner (make-instance 'fake-agent :id :codex :name "ChatGPT"))
+         (workflow (make-instance 'ai:workflow :lead lead :partner partner :request "Keep API compatibility"))
+         (step (ai::make-step :agent lead :role :work :contract-revision 1))
+         (report (format nil "The full answer.~%TASK REVISION: 1~%DECISIONS: Keep the API to preserve callers.~%VERIFICATION: NOT RUN because this is a design task.")))
+    (false (ai::handoff-advisory workflow step report))
+    (true (search "verification not reported"
+                  (ai::handoff-advisory workflow step (format nil "TASK REVISION: 1~%DECISIONS: NONE~%VERIFICATION: "))))
+    (true (search "task revision missing or different"
+                  (ai::handoff-advisory workflow step (format nil "TASK REVISION: nonsense~%DECISIONS: NONE~%VERIFICATION: passed"))))
+    (ai::record-task-direction workflow "Use the new API instead.")
+    (true (search "direction changed during this turn" (ai::handoff-advisory workflow step report)))
+    (let ((loop (ai::make-review-loop :author lead :reviewer partner :task "Implement API")))
+      (setf (ai:workflow-loops workflow) (list loop))
+      (true (search "Assignment for Claude (reviewer: ChatGPT)" (ai::task-contract workflow)))
+      (true (search "Use the new API instead." (ai::task-contract workflow))))))
+
+
+(define-test task-contract-context-and-retry :parent agent-duet
+  (let* ((lead (make-instance 'fake-agent :id :claude :name "Claude"
+                              :replies (loop repeat 7 collect (says "Done"))))
+         (partner (make-instance 'fake-agent :id :codex :name "ChatGPT"))
+         (workflow (make-instance 'ai:workflow :lead lead :partner partner :request "Preserve API compatibility"))
+         (step (ai::make-step :agent lead :role :work)))
+    (ai::workflow-agent-submit workflow step lead "Implement" nil)
+    (true (search "SHARED TASK CONTRACT" (first (fake-prompts lead))))
+    (ai::workflow-agent-submit workflow step lead "Fix" nil)
+    (let ((compact (first (fake-prompts lead))))
+      (false (search "SHARED TASK CONTRACT" compact))
+      (true (search "SHARED TASK CONTRACT" (ai::prompt-without-history lead compact))))
+    ;; Nested compact review history must expand alongside the shared brief.
+    (ai::remember-context-fallback lead "Short review" "Full review assignment")
+    (ai::workflow-agent-submit workflow step lead "Short review" nil)
+    (let ((expanded (ai::prompt-without-history lead (first (fake-prompts lead)))))
+      (true (search "Full review assignment" expanded))
+      (true (search "SHARED TASK CONTRACT" expanded)))
+    (ai::record-task-direction workflow "Keep existing callers working.")
+    (ai::workflow-agent-submit workflow step lead "Continue" nil)
+    (true (search "Keep existing callers working." (first (fake-prompts lead))))
+    ;; A changed session cannot rely on its predecessor's contract.
+    (setf (fake-handle lead) "new-session")
+    (ai::workflow-agent-submit workflow step lead "Continue" nil)
+    (true (search "SHARED TASK CONTRACT" (first (fake-prompts lead))))
+    ;; Failed delivery/turns must not make a retry assume context was read.
+    (setf (fake-replies lead) (list (says '(:error "Disconnected")) (says "Recovered")))
+    (ai::workflow-agent-submit workflow step lead "Fail" nil)
+    (ai::workflow-agent-submit workflow step lead "Retry" nil)
+    (true (search "SHARED TASK CONTRACT" (first (fake-prompts lead))))))
+
+(define-test contract-preserves-step-format-and-request-size :parent agent-duet
+  (let* ((lead (make-instance 'fake-agent :id :claude :name "Claude"
+                              :replies (loop repeat 4 collect (says "Done"))))
+         (partner (make-instance 'fake-agent :id :codex :name "ChatGPT"))
+         (request (concatenate 'string "UNIQUE-LARGE-REQUEST" (make-string 20000 :initial-element #\x)))
+         (workflow (make-instance 'ai:workflow :lead lead :partner partner :request request))
+         (part (ai::make-review-loop :author lead :reviewer partner :task request))
+         (plan (ai::plan-prompt partner request))
+         (review (ai::full-review-prompt part)))
+    (setf (ai:workflow-loops workflow) (list part))
+    (false (search request (ai::task-contract workflow)))
+    (loop for role in '(:plan :review) for raw in (list plan review) do
+      (ai::workflow-agent-submit workflow (ai::make-step :agent lead :role role) lead raw nil)
+      (let ((actual (first (fake-prompts lead))))
+        ;; The step's own formatting instructions remain the exact suffix,
+        ;; on both the first full send and the next compact send.
+        (is string= raw (subseq actual (- (length actual) (length raw))))
+        (false (search request actual :start2 (1+ (search request actual))))
+        (true (< (- (length actual) (length raw)) 1000))))))
+
+(define-test contract-second-turn-after-session-creation :parent agent-duet
+  (let* ((lead (make-instance 'fake-agent :id :claude :name "Claude"
+                              :replies (list (says :hang) (says "Done"))))
+         (partner (make-instance 'fake-agent :id :codex :name "ChatGPT"))
+         (workflow (make-instance 'ai:workflow :lead lead :partner partner :request "Implement"))
+         (step (ai::make-step :agent lead :role :work)))
+    (setf (fake-handle lead) nil)
+    (ai::workflow-agent-submit workflow step lead "First" nil)
+    (true (search "SHARED TASK CONTRACT" (first (fake-prompts lead))))
+    ;; Simulate a CLI announcing its new session before successful completion.
+    (setf (fake-handle lead) "created-during-first-turn")
+    (ai:agent-turn-finished lead "Done" nil)
+    (ai::workflow-agent-submit workflow step lead "Second" nil)
+    (false (search "SHARED TASK CONTRACT" (first (fake-prompts lead))))
+    (true (search "revision 1 is unchanged" (first (fake-prompts lead))))))
+
+(define-test unchanged-handoff-gaps-are-not-repeated :parent agent-duet
+  (multiple-value-bind (workflow messages lead partner)
+      (run-fake :review (list (says "First") (says "Second") (says "Third"))
+                (list (says (format nil "FINDINGS: NONE~%VERDICT: CHANGES REQUESTED"))
+                      (says (format nil "FINDINGS: NONE~%VERDICT: CHANGES REQUESTED"))
+                      (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (is = 1 (count-if (lambda (m) (and (eq :note (second m)) (search "Handoff advisory" (third m)))) messages))
+    (is = 1 (count-if (lambda (prompt) (search "Handoff advisory" prompt)) (fake-prompts partner)))
+    (let* ((checkpoint (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (restored (ai:restore-workflow checkpoint :lead lead :partner partner)))
+      (false (ai::loop-handoff-notice (first (ai:workflow-loops restored))))
+      (true (ai::loop-handoff-advisory (first (ai:workflow-loops restored)))))))
+
+(define-test refused-plan-keeps-contract-revision :parent agent-duet
+  (let* ((lead (make-instance 'fake-agent :id :claude :name "Claude" :replies (list (says :hang))))
+         (partner (make-instance 'fake-agent :id :codex :name "ChatGPT" :replies (list (says :hang))))
+         (workflow (make-instance 'ai:workflow :lead lead :partner partner :request "Split" :worktrees t))
+         (original (symbol-function 'ai::open-worktrees)))
+    (setf (ai:workflow-state workflow) :running)
+    (true (ai::start-parts workflow "Lead part" "Partner part" :order :circular))
+    (is = 1 (ai::workflow-contract-revision workflow))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'ai::open-worktrees) (lambda (w) (declare (ignore w)) nil))
+           (ai::start-parts workflow "Lead part" "Partner part" :order :parallel)
+           (is = 1 (ai::workflow-contract-revision workflow))
+           (false (fake-prompts lead))
+           (false (fake-prompts partner)))
+      (setf (symbol-function 'ai::open-worktrees) original))
+    (let ((started (make-instance 'ai:workflow :lead lead :partner partner :request "Split")))
+      (setf (ai:workflow-state started) :running)
+      (ai::start-parts started "Lead part" "Partner part" :order :parallel)
+      (is = 2 (ai::workflow-contract-revision started))
+      (true (search "SHARED TASK CONTRACT — revision 2" (first (fake-prompts lead))))
+      (true (search "SHARED TASK CONTRACT — revision 2" (first (fake-prompts partner)))))))

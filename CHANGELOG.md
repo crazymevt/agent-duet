@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Workflow prompts share a revisioned task brief with the request, assignments,
+  and subsequent direction addressed to both agents. Shared direction survives
+  restart and is recorded once across partial-delivery retries. Work handoffs
+  request revision, decisions and verification metadata; missing evidence and
+  revision mismatches appear as advisory notes for reviewers without rejecting
+  replies or changing approval rules. Unchanged advisories are suppressed across
+  fix rounds. Briefs precede the step's reply-format instructions and reference
+  the original request without duplicating it; successful session creation enables
+  compact reminders on the second turn. Refused plan starts retain their revision.
+
 - Before writing tasks, dirty folders offer committing current changes,
   continuing with them, or cancelling. Approved tasks offer a file selection,
   all/task-changed presets, an editable suggested message, and a commit diff

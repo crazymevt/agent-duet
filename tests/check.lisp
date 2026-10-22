@@ -89,7 +89,9 @@
       (ai:start-workflow workflow)
       (is eq :finished (ai:workflow-state workflow))
       (let ((loop (first (ai:workflow-loops workflow))))
-        (is string= (ai::review-prompt loop) (first (fake-prompts reviewer)))
+        (let* ((expected (ai::review-prompt loop))
+               (actual (first (fake-prompts reviewer))))
+          (is string= expected (subseq actual (- (length actual) (length expected)))))
         (false (ai::loop-check-report loop))))))
 
 (define-test check-stopped :parent agent-duet

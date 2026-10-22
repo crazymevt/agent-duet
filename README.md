@@ -418,6 +418,31 @@ and so on). Prompt characters count the submitted workflow text, excluding
 conversation history, system instructions, attachments, and any full-context
 expansion after a failed resume; they are not token or billing estimates.
 
+Workflow prompts begin with a shared task contract: the revision, current
+assignments and reviewers, and subsequent composer direction addressed to both
+agents. It refers to the original request already supplied by the workflow;
+assignments identical to that request use a reference too. The step's own prompt
+and reply-format instructions come last. Goals, acceptance criteria, scope, and
+interfaces remain in the user's wording; missing requirements are not inferred.
+Successfully starting a split plan or recording
+shared direction advances the contract revision. Later turns, including an idle
+reviewer's next turn, receive that direction. Messages addressed to one agent are
+not added to the shared contract. Partial delivery and retry record shared direction
+once. The contract and its revision survive restart recovery. Unchanged briefs use a
+short revision reminder on the next turn after a successful turn in the same
+conversation; session resets, recovery and changed direction send the full brief,
+with full-context fallback on resume failure.
+
+Work handoffs additionally request plain `TASK REVISION:`, `DECISIONS:`, and
+`VERIFICATION:` lines. Decisions include reasons or `NONE`; verification includes
+results or `NOT RUN` with a reason. Missing/empty fields, a different revision,
+or direction changed during the turn produce advisory notes in the conversation
+and reviewer prompt only when the reported gaps change. Unchanged gaps are not
+repeated on fix rounds, and this suppression survives restart. These check reported
+metadata only, not the truth of a claim. They preserve the full reply and do not reject it, block checks, or determine
+approval. These additions do not provide a separate acceptance-criteria editor,
+a decision ledger, or agent questions between turns.
+
 Handoffs ask for a concise outcome, changed paths, verification and unresolved
 issues. These are advisory writing guidelines: replies are not rejected for
 missing fields. Correction prompts retain older open findings and omit an extra
