@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Sidebar file filters reuse rows, report truncated inventories, and attach
+  literal native paths. Tasks avoids a duplicate heading, and Changes refreshes
+  when a task starts or its final snapshot is recorded.
+
 - Find highlights the active text match in yellow even while the Find window
   has focus, and clears the highlight when the query changes or Find closes.
 

@@ -1575,17 +1575,17 @@ comes without one (a turn stopped as the folder changes) isn't kept."
               (or (saved-checklist-width) 300))
         (gtk:widget-queue-allocate content)))))
 
-(defun make-checklist-panel ()
+(defun make-checklist-panel (&key embedded)
   (multiple-value-bind (messages scroller) (make-message-list)
     (setf *checklist* (make-pane :messages messages :scroller scroller)
           *checklist-findings* nil)
     (clear-checklist)
     (let ((panel (gtk:build
                   (gtk:box :orientation :vertical :width-request 260
-                           (gtk:label :label "Tasks" :xalign 0.0
+                           (gtk:label :visible (not embedded) :label "Tasks" :xalign 0.0
                                       :margin-start 12 :margin-top 8 :margin-bottom 8
                                       :css-classes '("title-4"))
-                           (gtk:separator)
+                           (gtk:separator :visible (not embedded))
                            scroller))))
       (setf (getf *controls* :checklist-panel) panel)
       (gtk:widget-set-visible panel (setting :checklist-visible nil))
@@ -2740,6 +2740,7 @@ It may be stuck, or busy with something long, such as a command that prints noth
               (snapshot-failed why)
               (destructuring-bind (task problem previous-error repository-start) result
                 (setf *task-changes* task)
+                (refresh-workspace-sidebar)
                 (when previous-error (snapshot-failed previous-error))
                 (when problem (snapshot-failed problem))
                 (funcall ready repository-start))))))))
@@ -2747,6 +2748,8 @@ It may be stuck, or busy with something long, such as a command that prints noth
 (defun finish-task-end (task)
   "Record TASK's end if it's time; true while it's still waiting."
   (multiple-value-bind (result why) (finish-task-changes task)
+    (when (and result (eq task *task-changes*))
+      (refresh-workspace-sidebar))
     (when (eq result :failed)
       (snapshot-failed (format nil "~a. The task's changes can't be shown." why))))
   (eq (task-changes-final task) :pending))
