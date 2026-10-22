@@ -22,12 +22,12 @@ BUFFER needs the tags from ADD-DIFF-TAGS. DIFF may span several files."
                                             (iter-at buffer (+ offset (length line)))))
         (incf offset (1+ (length line)))))))
 
-(defun show-changes-window (directory start end &key (title "Task changes") on-close)
+(defun show-changes-window (directory start end &key (title "Task changes") on-close embedded)
   "Present a new, read-only window comparing START and END snapshots. Return its GTK window.
 END may instead be a function returning a snapshot, or nil and why. Git runs off the
 GTK thread: END and the file list load once the window is up, and each file's diff
 when it's first selected. ON-CLOSE, if given, is called with END's snapshot (or nil)
-once the window has closed."
+once the window has closed. With EMBEDDED, return the widget and a disposal function."
   (let* ((changes nil)
          (loaded nil)                   ; the file list is in
          (failure nil)                  ; why it couldn't be loaded
@@ -35,7 +35,9 @@ once the window has closed."
          (end-snapshot (unless (functionp end) end))
          (shown nil)
          (selected nil)                 ; the change whose diff is wanted
-         (window (make-instance 'gtk:window :title title :default-width 1100 :default-height 820))
+         (window (unless embedded (make-instance 'gtk:window :title title :default-width 1100 :default-height 820)))
+         (content nil)
+         (dispose nil)
          (filter (make-instance 'gtk:search-entry :placeholder-text "Filter changed files"
                                 :margin-start 8 :margin-end 8 :margin-top 8 :margin-bottom 8))
          (files (make-instance 'gtk:list-box :selection-mode :single :css-classes '("navigation-sidebar")))
@@ -88,19 +90,21 @@ once the window has closed."
       (gobject:connect files :row-selected
                        (lambda (list row) (declare (ignore list))
                          (when row (show-diff (nth (gtk:list-box-row-get-index row) shown)))))
-      (let ((paned (make-instance 'gtk:paned :orientation :horizontal :position 300
+      (let ((paned (make-instance 'gtk:paned :orientation (if embedded :vertical :horizontal) :position (if embedded 180 300)
                                   :shrink-start-child nil :shrink-end-child nil)))
         (gtk:paned-set-start-child paned
           (gtk:build (gtk:box :orientation :vertical filter
                              (gtk:scrolled-window :vexpand t :hscrollbar-policy :never :child files))))
         (gtk:paned-set-end-child paned
           (make-instance 'gtk:scrolled-window :vexpand t :hexpand t :child view))
-        (gtk:window-set-child window paned))
-      (gobject:connect window :close-request
-                       (lambda (w) (declare (ignore w))
-                         (setf closed t)
-                         (when (and on-close loaded) (funcall on-close end-snapshot))
-                         nil))
+        (setf content paned)
+        (when window (gtk:window-set-child window paned)))
+      (setf dispose (lambda ()
+                      (unless closed
+                        (setf closed t)
+                        (when (and on-close loaded) (funcall on-close end-snapshot)))))
+      (gobject:connect (or window content) (if embedded :unrealize :close-request)
+                       (lambda (w) (declare (ignore w)) (funcall dispose) nil))
       (refill)
       (sb-thread:make-thread
        (lambda ()
@@ -118,8 +122,8 @@ once the window has closed."
                           (when on-close (funcall on-close end-snapshot))
                           (refill))))))
        :name "changes list"))
-    (gtk:window-present window)
-    window))
+    (when window (gtk:window-present window))
+    (values (or window content) dispose)))
 
 (defun show-commit-preview (root &key start workflow (message "Commit current changes") opening-state on-committed on-continue)
   "Select whole files and review the exact prospective staged diff before committing."

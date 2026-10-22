@@ -580,6 +580,7 @@
 (format t "~&Conversation UI checks passed.~%")
 (load (merge-pathnames "test-layout-ui.lisp" *load-truename*))
 (load (merge-pathnames "test-shortcut-ui.lisp" *load-truename*))
+(load (merge-pathnames "test-sidebar-ui.lisp" *load-truename*))
 
 
 ;; Artifact directives use the actual private-use protocol delimiters.

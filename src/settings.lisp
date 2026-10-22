@@ -191,7 +191,7 @@ Sidebar and responsive layouts split the child space in half."
 
 (defparameter *panel-shortcuts*
   '((:agents-shortcut "Agents" "a")
-    (:checklist-shortcut "Checklist" "l")
+    (:checklist-shortcut "Sidebar" "l")
     (:terminal-shortcut "Terminal" "t")))
 
 (defun default-panel-shortcut (name)

@@ -3507,7 +3507,8 @@ this task's turns cheaper."
         (pane-note *middle* (format nil "Working in ~a" (namestring directory)) "dim-label" "duet-note"))
       (refresh-folder-menu)
       (refresh-check-command)
-      (documents-folder-changed))))
+      (documents-folder-changed)
+      (refresh-workspace-sidebar))))
 
 (defun refresh-check-command ()
   "Show the current folder's check command."
@@ -3584,7 +3585,7 @@ this task's turns cheaper."
 
 (defun update-shortcut-tooltips ()
   (dolist (spec '((:agent-toggle :agents-shortcut "Toggle agents")
-                  (:checklist-toggle :checklist-shortcut "Show or hide the checklist")
+                  (:checklist-toggle :checklist-shortcut "Show or hide the sidebar")
                   (:sidebar-toggle :checklist-shortcut "Toggle sidebar")
                   (:terminal :terminal-shortcut "Show or hide the terminal")
                   (:terminal-button :terminal-shortcut "Show or hide the terminal")))
@@ -3747,9 +3748,9 @@ this task's turns cheaper."
                (gtk:box-append box button))))
       (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
                                      :tooltip-text "Show or hide the terminal"))
-            (checklist (make-instance 'gtk:check-button :label "Checklist"
+            (checklist (make-instance 'gtk:check-button :label "Sidebar"
                                       :active (setting :checklist-visible nil)
-                                      :tooltip-text "Show or hide the checklist"))
+                                      :tooltip-text "Show or hide the sidebar"))
             (notes (make-instance 'gtk:check-button :label "Share project instructions" :active *shared-notes*
                                   :tooltip-text "Give each agent the other agent's project instructions too.")))
         (setf (getf *controls* :terminal) terminal
@@ -3985,7 +3986,7 @@ this task's turns cheaper."
                 (getf *controls* :codex-widget) codex-widget)
           (arrange-conversation *view*)
           (gtk:paned-set-start-child content outer)
-          (gtk:paned-set-end-child content (make-checklist-panel))
+          (gtk:paned-set-end-child content (make-workspace-sidebar))
           (when (setting :checklist-visible nil)
             (setf (getf *controls* :restore-checklist-width)
                   (or (saved-checklist-width) 300)))

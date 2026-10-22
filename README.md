@@ -71,8 +71,17 @@ Use **Cmd+Option** on macOS or **Ctrl+Alt** on Linux with these keys:
 | Key | Toggle |
 | --- | --- |
 | **A** | Agents (restores the last agent layout) |
-| **L** | Checklist |
+| **L** | Sidebar |
 | **T** | Terminal |
+
+The resizable sidebar has four tabs: **Tasks** keeps the task checklist;
+**Changes** shows the latest task's per-file snapshot diffs; **Files** lists
+project paths; **Artifacts** filters that inventory to documents, images and
+output formats, including files that already existed. Markdown files open in the document preview; other files open
+in your system's default app. The **+** beside a path attaches it to your next message. Use the path filter to find a file and **Refresh**
+to pick up edits. Tabs also refresh when selected or when you switch folders.
+The file inventory skips hidden and dependency/build folders and lists up to
+2,000 files, descending at most six folder levels.
 
 These shortcuts work from any pane, including the terminal. **Ctrl+`** also
 continues to toggle the terminal. On Linux, desktop shortcuts can take priority:

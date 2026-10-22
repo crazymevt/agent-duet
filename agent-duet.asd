@@ -43,6 +43,7 @@
                (:file "terminal")
                (:file "preview")
                (:file "changes")
+               (:file "sidebar")
                (:file "app"))
   :entry-point "agent-duet:main"
   :in-order-to ((test-op (test-op "agent-duet/tests"))))
