@@ -1135,3 +1135,42 @@
          (clear-pane-search-highlight)
          (assert (null (gtk:label-get-attributes second))))
     (clear-pane-search-highlight)))
+
+;; Startup snapshots must not execute repository I/O in the button callback.
+(let* ((*directory* #p"/tmp/") (*workflow* (list :starting))
+       (*task-changes* nil) (*request-preflight* nil)
+       (names '(in-background begin-task-changes repository-start-state))
+       (originals (mapcar #'symbol-function names))
+       (work nil) (done nil) (captured nil) (started nil))
+  (unwind-protect
+       (progn
+         (setf (symbol-function 'in-background)
+               (lambda (name worker callback)
+                 (declare (ignore name)) (setf work worker done callback))
+               (symbol-function 'begin-task-changes)
+               (lambda (workflow directory)
+                 (setf captured t)
+                 (%make-task-changes :workflow workflow :directory directory))
+               (symbol-function 'repository-start-state)
+               (lambda (&rest args) (declare (ignore args)) :baseline))
+         (snapshot-task-start *workflow* (lambda (state) (setf started state)))
+         (assert *request-preflight*)
+         (assert (not captured))
+         ;; Repeated Return must leave the pending startup alone.
+         (send-composer-message)
+         (assert (not captured))
+         (let ((result (funcall work)))
+           (assert captured)
+           (assert (not started))
+           (funcall done result nil))
+         (assert (eq :baseline started))
+         (assert (not *request-preflight*))
+         ;; A completion for a folder left during capture cannot start agents.
+         (setf started nil)
+         (snapshot-task-start *workflow* (lambda (state) (setf started state)))
+         (setf *directory* #p"/elsewhere/")
+         (funcall done (funcall work) nil)
+         (assert (not started)))
+    (loop for name in names for original in originals
+          do (setf (symbol-function name) original))))
+(format t "~&Background startup snapshot UI checks passed.~%")

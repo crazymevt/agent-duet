@@ -22,6 +22,7 @@
 (defvar *checklist* nil "The task checklist panel's PANE.")
 (defvar *checklist-findings* nil "The consolidated findings pane.")
 (defvar *checklist-boxes* nil "Snapshot heading → card widgets and presentation data, one entry per loop.")
+(defvar *request-preflight* nil)
 (defvar *workflow* nil "The running or last workflow.")
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
@@ -2718,13 +2719,30 @@ It may be stuck, or busy with something long, such as a command that prints noth
 (defun snapshot-failed (why)
   (pane-note *middle* (format nil "Couldn't record the folder's state: ~a" why) "error"))
 
-(defun snapshot-task-start (workflow)
-  "Record the folder as WORKFLOW starts; first, the last task's end, if
-that's still waiting (its agents have stopped by now)."
-  (when *task-changes* (finish-task-end *task-changes*))
-  (multiple-value-bind (task why) (begin-task-changes workflow *directory*)
-    (setf *task-changes* task)
-    (when why (snapshot-failed why))))
+(defun snapshot-task-start (workflow ready)
+  "Capture the starting state off the UI thread, then call READY on it."
+  (let ((directory *directory*) (previous *task-changes*))
+    (setf *request-preflight* t)
+    (in-background "capture task starting snapshot"
+      (lambda ()
+        (let ((previous-error nil))
+          (when previous
+            (multiple-value-bind (result why) (finish-task-changes previous)
+              (when (eq result :failed) (setf previous-error why))))
+          (multiple-value-bind (task why) (begin-task-changes workflow directory)
+            (list task why previous-error
+                  (ignore-errors
+                    (repository-start-state directory (task-changes-start task)))))))
+      (lambda (result why)
+        (setf *request-preflight* nil)
+        (when (and (eq workflow *workflow*) (equal directory *directory*))
+          (if why
+              (snapshot-failed why)
+              (destructuring-bind (task problem previous-error repository-start) result
+                (setf *task-changes* task)
+                (when previous-error (snapshot-failed previous-error))
+                (when problem (snapshot-failed problem))
+                (funcall ready repository-start))))))))
 
 (defun finish-task-end (task)
   "Record TASK's end if it's time; true while it's still waiting."
@@ -3095,6 +3113,7 @@ and summary, with Changes and, when the work can be committed, Commit changes."
 
 (defun send-composer-message ()
   "Start a task, or deliver direction, remembering partial delivery for retries."
+  (when *request-preflight* (return-from send-composer-message))
   (let* ((recipient (composer-recipient))
          (holder (control :composer-attachments))
          (attachments (copy-list (and holder (agent-pane-attachments holder))))
@@ -3174,7 +3193,6 @@ and summary, with Changes and, when the work can be committed, Commit changes."
              (if (eq (selected-mode) :review-only) ""
                  (format nil " · ~d rounds" (gtk:spin-button-get-value-as-int (control :rounds))))))))
 
-(defvar *request-preflight* nil)
 
 (defun start-request (&optional attachments)
   (cond ((workflow-running-p) (stop-workflow *workflow*))
@@ -3258,12 +3276,15 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                                :worktrees (worktrees-wanted-p)
                                                :check-command (folder-check-command *directory*)
                                                (workflow-callbacks)))
-               (snapshot-task-start *workflow*)
-               (start-workflow *workflow*
-                               :repository-start
-                               (and *task-changes* (task-changes-start *task-changes*)
-                                    (ignore-errors
-                                      (repository-start-state *directory* (task-changes-start *task-changes*)))))
+               (let ((workflow *workflow*))
+                 (snapshot-task-start workflow
+                   (lambda (repository-start)
+                     (start-workflow workflow :repository-start repository-start)
+                     (let ((holder (control :composer-attachments)))
+                       (when (and holder
+                                  (equal attachments (agent-pane-attachments holder)))
+                         (set-attachments holder nil)))
+                     (update-controls))))
                (update-controls))))))))
 
 ;;; A long conversation is reread on every turn: before a task, one whose
