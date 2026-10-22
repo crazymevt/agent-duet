@@ -8,7 +8,13 @@
   (when *pane-search-highlight*
     (dolist (saved *pane-search-highlight*)
       (destructuring-bind (label attributes) saved
-        (gtk:label-set-attributes label attributes)))
+        (gtk:label-set-attributes label attributes)
+        ;; GTK can merge explicit attributes into its cached markup attributes.
+        ;; Restoring the property alone then leaves search colors in the layout.
+        ;; Toggle markup parsing to rebuild those attributes from the source.
+        (when (gtk:label-get-use-markup label)
+          (gtk:label-set-use-markup label nil)
+          (gtk:label-set-use-markup label t))))
     (setf *pane-search-highlight* nil)))
 
 (defun highlight-pane-search-matches (matches)

@@ -931,6 +931,7 @@
   (let* ((pane (make-pane :messages messages :scroller scroller))
          (label (make-instance 'gtk:label :label "λ Alpha alpha"))
          (detail (make-instance 'gtk:expander :label "Details" :expanded nil :child label)))
+    (gtk:label-set-markup label "<b>λ Alpha</b> alpha")
     (gtk:box-append messages detail)
     (let ((matches (pane-search-matches pane "ALPHA")))
       (assert (= 2 (length matches)))
@@ -959,25 +960,35 @@
       (assert (eq scroller *pane-search-scroller*))
       (assert (string= "1 of 2" (gtk:label-get-text count)))
       (assert (gtk:expander-get-expanded detail))
+      ;; Force layout as a displayed transcript would before navigating away.
+      (assert (search "3 8 background"
+                      (pango:attr-list-to-string
+                       (pango:layout-get-attributes (gtk:label-get-layout label)))))
       (gobject:emit previous :clicked)
       (assert (string= "2 of 2" (gtk:label-get-text count)))
-      (let ((attributes (pango:attr-list-to-string (gtk:label-get-attributes label))))
+      (let ((attributes (pango:attr-list-to-string
+                         (pango:layout-get-attributes (gtk:label-get-layout label)))))
         (assert (search "9 14 background" attributes))
         (assert (not (search "3 8 background" attributes))))
       (gtk:check-button-set-active highlight-all t)
-      (let ((attributes (pango:attr-list-to-string (gtk:label-get-attributes label))))
+      (let ((attributes (pango:attr-list-to-string
+                         (pango:layout-get-attributes (gtk:label-get-layout label)))))
         (assert (search "3 8 background" attributes))
         (assert (search "9 14 background" attributes)))
       (gobject:emit next :clicked)
       (assert (string= "1 of 2" (gtk:label-get-text count)))
       (gtk:check-button-set-active highlight-all nil)
-      (let ((attributes (pango:attr-list-to-string (gtk:label-get-attributes label))))
+      (let ((attributes (pango:attr-list-to-string
+                         (pango:layout-get-attributes (gtk:label-get-layout label)))))
         (assert (search "3 8 background" attributes))
         (assert (not (search "9 14 background" attributes))))
       (gtk:check-button-set-active highlight-all t)
       (gtk:editable-set-text entry "missing")
       (assert (null *pane-search-scroller*))
       (assert (null *pane-search-highlight*))
+      (assert (string= "0 8 weight bold"
+                       (pango:attr-list-to-string
+                        (pango:layout-get-attributes (gtk:label-get-layout label)))))
       (assert (string= "No matches" (gtk:label-get-text count)))
       (assert (not (gtk:widget-get-sensitive next)))
       (gtk:editable-set-text entry "alpha")
@@ -985,6 +996,9 @@
       (assert *pane-search-scroller*)
       (gtk:window-close window)
       (assert (null *pane-search-highlight*))
+      (assert (string= "0 8 weight bold"
+                       (pango:attr-list-to-string
+                        (pango:layout-get-attributes (gtk:label-get-layout label)))))
       (assert (null *pane-search-scroller*)))))
 
 ;; Finding an early match must visibly scroll away from the bottom; transcript
