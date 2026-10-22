@@ -1856,7 +1856,7 @@ and a line saying what each is doing.")
     (refresh-activity)))
 
 (defun agent-activity (agent)
-  "Workflow detail and remaining usage beside the conversation header pill."
+  "Workflow detail, remaining usage and context beside the conversation header pill."
   (when (or (null *workflow*) (not (workflow-agent-member-p *workflow* agent)))
     (return-from agent-activity (gtk:label-get-text (pane-status (agent-pane-of agent)))))
   (let* ((presentation (workflow-agent-presentation *workflow* agent))
@@ -1866,7 +1866,8 @@ and a line saying what each is doing.")
                     (list (getf presentation :detail)
                           (and (not (agent-out-of-usage-p agent))
                                (not (eq (agent-out-until agent) :unknown)) usage
-                               (format nil "~a left" usage)))))))
+                               (format nil "~a left" usage))
+                          (agent-context-summary agent))))))
 
 (defun refresh-activity ()
   "Bring the shared conversation's agent status lines up to date."

@@ -818,6 +818,25 @@
   (setf *controls* (list :folder (make-instance 'gtk:button)
                          :permission (make-instance 'gtk:button)))
   (make-middle-pane)
+  ;; The shared header switches formatters once a message creates a workflow.
+  ;; Context must survive that switch, subsequent usage updates and completion.
+  (dolist (agent (list *claude* *codex*))
+    (pane-update-status (agent-pane-of agent))
+    (assert (search "Context: unknown" (agent-activity agent))))
+  (let ((*workflow* (make-instance 'workflow :lead *claude* :partner *codex* :request "Task")))
+    (setf (workflow-state *workflow*) :running)
+    (refresh-activity)
+    (dolist (key '(:claude-activity :codex-activity))
+      (assert (search "Context: unknown" (gtk:label-get-text (control key)))))
+    (setf (agent-context-tokens *claude*) 120
+          (agent-context-tokens *codex*) 240
+          (agent-context-limit *codex*) 1000)
+    (dolist (state '(:running :finished))
+      (setf (workflow-state *workflow*) state)
+      (pane-update-status (agent-pane-of *claude*))
+      (pane-update-status (agent-pane-of *codex*))
+      (assert (search "Context ≈: 120 tokens" (gtk:label-get-text (control :claude-activity))))
+      (assert (search "Context: 240 / 1,000 tokens" (gtk:label-get-text (control :codex-activity))))))
   ;; No recipient control means both, and must clear rather than start a task.
   (setf (claude-agent-session-id *claude*) "old" (claude-agent-started *claude*) t
         (codex-agent-thread-id *codex*) "old")
