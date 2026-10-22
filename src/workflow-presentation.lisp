@@ -87,6 +87,7 @@ without rounds. A confirming review is no new round, running or paused."
     (:continuation-failed "couldn't carry on from the reply")
     (:integration-unresolved "the merge isn't resolved")
     (:deadlock "the parts wait on each other")
+    (:disagreement "decide on the disputed findings")
     (t (string-downcase (princ-to-string (step-reason step))))))
 
 (defun presentation-waiting-for (step)
@@ -109,6 +110,7 @@ without rounds. A confirming review is no new round, running or paused."
                              :label (if (eq (step-role step) :replan) "Revising the plan" "Planning")
                              :detail nil))
       (:resolve (list :state :resolving :label "Resolving merge conflicts" :detail nil))
+      (:answer (list :state :working :label "Answering questions" :detail nil))
       (:check (list :state :checking :label "Running check" :detail part))
       (:review (list :state :reviewing
                      :label (if (step-confirming step) "Settling open findings" "Reviewing")
@@ -123,6 +125,10 @@ without rounds. A confirming review is no new round, running or paused."
                     (list :state :working :label "Combining the parts" :detail round))
                    (t (list :state :working :label "Working" :detail (presentation-join part round))))))))
 
+(defun presentation-held-loops (workflow)
+  "Loops whose work waits for answers to blocking questions."
+  (mapcar #'first (workflow-question-holds workflow)))
+
 (defun presentation-idle-in-workflow (workflow agent)
   "What AGENT, with no step of its own, waits for in running WORKFLOW."
   (let ((loops (remove-if #'loop-done-p (workflow-loops workflow))))
@@ -131,7 +137,9 @@ without rounds. A confirming review is no new round, running or paused."
                                                         (not (loop-skip-review l))))
                                        loops)))
       (let ((l nil))
-        (cond ((setf l (authored :checking))
+        (cond ((setf l (find-if (lambda (l) (eq (loop-author l) agent)) (presentation-held-loops workflow)))
+               (list :state :waiting :label "Waiting for an answer" :detail (part-name l)))
+              ((setf l (authored :checking))
                (list :state :checking :label "Running check" :detail (part-name l)))
               ((setf l (authored :reviewing))
                (list :state :waiting :label "Waiting for review" :detail (part-name l)))
@@ -288,6 +296,8 @@ was, and stays when the work is handed over: its author may change."
                     detail (presentation-join (format nil "Paused: ~a" (presentation-pause-reason paused)) round)))
              (paused
               (setf state :pending detail (format nil "Waits for ~a" (presentation-waiting-for paused))))
+             ((member loop (presentation-held-loops workflow))
+              (setf state :active detail (presentation-join "Waiting for an answer" round)))
              ((eq (loop-state loop) :assigned) (setf state :pending))
              (t
               (setf state :active
@@ -459,6 +469,7 @@ until it has a loop of its own."
        (cond ((some #'agent-waiting-for-user-p agents) "Waiting for your answer")
              ((workflow-pending-plan workflow) "Waiting for you to approve the plan")
              ((and user-pause (eq (step-reason user-pause) :deadlock)) "Parts wait on each other")
+             ((and user-pause (eq (step-reason user-pause) :disagreement)) "Waiting for your decision on disputed findings")
              ((and user-pause (eq (step-reason user-pause) :out-of-usage))
               (format nil "Paused: ~a is out of usage" (agent-name (step-agent user-pause))))
              (user-pause "Paused")
@@ -467,6 +478,7 @@ until it has a loop of its own."
               "Merging the parts")
              ((find-if (lambda (s) (member (step-role s) '(:plan :replan))) running) "Planning")
              ((find :propose running :key #'step-role) "Proposing approaches")
+             ((and (null (rest active-loops)) (presentation-held-loops workflow)) "Waiting for an answer")
              ((rest active-loops) (format nil "~d parts in progress" (length active-loops)))
              (active-loops
               (let ((l (first active-loops)))

@@ -383,7 +383,10 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
            (let* ((text (ai::long-part-reply workflow reply))
                   (path (subseq text (+ (search "Full reply: " text) 12))))
              (true (< (length text) (length reply)))
-             (is string= reply (uiop:read-file-string path)))
+             (is string= reply (uiop:read-file-string path))
+             ;; Indexed as an artifact for the reviewers.
+             (is eq :artifact (ai::evidence-kind (first (ai::workflow-task-evidence workflow))))
+             (true (search path (ai::evidence-summary (first (ai::workflow-task-evidence workflow))))))
            (setf (ai::agent-permission reviewer) :edits)
            (true (search "cut short" (ai::long-part-reply workflow reply)))
            (setf (ai::agent-permission reviewer) :full)
@@ -691,3 +694,261 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
         (false (search "first.txt" compact))
         ;; The fallback keeps the full worktree note.
         (true (search "git diff --cached" (ai::prompt-without-history reviewer compact)))))))
+
+;;; Task records: questions between turns, review convergence, decisions,
+;;; evidence and work allocation
+
+(define-test blocking-question-holds-work-until-answered :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review
+                (list (says (format nil "Started.~%QUESTIONS:~%- Q1 [blocking] Which API version?"))
+                      (says "Done with v2."))
+                (list (says (format nil "ANSWERS:~%- Q1 Use v2."))
+                      (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (let ((question (first (ai::workflow-task-questions workflow)))
+          (asked (car (last (fake-prompts codex)))))
+      (is string= "Use v2." (ai::task-question-answer question))
+      (is eq :claude (ai::task-question-from question))
+      (is eq :codex (ai::task-question-to question))
+      ;; The partner gets its own turn at the boundary, with the question.
+      (true (search "Questions for you from Claude" asked))
+      (true (search "Which API version?" asked))
+      (true (search "Don't change any files" asked)))
+    ;; The asker goes on with the answer linked to its question.
+    (let ((resumed (first (fake-prompts claude))))
+      (true (search "blocking question has been answered" resumed))
+      (true (search "Q1 [blocking] Which API version? Answer: Use v2." resumed)))
+    (true (find "Claude asks ChatGPT (Q1, blocking)" messages :key #'third :test #'search))
+    (true (find "waits for the answer to Q1" messages :key #'third :test #'search))
+    ;; The hold is blocked time, opened and closed once.
+    (is equal '(:blocked-start :blocked-end)
+        (mapcar (lambda (e) (getf e :kind))
+                (remove-if-not (lambda (e) (member (getf e :kind) '(:blocked-start :blocked-end)))
+                               (ai::workflow-efficiency-events workflow))))
+    (false (ai::workflow-question-holds workflow))))
+
+(define-test non-blocking-question-waits-for-next-turn :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review
+                (list (says (format nil "Done.~%QUESTIONS:~%- Q1 [non-blocking] Is frob a good name?"))
+                      (says "Renamed."))
+                (list (says (format nil "ANSWERS:~%- Q1 Prefer frobnicate.~%FINDINGS:~%- F1 [open] Rename it~%VERDICT: CHANGES REQUESTED"))
+                      (says (format nil "FINDINGS:~%- F1 [fixed] Rename it~%VERDICT: APPROVED"))))
+    (declare (ignore messages))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    ;; No extra turn: the reviewer sees it with its review, the asker the answer with its fix.
+    (is = 2 (length (fake-prompts codex)))
+    (true (search "Is frob a good name?" (car (last (fake-prompts codex)))))
+    (true (search "Answers to your questions" (first (fake-prompts claude))))
+    (true (search "Prefer frobnicate." (first (fake-prompts claude))))
+    ;; Given once: the next review doesn't repeat the answered question.
+    (false (search "Questions for you" (first (fake-prompts codex))))))
+
+(define-test unanswered-blocking-question-is-given-up :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review
+                (list (says (format nil "Started.~%QUESTIONS:~%- Q1 [blocking] Which API?"))
+                      (says "Done anyway."))
+                (list (says "I don't know.")
+                      (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    (declare (ignore messages codex))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (is string= "No answer was given." (ai::task-question-answer (first (ai::workflow-task-questions workflow))))
+    (true (search "No answer was given." (first (fake-prompts claude))))))
+
+(define-test held-work-presentation :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review (list (says (format nil "Started.~%QUESTIONS:~%- Q1 [blocking] Which API?")))
+                (list (says :hang)))
+    (declare (ignore messages))
+    (is string= "Waiting for an answer" (getf (ai::workflow-agent-presentation workflow claude) :label))
+    (is string= "Answering questions" (getf (ai::workflow-agent-presentation workflow codex) :label))
+    (is string= "Waiting for an answer"
+        (getf (ai::workflow-progress-presentation workflow) :label))
+    ;; Restart keeps the hold and the answer turn, rather than redoing the work.
+    (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (restored (ai:restore-workflow cp :lead claude :partner codex)))
+      (is = 1 (length (ai::workflow-question-holds restored)))
+      (is equal '(:answer) (mapcar #'ai::step-role (ai:workflow-paused restored)))
+      (false (ai::task-question-answer (first (ai::workflow-task-questions restored)))))
+    (ai:agent-cancel codex)))
+
+(define-test finding-severity-and-suggestions :parent agent-duet
+  (let ((f (ai::parse-finding-line "- F2 [open] [suggestion] `a.lisp:4` Rename it")))
+    (is eq :suggestion (getf f :severity))
+    (is eq :open (getf f :status))
+    (is string= "a.lisp:4" (getf f :location))
+    (is string= "Rename it" (getf f :text)))
+  (is eq :blocker (getf (ai::parse-finding-line "- F1 [blocker] [open] Bug") :severity))
+  (false (getf (ai::parse-finding-line "- F1 [open] Bug") :severity))
+  ;; An unknown second tag stays in the text.
+  (is string= "[later] Bug" (getf (ai::parse-finding-line "- F1 [open] [later] Bug") :text))
+  (let ((merged (ai::merge-findings '() (ai::parse-findings (format nil "FINDINGS:~%- F1 [open] Bug~%- F2 [open] [suggestion] Style")) 1)))
+    (is equal '(:blocker :suggestion) (mapcar #'ai::finding-severity merged))
+    (true (search "- F2 [open] [suggestion] Style" (ai::findings-lines merged)))
+    (is = 1 (ai::open-blockers merged)))
+  ;; Approval with only suggestions open needs no settling turn.
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review (list (says "Done"))
+                (list (says (format nil "FINDINGS:~%- F1 [open] [suggestion] Nicer name~%VERDICT: APPROVED"))))
+    (declare (ignore claude))
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (is = 1 (length (fake-prompts codex)))
+    (true (search "[suggestion]" (first (fake-prompts codex))))
+    (true (find "1 suggestion open" messages :key #'third :test #'search))
+    (true (some (lambda (line) (search "suggestions: 1" line))
+                (ai::task-summary-lines (ai::workflow-completion-data workflow))))))
+
+(define-test disputed-blocker-escalates-to-user :parent agent-duet
+  (let ((review (format nil "FINDINGS:~%- F1 [open] `a.lisp:1` Use a hash table~%VERDICT: CHANGES REQUESTED")))
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :review
+                  (list (says "Done")
+                        (says (format nil "A list is fine here.~%DISPUTED: F1"))
+                        (says (format nil "Still fine.~%DISPUTED: F1")))
+                  (list (says review) (says review) (says review)))
+      (declare (ignore codex))
+      (let* ((loop (first (ai:workflow-loops workflow)))
+             (step (first (ai:workflow-paused workflow))))
+        (is eq :disagreement (ai::step-reason step))
+        (is eq :paused (ai::loop-state loop))
+        (is = 3 (length (fake-prompts claude)))
+        (true (search "DISPUTED: F2, F5" (first (fake-prompts claude))))
+        (true (find "Claude disputes F1 and ChatGPT keeps it open" messages :key #'third :test #'search))
+        (true (search "disputed" (getf (ai::workflow-progress-presentation workflow) :label)))
+        ;; Saved and restored with its disputes.
+        (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+               (restored (ai:restore-workflow cp :lead claude :partner (ai::workflow-partner workflow))))
+          (is = 2 (ai::finding-disputes (first (ai::loop-findings (first (ai:workflow-loops restored))))))
+          (is eq :disagreement (ai::step-reason (first (ai:workflow-paused restored)))))
+        ;; The user dismisses it: with no blocker left, it's approved.
+        (true (ai::decide-disagreement workflow step :dismiss))
+        (is eq :dismissed (ai::finding-status (first (ai::loop-findings loop))))
+        (is eq :approved (ai::loop-state loop))
+        (is eq :finished (ai:workflow-state workflow))))))
+
+(define-test disputed-blocker-kept-by-user :parent agent-duet
+  (let ((review (format nil "FINDINGS:~%- F1 [open] Use a hash table~%VERDICT: CHANGES REQUESTED")))
+    (multiple-value-bind (workflow messages claude codex)
+        (run-fake :review
+                  (list (says "Done") (says (format nil "No.~%DISPUTED: F1")) (says (format nil "No.~%DISPUTED: F1"))
+                        (says "Switched to a hash table."))
+                  (list (says review) (says review) (says review)
+                        (says (format nil "FINDINGS:~%- F1 [fixed] Use a hash table~%VERDICT: APPROVED"))))
+      (declare (ignore messages codex))
+      (let ((step (find :disagreement (ai:workflow-paused workflow) :key #'ai::step-reason)))
+        (true step)
+        (true (ai::decide-disagreement workflow step :keep))
+        (true (search "decided that these findings stand" (first (fake-prompts claude))))
+        (is = 0 (ai::finding-disputes (first (ai::loop-findings (first (ai:workflow-loops workflow))))))
+        (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))))))
+
+(defun disputed-workflow ()
+  "A review workflow (default rounds) paused for the user: F1 disputed twice."
+  (let ((review (format nil "FINDINGS:~%- F1 [open] Use a hash table~%VERDICT: CHANGES REQUESTED")))
+    (run-fake :review
+              (list (says "Done") (says (format nil "No.~%DISPUTED: F1")) (says (format nil "No.~%DISPUTED: F1"))
+                    (says "Fixed it."))
+              (list (says review) (says review) (says review)))))
+
+(define-test dismissed-dispute-with-failing-check-not-approved :parent agent-duet
+  (multiple-value-bind (workflow messages claude) (disputed-workflow)
+    (declare (ignore messages))
+    (let ((loop (first (ai:workflow-loops workflow)))
+          (step (first (ai:workflow-paused workflow))))
+      (setf (ai::loop-check-failed loop) t)
+      (true (ai::decide-disagreement workflow step :dismiss))
+      (is eq :dismissed (ai::finding-status (first (ai::loop-findings loop))))
+      (false (eq :approved (ai::loop-state loop)))
+      (true (search "The check still fails" (first (fake-prompts claude)))))))
+
+(define-test restored-dispute-asks-again :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex) (disputed-workflow)
+    (declare (ignore messages))
+    (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (asked nil)
+           (restored (ai:restore-workflow cp :lead claude :partner codex
+                                             :on-pause (lambda (w s) (declare (ignore w)) (push s asked))))
+           (prompts (length (fake-prompts claude))))
+      (is eq :started (ai:recover-workflow restored :resume))
+      ;; No fix work replayed: the decision is asked for again.
+      (is = prompts (length (fake-prompts claude)))
+      (is eq :disagreement (ai::step-reason (first asked)))
+      (true (ai::decide-disagreement restored (first asked) :keep))
+      (true (search "decided that these findings stand" (first (fake-prompts claude))))
+      (is = 0 (ai::finding-disputes (first (ai::loop-findings (first (ai:workflow-loops restored)))))))))
+
+(define-test decisions-steering-and-records-restart :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review
+                (list (says (format nil "Done.~%TASK REVISION: 1~%DECISIONS:~%- D1 Keep the list — because callers rely on order; rejected: hash table~%VERIFICATION: make test passed")))
+                (list (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED"))))
+    (declare (ignore messages))
+    ;; A decision section counts as reported decisions.
+    (false (search "decisions not reported" (first (fake-prompts codex))))
+    (let ((decision (first (ai::workflow-task-decisions workflow))))
+      (is string= "Keep the list" (ai::task-decision-text decision))
+      (is equal '("hash table") (ai::task-decision-rejected decision))
+      (true (search "D1 Keep the list" (ai::task-contract workflow)))
+      (ai::record-task-direction workflow "Use a hash table after all.")
+      (true (ai::task-decision-stale decision))
+      (true (search "[stale]" (ai::task-contract workflow))))
+    ;; The author's verification is indexed as its own claim.
+    (let ((evidence (first (ai::workflow-task-evidence workflow))))
+      (is eq :discovery (ai::evidence-kind evidence))
+      (is eq :claude (ai::evidence-source evidence))
+      (true (search "make test passed" (ai::evidence-summary evidence))))
+    (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (restored (ai:restore-workflow cp :lead claude :partner codex)))
+      (is string= (ai::task-contract workflow) (ai::task-contract restored))
+      (is = 1 (length (ai::workflow-task-evidence restored)))
+      (is equal (ai::workflow-efficiency-events workflow) (ai::workflow-efficiency-events restored)))
+    ;; Older checkpoints have no records.
+    (let ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow)))))
+      (setf (cdr cp) (remove "task-records" (cdr cp) :key #'car :test #'string=))
+      (let ((restored (ai:restore-workflow cp :lead claude :partner codex)))
+        (false (ai::workflow-task-decisions restored))
+        (false (ai::workflow-task-questions restored))))))
+
+(define-test review-evidence-current-or-stale :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((author (make-instance 'fake-agent :name "Claude" :directory repo))
+           (reviewer (make-instance 'fake-agent :name "ChatGPT" :directory repo))
+           (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Do it"))
+           (part (ai::make-review-loop :author author :reviewer reviewer :task "Do it" :summary "Report")))
+      (write-file (merge-pathnames "first.txt" repo) "one")
+      (let ((state (ai::repository-state-id repo)))
+        (true state)
+        ;; The same content is the same state, and leaves no snapshot ref behind.
+        (is string= state (ai::repository-state-id repo))
+        (ai::add-evidence workflow :check "Check `make test` passed (exit code 0)." state :check))
+      (let ((prompt (ai::review-prompt part :workflow workflow)))
+        (true (search "Evidence so far" prompt))
+        (true (search "[current]" prompt))
+        (true (search "verify independently" prompt)))
+      (ai::reviewed part)
+      (write-file (merge-pathnames "first.txt" repo) "changed")
+      (true (search "[stale]" (ai::review-prompt part :workflow workflow))))))
+
+(define-test plan-order-reason :parent agent-duet
+  (multiple-value-bind (lead partner order reason)
+      (ai:parse-plan (format nil "LEAD TASK:~%The parser~%~%PARTNER TASK:~%The tests~%~%ORDER: LEAD FIRST~%ORDER REASON: the tests need the parser's interface"))
+    (is string= "The parser" lead)
+    (is string= "The tests" partner)
+    (is eq :lead-first order)
+    (is string= "the tests need the parser's interface" reason))
+  (is eq nil (nth-value 3 (ai:parse-plan (format nil "LEAD TASK:~%A~%PARTNER TASK:~%B~%ORDER: PARALLEL"))))
+  (let ((form (ai::plan-form (make-instance 'fake-agent :id :codex :name "ChatGPT"))))
+    (dolist (text '("ORDER REASON:" "depends on" "interfaces" "integrating and reviewing"))
+      (true (search text form))))
+  (multiple-value-bind (workflow messages)
+      (run-fake :divide
+                (lambda (prompt)
+                  (cond ((search "Review the work" prompt) *approve*)
+                        ((search "Split the work" prompt)
+                         (format nil "LEAD TASK:~%A~%~%PARTNER TASK:~%B~%~%ORDER: PARALLEL~%ORDER REASON: independent files"))
+                        (t "A done")))
+                (lambda (prompt) (if (search "Review the work" prompt) *approve* "B done")))
+    (declare (ignore workflow))
+    (true (find "Order: parallel: independent files" messages :key #'third :test #'search))))

@@ -204,3 +204,16 @@
     (ai::agent-new-conversation agent)
     (is equal '(("compact" . "full")) (ai::agent-context-fallback agent))
     (false (ai::agent-conversation-handle agent))))
+
+(define-test summary-efficiency-feedback :parent agent-duet
+  (let ((lines (ai::task-summary-lines
+                (list :elapsed-seconds 60 :open-findings 2 :open-suggestions 1 :unanswered-questions 1
+                      :efficiency (list :blocked-seconds 30 :repeated-checks 1 :recurring-findings 0
+                                        :integration-reworks 2)))))
+    (true (member "Open findings: 2 (suggestions: 1, which don't stop approval)" lines :test #'string=))
+    (true (member "Unanswered questions: 1" lines :test #'string=))
+    (true (some (lambda (line) (search "Repeated checks" line)) lines))
+    (true (some (lambda (line) (search "Integration reworks" line)) lines))
+    ;; Zero values are left out; defects (open findings) come first.
+    (false (some (lambda (line) (search "Recurring findings" line)) lines))
+    (is string= "Open findings: 1" (second (ai::task-summary-lines (list :open-findings 1))))))

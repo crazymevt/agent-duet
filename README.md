@@ -229,7 +229,19 @@ unresolved finding stays in view from one round to the next. A reviewer that
 approves with findings still open is asked once to settle them; if it
 leaves them open again, the part isn't approved, and **Continue** has the
 author pick them up. Review prompts already say that an approval leaves no
-finding open, so this extra turn should be rare. For ChatGPT it runs at `low`
+blocker open, so this extra turn should be rare.
+
+A finding is a blocker unless the reviewer marks it `[suggestion]`
+(`- F2 [open] [suggestion] \`a.lisp:4\` …`). Only open blockers stop approval:
+work approved with suggestions still open is approved, and the conversation and
+summary card say how many suggestions are left. An author who disagrees with a
+blocker says why and lists it on a `DISPUTED: F2` line. When the reviewer keeps a
+disputed blocker open for two reviews in a row, the next round doesn't start
+automatically, even in the last round, and after a restart it asks again. A card shows the disputed findings and asks you to decide.
+**They stand** has the author address them, and tells the author that you
+decided. **Dismiss them** dismisses them. If no blocker is left open after
+that and the check passes, the work is approved by your decision. The settling turn asks
+only about open blockers. For ChatGPT it runs at `low`
 effort when its model supports that and the effort chosen in the app is
 higher. With the model's default chosen, the effective effort isn't known, so
 it's left alone. The next turn sends the replaced effort again, because Codex
@@ -470,8 +482,47 @@ or direction changed during the turn produce advisory notes in the conversation
 and reviewer prompt only when the reported gaps change. Unchanged gaps are not
 repeated on fix rounds, and this suppression survives restart. These check reported
 metadata only, not the truth of a claim. They preserve the full reply and do not reject it, block checks, or determine
-approval. These additions do not provide a separate acceptance-criteria editor,
-a decision ledger, or agent questions between turns.
+approval. They don't provide a separate acceptance-criteria editor.
+
+Agents can also exchange questions, record decisions, and share evidence between
+turns:
+
+- **Questions between turns.** A work handoff can end with a `QUESTIONS`
+  section, one line per question: `- Q1 [blocking] …` or `- Q1 [non-blocking] …`.
+  The workflow numbers questions for the whole task and gives them to the other
+  agent with its next prompt. That agent answers in an `ANSWERS` section
+  (`- Q1 …`), and each answer is linked to its question. The asker gets the
+  answer with its own next prompt. A non-blocking question doesn't stop anything.
+  A blocking one holds the asker's part: its report is kept, and its check and
+  review wait. If the other agent has nothing under way, it gets one turn of its
+  own to answer. When every blocking question has an answer, the asker carries
+  on with the answers. A question still unanswered after that turn is closed as
+  "No answer was given", so the work isn't held for ever. Questions are only
+  exchanged when a turn ends. Agents can't ask each other anything in the
+  middle of a turn.
+- **Decision record.** Work handoffs can give a `DECISIONS` section instead of
+  the one-line field: `- D1 choice — because reason; rejected: other options`.
+  Recorded decisions keep their reasons and rejected options in the shared task
+  contract. Direction addressed to both agents marks the earlier decisions
+  `[stale]`, so they're revisited.
+- **Evidence index.** Check results, the authors' reported `VERIFICATION`, and
+  retained artifacts are recorded against the repository content they describe
+  (a Git tree id, untracked files included). Each entry keeps its source. Reviewers
+  see the latest entries marked `current` (the files are as they were then) or
+  `stale`, and are asked to verify independently anything that matters. An entry
+  is a record of what was reported or run, not a verdict.
+- **Work allocation.** The lead's split prompt asks it to choose the order from
+  what each part depends on, how settled the interfaces between the parts are,
+  and the cost of integrating and reviewing them. The lead gives the reason on an
+  `ORDER REASON:` line, which appears in the conversation. Splitting isn't
+  required: the lead can leave the partner's part empty when that costs less.
+- **Efficiency feedback.** Next to the open findings, the summary card shows
+  time spent blocked (paused, waiting for a prerequisite or held for an answer),
+  checks repeated on unchanged files, findings that recur across review rounds,
+  and integration rework (revalidated parts and merge conflicts). Zero values
+  are left out.
+
+All of this is saved with the task and survives a restart.
 
 Handoffs ask for a concise outcome, changed paths, verification and unresolved
 issues. These are advisory writing guidelines: replies are not rejected for

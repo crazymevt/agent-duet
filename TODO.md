@@ -28,19 +28,21 @@ sequence, see [the implementation plan](docs/implementation-plan.md).
   advisory evidence gaps that preserve replies and existing approval behavior.
   State survives restart; goals and acceptance criteria stay in the request's
   wording. Implemented for review.
-- [ ] **Questions between turns:** Queue and link partner questions/responses at
+- [x] **Questions between turns:** Queue and link partner questions/responses at
   turn boundaries, distinguishing blocked work from work that can continue.
   Mid-turn exchanges need separate turn, stall and recovery design.
-- [ ] **Shared evidence index:** Link discoveries, check results and artifacts to
+- [x] **Shared evidence index:** Link discoveries, check results and artifacts to
   the repository state they describe; retain independent reviewer verification.
-- [ ] **Per-task decision record:** Preserve reasons and rejected options, beyond
+- [x] **Per-task decision record:** Preserve reasons and rejected options, beyond
   project conventions and recovery state; mark affected decisions stale on steering.
-- [ ] **Review convergence:** Distinguish blockers from optional suggestions and
+- [x] **Review convergence:** Distinguish blockers from optional suggestions and
   escalate repeated unresolved disagreement. Finding IDs and carry-forward exist.
-- [ ] **Work allocation:** Include dependencies, interface uncertainty, integration
+- [x] **Work allocation:** Include dependencies, interface uncertainty, integration
   and review effort in deciding parallel versus sequential assignments.
-- [ ] **Efficiency feedback:** Extend metrics with blocked time, repeated checks,
+- [x] **Efficiency feedback:** Extend metrics with blocked time, repeated checks,
   recurring findings and integration rework, considered alongside defects.
+  Implemented for review (with the five items above). Mid-turn questions remain
+  out of scope.
 
 ## Next (agreed by Claude and ChatGPT)
 

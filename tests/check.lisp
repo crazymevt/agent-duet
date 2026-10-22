@@ -376,3 +376,30 @@
     (finish-output out)
     (is string= (ai::read-check-output-tail path 500)
         (ai::read-check-output-excerpt path 500))))
+
+(define-test check-evidence-and-repeats :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((review (format nil "FINDINGS:~%- F1 [open] Explain the choice~%VERDICT: CHANGES REQUESTED"))
+           (author (make-instance 'fake-agent :id :claude :name "Claude" :directory repo
+                                  :replies (list (says "Done") (says "Explained; no file changes."))))
+           (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory repo
+                                    :replies (list (says review)
+                                                   (says (format nil "FINDINGS:~%- F1 [fixed] Explain the choice~%VERDICT: APPROVED")))))
+           (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Do it"
+                                   :check-command "true")))
+      (let* ((history (merge-pathnames (format nil "duet-history-~a/" (ai::make-uuid)) (uiop:temporary-directory)))
+             (ai::*history-directory* history))
+        (unwind-protect
+             (progn
+               (write-file-text repo "a.txt" "work")
+               (ai:start-workflow workflow)
+               (true (wait-until (lambda () (eq :finished (ai:workflow-state workflow)))))
+               ;; One check result on one state, indexed once and shown current to the reviewer.
+               (is = 1 (count :check (ai::workflow-task-evidence workflow) :key #'ai::evidence-kind))
+               (true (search "[current]" (first (fake-prompts reviewer))))
+               ;; The second check ran on unchanged files: a repeat.
+               (is = 1 (getf (ai::efficiency-summary (ai::workflow-efficiency-events workflow)) :repeated-checks))
+               (true (some (lambda (line) (search "Repeated checks: 1" line))
+                           (ai::task-summary-lines (ai::workflow-completion-data workflow)))))
+          (ai:stop-workflow workflow)
+          (uiop:delete-directory-tree history :validate t :if-does-not-exist :ignore))))))

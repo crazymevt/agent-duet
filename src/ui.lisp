@@ -2091,7 +2091,9 @@ later (Codex reads its usage after the turn) brings the Wait button."
                                          (format nil "~a is out of usage~@[ until ~a~]" (agent-name agent)
                                                  (and reset (format-reset-time reset)))
                                          (format nil "~a: ~a" (string-capitalize (step-description step) :end 1)
-                                                 (step-reason-text reason))))
+                                                 (if (eq reason :disagreement)
+                                                     "your decision is needed"
+                                                     (step-reason-text reason)))))
                  (when reset
                    (unless wait-button
                      (setf wait-button (choice "" (format nil "Send it to ~a again once its usage resets" (agent-name agent))
@@ -2102,44 +2104,61 @@ later (Codex reads its usage after the turn) brings the Wait button."
                      (wait))))))
       (choice "Stop task" "Stop both agents; the task can be recovered later" '("destructive-action")
               (lambda () (incf attempt) (stop-workflow workflow) (settled "Stopped")))
-      (let ((hand-off (choice (case role
-                                (:review "Finish unreviewed")
-                                (:propose "Go without it")
-                                (t (format nil "Hand off to ~a" (agent-name other))))
-                              (case role
-                                (:review "Finish this part without a review, and say so")
-                                (:propose (format nil "Carry on with ~a's proposal alone" (agent-name other)))
-                                (t (format nil "~a carries on from what ~a has done so far; its work won't be reviewed"
-                                           (agent-name other) (agent-name agent))))
-                              '()
-                              (lambda () (choose :hand-off (case role
-                                                             (:review "Finished unreviewed")
-                                                             (:propose "Went without it")
-                                                             (t (format nil "Handed to ~a" (agent-name other)))))))))
-        ;; Only taking work over needs the other agent's usage.
-        (when (or (eq role :check)
-                  (and (not (member role '(:review :propose))) (agent-out-of-usage-p other)))
-          (gtk:widget-set-sensitive hand-off nil)
-          (gtk:widget-set-tooltip-text hand-off (if (eq role :check) "A check is run again, not handed off"
-                                                    (format nil "~a is out of usage too" (agent-name other))))))
-      (choice (if usage "Try again" "Retry step")
-              (format nil "Give ~a the step again, as it was first given" (agent-name agent)) '()
-              (lambda () (choose :retry "Tried again")))
-      (unless usage
-        (choice "Resume" (format nil "~a carries on from where it stopped, shown what's already done first"
-                                 (agent-name agent))
-                '("suggested-action") (lambda () (choose :resume "Resumed"))))
+      ;; The author keeps disputing findings the reviewer keeps open: the user decides.
+      (when (eq reason :disagreement)
+        (flet ((decide (decision done)
+                 (incf attempt)
+                 (if (decide-disagreement workflow step decision)
+                     (settled done)
+                     (say (format nil "~a is still busy; try again in a moment." (agent-name agent)) '("warning")))))
+          (choice "Dismiss them" "Dismiss the disputed findings; with no blocker left open, the work is approved" '()
+                  (lambda () (decide :dismiss "Dismissed")))
+          (choice "They stand" (format nil "~a addresses the disputed findings, told they stand" (agent-name agent))
+                  '("suggested-action") (lambda () (decide :keep "Kept")))))
+      (unless (eq reason :disagreement)
+        (let ((hand-off (choice (case role
+                                  (:review "Finish unreviewed")
+                                  ((:propose :answer) "Go without it")
+                                  (t (format nil "Hand off to ~a" (agent-name other))))
+                                (case role
+                                  (:review "Finish this part without a review, and say so")
+                                  (:propose (format nil "Carry on with ~a's proposal alone" (agent-name other)))
+                                  (:answer (format nil "~a's held work goes on without the answers" (agent-name other)))
+                                  (t (format nil "~a carries on from what ~a has done so far; its work won't be reviewed"
+                                             (agent-name other) (agent-name agent))))
+                                '()
+                                (lambda () (choose :hand-off (case role
+                                                               (:review "Finished unreviewed")
+                                                               ((:propose :answer) "Went without it")
+                                                               (t (format nil "Handed to ~a" (agent-name other)))))))))
+          ;; Only taking work over needs the other agent's usage.
+          (when (or (eq role :check)
+                    (and (not (member role '(:review :propose :answer))) (agent-out-of-usage-p other)))
+            (gtk:widget-set-sensitive hand-off nil)
+            (gtk:widget-set-tooltip-text hand-off (if (eq role :check) "A check is run again, not handed off"
+                                                      (format nil "~a is out of usage too" (agent-name other))))))
+        (choice (if usage "Try again" "Retry step")
+                (format nil "Give ~a the step again, as it was first given" (agent-name agent)) '()
+                (lambda () (choose :retry "Tried again")))
+        (unless usage
+          (choice "Resume" (format nil "~a carries on from where it stopped, shown what's already done first"
+                                   (agent-name agent))
+                  '("suggested-action") (lambda () (choose :resume "Resumed")))))
       (refresh)
       (push (list step #'refresh #'settled) *pause-cards*)
       (pane-append *middle*
                    (gtk:build
                     (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
                              heading
-                             (gtk:label :label (format nil "~a is paused~:[~; while ~a carries on with work that doesn't depend on it~]. ~
+                             (gtk:label :label (if (eq reason :disagreement)
+                                                   (format nil "~a disputes these findings, and ~a keeps them open:~%~a"
+                                                           (agent-name agent) (agent-name other)
+                                                           (findings-lines (disputed-findings (step-loop step))))
+                                                   (format nil "~a is paused~:[~; while ~a carries on with work that doesn't depend on it~]. ~
 Nothing done so far is lost~@[: what it had written is kept~]."
-                                                       (string-capitalize (step-description step) :end 1)
-                                                       (agent-busy other) (agent-name other)
-                                                       (step-progress step))
+                                                           (string-capitalize (step-description step) :end 1)
+                                                           (agent-busy other) (agent-name other)
+                                                           (step-progress step)))
                                         :xalign 0.0 :wrap t)
                              status
                              buttons))))

@@ -36,6 +36,9 @@ conversation. The keys the UI reads (`checkpoint-summary`):
 | `"integration"`, `"integration-journal"` | `"committing"`, `"merging"`, `"merged"`, `"interrupted"` or null; `[{"path", "head"}]` merged so far |
 | `"prerequisite-merges"` | `[{"path", "from", "head"}]`: prerequisite work (`head`, from the worktree `from`) merged into a dependent part's worktree (`path`) |
 | `"repositories"` | each folder and worktree as it was (`inspect-recovery-repository`) |
+| `"task-records"` | `{"questions", "evidence", "decisions", "efficiency-events"}` (`task-records-to-json`, read back by `task-records-from-json`) |
+| `"delivered-answers"`, `"answer-turns"` | question ids whose answer the asker has been given; blocking question ids already given an answer turn |
+| `"question-holds"` | `[{"loop", "step", "questions"}]`: a part's work held (loop index, the held step's id) until those blocking questions are answered |
 
 Metric `values` use `elapsed-seconds`, `duration-ms`, `cost-usd`,
 `input-tokens`, `output-tokens`, `cache-read-tokens`, `cache-write-tokens`,
@@ -44,6 +47,19 @@ across a crash. Reported turn IDs replace the pending entry once; duplicate
 reports are ignored. `incomplete` marks interrupted/failed measurements. Task
 aggregates retain known-field coverage, so missing turns remain visibly partial.
 Older checkpoints load with unknown start time and no recorded metrics.
+
+Loops also save `"disputed"` (finding ids the author's last report disputed),
+and findings save `"severity"` (`"blocker"` or `"suggestion"`) and `"disputes"`
+(reviews in a row a disputed blocker stayed open). Steps can have the role
+`"answer"`, with `"target"` the question ids it answers, and the reason
+`"disagreement"`, for work waiting for the user to settle disputed findings
+(`decide-disagreement` with `:keep` or `:dismiss`). After a restart, **Resume**
+or **Retry** asks again (`:on-pause`) instead of replaying the fix work; without
+an `:on-pause` callback it carries on as `:keep`.
+Older checkpoints have no task records, holds or disputes. Their findings
+read as blockers. On restore, a loop held for answers isn't given a restart
+step. If no answer turn was saved for its questions, a paused `"answer"` step
+is added to recover.
 
 `history-interrupted-p`: the state is `"running"`, `"paused"` or
 `"interrupted"`, or `"finished"` with integration still `"committing"`,

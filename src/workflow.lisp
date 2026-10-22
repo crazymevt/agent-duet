@@ -96,6 +96,17 @@
    (contract-directions :initform nil :accessor workflow-contract-directions)
    (contract-context :initform nil :accessor workflow-contract-context
                      :documentation "Transient (agent conversation brief) entries; restart sends full briefs")
+   ;; Task records (task-records.lisp), saved with the checkpoint.
+   (task-questions :initform nil :accessor workflow-task-questions :documentation "TASK-QUESTIONs, oldest first")
+   (task-evidence :initform nil :accessor workflow-task-evidence :documentation "EVIDENCE, newest first")
+   (task-decisions :initform nil :accessor workflow-task-decisions :documentation "TASK-DECISIONs, oldest first")
+   (efficiency-events :initform nil :accessor workflow-efficiency-events :documentation "Event plists, oldest first")
+   (delivered-answers :initform nil :accessor workflow-delivered-answers
+                      :documentation "Ids of answered questions whose asker has been given the answer")
+   (answer-turns :initform nil :accessor workflow-answer-turns
+                 :documentation "Ids of blocking questions already given their own answer turn")
+   (question-holds :initform nil :accessor workflow-question-holds
+                   :documentation "(loop step-id question-id...)s: work held until blocking questions are answered")
    (request :initarg :request :reader workflow-request)
    (max-rounds :initarg :max-rounds :initform *default-max-rounds* :accessor workflow-max-rounds)
    (on-message :initarg :on-message :initform nil :accessor workflow-on-message)
@@ -150,6 +161,7 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   label                                 ; how to name it in notes: nil, or "Claude's part"
   (handoff-advisory nil)               ; latest gaps, for change detection
   (handoff-notice nil)                 ; only changed gaps go to the next review
+  (disputed nil)                        ; finding ids the author's latest report disputes
   (summary "")                          ; the author's latest report
   (review-history nil)                 ; (reviewer conversation) from its last reply
   (review-snapshot nil)                ; (directory . snapshot) of the state asked to be reviewed
@@ -177,7 +189,7 @@ again, or to the other agent, after the first ran out of usage."
   (id (make-uuid))
   (generation 0) (state :new) reason progress contract-revision
   agent prompt original-prompt then target confirming (check-fixes 0) repositories repository-capture
-  role                                  ; :propose, :plan, :replan, :work, :review, :resolve or :check
+  role                                  ; :propose, :plan, :replan, :work, :review, :resolve, :answer or :check
   loop)                                 ; the review loop it belongs to (not for :plan)
 
 (defun post (workflow from to text kind)
@@ -210,6 +222,9 @@ preserve the step for explicit recovery (PAUSE-STEP)."
   (setf (workflow-contract-directions workflow)
         (append (workflow-contract-directions workflow) (list text)))
   (incf (workflow-contract-revision workflow))
+  ;; Decisions taken under earlier direction are to be revisited.
+  (setf (workflow-task-decisions workflow)
+        (mark-decisions-stale (workflow-task-decisions workflow) (workflow-contract-revision workflow)))
   (checkpoint-changed workflow))
 
 (defun task-contract (workflow)
@@ -224,6 +239,9 @@ preserve the step for explicit recovery (PAUSE-STEP)."
               (agent-name (loop-author part)) (agent-name (loop-reviewer part))
               (if (equal (loop-task part) (workflow-request workflow))
                   "The overall request." (loop-task part))))
+    (let ((decisions (records-text (decision-record-lines (workflow-task-decisions workflow)))))
+      (when decisions
+        (format out "~%Decision record (a stale one predates later direction):~%~a~%" decisions)))
     (format out "~%Revisit decisions that later direction affects; report any conflict between an assignment and it.")))
 
 (defun handoff-field (text name)
@@ -241,7 +259,8 @@ preserve the step for explicit recovery (PAUSE-STEP)."
          (gaps (append
                 (unless (eql revision (step-contract-revision step))
                   (list (format nil "task revision missing or different (expected ~d)" (step-contract-revision step))))
-                (unless (handoff-field text "DECISIONS") (list "decisions not reported"))
+                (unless (or (handoff-field text "DECISIONS") (parse-decisions-section text))
+                  (list "decisions not reported"))
                 (unless (handoff-field text "VERIFICATION") (list "verification not reported"))
                 (when (< (step-contract-revision step) (workflow-contract-revision workflow))
                   (list "task direction changed during this turn; check the result against the current contract")))))
@@ -250,6 +269,205 @@ preserve the step for explicit recovery (PAUSE-STEP)."
 
 (defun review-handoff-report (loop)
   (format nil "~a~@[~%~%~a~]" (loop-summary loop) (loop-handoff-notice loop)))
+
+;;; Task records (task-records.lisp): questions between turns, evidence,
+;;; decisions and efficiency events. Questions are exchanged only at turn
+;;; boundaries: a reply's QUESTIONS reach the other agent with its next
+;;; prompt, and its ANSWERS reach the asker with the asker's next one.
+
+(defun records-text (lines)
+  "LINES from a task-records function, a list or a string, as text; nil if there are none."
+  (blank-to-nil (if (listp lines) (format nil "~{~a~^~%~}" lines) lines)))
+
+(defun record-efficiency (workflow kind &rest data)
+  "Add an event (EFFICIENCY-SUMMARY), oldest first."
+  (setf (workflow-efficiency-events workflow)
+        (append (workflow-efficiency-events workflow)
+                (list (list* :kind kind :at (get-universal-time) data)))))
+
+(defun blocked-open-p (workflow id)
+  "Whether ID has a :blocked-start event not yet ended."
+  (let ((open nil))
+    (dolist (event (workflow-efficiency-events workflow) open)
+      (when (equal id (getf event :step))
+        (case (getf event :kind)
+          (:blocked-start (setf open t))
+          (:blocked-end (setf open nil)))))))
+
+(defun record-blocked (workflow id blocked)
+  "Mark ID (a step id) blocked, or no longer blocked, once per transition."
+  (unless (eq (and blocked t) (blocked-open-p workflow id))
+    (record-efficiency workflow (if blocked :blocked-start :blocked-end) :step id)))
+
+(defun add-evidence (workflow kind summary state source)
+  "Index SUMMARY as evidence of KIND about repository STATE (a tree id, or nil) from SOURCE."
+  (let ((evidence (workflow-task-evidence workflow)))
+    (setf (workflow-task-evidence workflow)
+          (record-evidence evidence
+                           (make-evidence :id (1+ (reduce #'max evidence :key #'evidence-id :initial-value 0))
+                                          :kind kind :summary summary :repo-state state :source source
+                                          :at (get-universal-time))))))
+
+(defun find-question (workflow id)
+  (find id (workflow-task-questions workflow) :key #'task-question-id))
+
+(defun answer-workflow-question (workflow id text)
+  "Link TEXT to question ID as its answer; the question, or nil if there is none."
+  (let ((q (answer-question (workflow-task-questions workflow) id text (get-universal-time))))
+    (when q
+      (setf (workflow-task-questions workflow)
+            (substitute-if q (lambda (x) (eql (task-question-id x) id)) (workflow-task-questions workflow))))
+    q))
+
+(defun open-questions-to (workflow agent)
+  "Questions put to AGENT and not yet answered."
+  (remove-if-not (lambda (q) (and (eq (task-question-to q) (agent-id agent)) (null (task-question-answer q))))
+                 (workflow-task-questions workflow)))
+
+(defun held-question-ids (workflow)
+  (loop for hold in (workflow-question-holds workflow) append (cddr hold)))
+
+(defun turn-records-text (workflow agent)
+  "What AGENT is to see at this turn boundary: the questions put to it, and
+answers to its own it hasn't been given, which now count as given."
+  (let* ((asked (open-questions-to workflow agent))
+         (answered (remove-if-not (lambda (q) (and (eq (task-question-from q) (agent-id agent))
+                                                   (task-question-answer q)
+                                                   (not (member (task-question-id q) (workflow-delivered-answers workflow)))))
+                                  (workflow-task-questions workflow)))
+         (parts (remove nil
+                        (list (and asked
+                                   (format nil "Questions for you from ~a, asked at the end of its turn. Answer each in an ~
+ANSWERS section, one line each: `- Q1 answer`. A blocking one holds up its work until answered.~%~a"
+                                           (agent-name (other-agent workflow agent))
+                                           (records-text (questions-prompt-lines asked))))
+                              (and answered
+                                   (format nil "Answers to your questions:~%~a"
+                                           (records-text (questions-prompt-lines answered))))))))
+    (dolist (q answered) (push (task-question-id q) (workflow-delivered-answers workflow)))
+    (and parts (format nil "~{~a~^~%~%~}" parts))))
+
+(defun disputed-finding-ids (text)
+  "The finding ids on a report's DISPUTED: F2, F5 line."
+  (let ((line (handoff-field text "DISPUTED")))
+    (when line
+      (loop with start = 0
+            for at = (position-if #'digit-char-p line :start start)
+            while at
+            collect (multiple-value-bind (n end) (parse-integer line :start at :junk-allowed t)
+                      (setf start end) n)))))
+
+(defun take-turn-records (workflow step text)
+  "Take the task records in completed STEP's reply TEXT: answers to questions
+put to its agent, and from a part's work its questions, decisions, disputed
+findings and reported verification. Returns the ids of new blocking questions
+its work waits for. Malformed records are advisory only: never stop the task."
+  (handler-case
+      (let* ((agent (step-agent step))
+             (other (other-agent workflow agent))
+             (loop (step-loop step))
+             (held '()))
+        (loop for (id . answer) in (parse-answers-section text)
+              for q = (find-question workflow id)
+              when (and q (eq (task-question-to q) (agent-id agent)) (null (task-question-answer q))
+                        (blank-to-nil answer))
+                do (answer-workflow-question workflow id answer)
+                   (note workflow "~a answered Q~d." (agent-name agent) id))
+        (when (and (eq (step-role step) :work) loop)
+          (setf (loop-disputed loop) (disputed-finding-ids text))
+          (dolist (p (parse-questions-section text))
+            (let ((q (make-task-question :id (next-question-id (workflow-task-questions workflow))
+                                         :from (agent-id agent) :to (agent-id other) :text (getf p :text)
+                                         ;; It can't hold work for an agent that can't answer.
+                                         :blocking (and (getf p :blocking) (not (agent-out-of-usage-p other)) t)
+                                         :asked-at (get-universal-time))))
+              (setf (workflow-task-questions workflow) (append (workflow-task-questions workflow) (list q)))
+              (when (task-question-blocking q) (push (task-question-id q) held))
+              (note workflow "~a asks ~a (Q~d, ~:[non-blocking~;blocking~]): ~a" (agent-name agent) (agent-name other)
+                    (task-question-id q) (task-question-blocking q) (task-question-text q))))
+          (dolist (p (parse-decisions-section text))
+            (setf (workflow-task-decisions workflow)
+                  (append (workflow-task-decisions workflow)
+                          (list (make-task-decision
+                                 :id (1+ (reduce #'max (workflow-task-decisions workflow)
+                                                 :key #'task-decision-id :initial-value 0))
+                                 :text (getf p :text) :reason (getf p :reason) :rejected (getf p :rejected)
+                                 :revision (or (step-contract-revision step) (workflow-contract-revision workflow)))))))
+          (let ((verification (handoff-field text "VERIFICATION")))
+            (when verification
+              (add-evidence workflow :discovery (format nil "~a reported: ~a" (agent-name agent) verification)
+                            (repository-state-id (review-directory loop)) (agent-id agent)))))
+        (nreverse held))
+    (error (e)
+      (note workflow "Task records in ~a's reply were skipped: ~a" (agent-name (step-agent step)) e)
+      nil)))
+
+(defun hold-for-answers (workflow step text ids)
+  "STEP's work asked blocking questions IDS: keep its report, and hold its
+part until they are answered (RELEASE-QUESTION-HOLDS)."
+  (let ((loop (step-loop step)))
+    (work-done loop text)
+    (post workflow (step-agent step) (loop-reviewer loop) text :work)
+    (push (list* loop (step-id step) ids) (workflow-question-holds workflow))
+    (record-blocked workflow (step-id step) t)
+    (note workflow "~a waits for the answer~p to ~{Q~d~^, ~} before going on."
+          (string-capitalize (part-name loop) :end 1) (length ids) ids)
+    (update-loop-state workflow loop :paused)))
+
+(defun release-question-holds (workflow)
+  "Carry on held work whose blocking questions are all answered."
+  (dolist (hold (copy-list (workflow-question-holds workflow)))
+    (destructuring-bind (loop step-id &rest ids) hold
+      (when (and (workflow-live-p workflow)
+                 (every (lambda (id) (let ((q (find-question workflow id))) (or (null q) (task-question-answer q)))) ids))
+        (setf (workflow-question-holds workflow) (remove hold (workflow-question-holds workflow)))
+        (record-blocked workflow step-id nil)
+        ;; Something else (revalidation, say) may have taken the part over meanwhile.
+        (unless (or (not (eq (loop-state loop) :paused))
+                    (find-if (lambda (s) (and (eq (step-loop s) loop) (member (step-state s) '(:new :running :paused))))
+                             (workflow-steps workflow)))
+          (note workflow "~a goes on with the answer~p to ~{Q~d~^, ~}."
+                (string-capitalize (part-name loop) :end 1) (length ids) ids)
+          (loop-work workflow loop
+                     (format nil "~:[Your blocking question has been answered: the answer is above. Carry on with your part, using it.~;~
+Your blocking questions have been answered: the answers are above. Carry on with your part, using them.~] ~a"
+                             (rest ids) (work-reply-instruction loop))))))))
+
+(defun give-up-questions (workflow ids why)
+  "Answer the questions IDS still open with WHY, so held work can go on."
+  (dolist (id ids)
+    (let ((q (find-question workflow id)))
+      (when (and q (null (task-question-answer q)))
+        (answer-workflow-question workflow id why)))))
+
+(defun answer-prompt (workflow agent)
+  (format nil "~a's work waits for your answer to the question~p above, at this turn boundary. ~
+Answer each in an ANSWERS section, one line each: `- Q1 answer`; if you can't answer one, say so on its line. ~
+Don't change any files for this."
+          (agent-name (other-agent workflow agent))
+          (length (open-questions-to workflow agent))))
+
+(defun ask-blocking-questions (workflow)
+  "Give an agent with nothing under way a turn of its own to answer the
+blocking questions held work waits for: they'd otherwise wait for a turn
+it may never get. One such turn per question; unanswered after it, the
+question is given up so the work can go on."
+  (when (workflow-live-p workflow)
+    (dolist (agent (list (workflow-lead workflow) (workflow-partner workflow)))
+      (let ((ids (loop for q in (open-questions-to workflow agent)
+                       for id = (task-question-id q)
+                       when (and (member id (held-question-ids workflow))
+                                 (not (member id (workflow-answer-turns workflow))))
+                         collect id)))
+        (when (and ids (agent-quiescent-p agent)
+                   (notany (lambda (s) (and (eq (step-agent s) agent) (member (step-state s) '(:new :running))))
+                           (workflow-steps workflow)))
+          (setf (workflow-answer-turns workflow) (append (workflow-answer-turns workflow) ids))
+          (submit workflow agent (answer-prompt workflow agent)
+                  (lambda (text error)
+                    (declare (ignore text error))
+                    (give-up-questions workflow ids "No answer was given."))
+                  :role :answer :target ids))))))
 
 (defun workflow-agent-submit (workflow step agent prompt callback)
   ;; Persist an unknown entry before dispatch: a crash must not make a
@@ -262,13 +480,17 @@ preserve the step for explicit recovery (PAUSE-STEP)."
          (check (blank-to-nil (workflow-check-command workflow)))
          (instructions
            (when (eq (step-role step) :work)
-             (format nil "After the full answer, add plain lines TASK REVISION: ~d, DECISIONS: <choices and reasons, or NONE>, VERIFICATION: <checks and results, or NOT RUN with reason>.~@[ `~a` runs automatically after your turn and its result goes to the reviewer: run targeted checks as needed instead of running it yourself.~]"
-                     (step-contract-revision step) check)))
-         (full (format nil "~a~@[~%~%~a~]~%~%~a" brief instructions prompt))
+             (format nil "After the full answer, add plain lines TASK REVISION: ~d, DECISIONS: <choices and reasons, or NONE>, VERIFICATION: <checks and results, or NOT RUN with reason>. ~
+For decisions worth keeping, use a DECISIONS section instead, one line each: `- D1 choice — because reason; rejected: other options`. ~
+To ask ~a something, add a QUESTIONS section: `- Q1 [blocking] question` if your work can't go on without the answer (it waits for it), else `- Q1 [non-blocking] question`.~
+~@[ `~a` runs automatically after your turn and its result goes to the reviewer: run targeted checks as needed instead of running it yourself.~]"
+                     (step-contract-revision step) (agent-name (other-agent workflow agent)) check)))
+         (records (turn-records-text workflow agent))
+         (full (format nil "~a~@[~%~%~a~]~@[~%~%~a~]~%~%~a" brief instructions records prompt))
          (prompt
            (if (and handle (equal handle (second seen)) (equal brief (third seen)))
-               (let ((compact (format nil "Shared task contract revision ~d is unchanged.~@[~%~%~a~]~%~%~a"
-                                      (workflow-contract-revision workflow) instructions prompt)))
+               (let ((compact (format nil "Shared task contract revision ~d is unchanged.~@[~%~%~a~]~@[~%~%~a~]~%~%~a"
+                                      (workflow-contract-revision workflow) instructions records prompt)))
                  ;; Flatten older compact work/review fallbacks before adding
                  ;; this one, so losing a session restores both contexts.
                  (remember-context-fallback agent compact (prompt-without-history agent full))
@@ -335,7 +557,13 @@ preserve the step for explicit recovery (PAUSE-STEP)."
    (list (format nil "Elapsed: ~a (includes pauses)"
                  (let ((seconds (getf completion :elapsed-seconds)))
                    (if seconds (format nil "~dm ~ds" (floor seconds 60) (mod seconds 60)) "unknown")))
-         (format nil "Open findings: ~d" (getf completion :open-findings 0)))
+         (format nil "Open findings: ~d~[~:; (suggestions: ~:*~d, which don't stop approval)~]"
+                 (getf completion :open-findings 0) (getf completion :open-suggestions 0)))
+   (and (getf completion :efficiency)
+        (let ((lines (efficiency-summary-lines (getf completion :efficiency))))
+          (if (listp lines) lines (list lines))))
+   (let ((unanswered (getf completion :unanswered-questions 0)))
+     (and (plusp unanswered) (list (format nil "Unanswered questions: ~d" unanswered))))
    (loop for round in (getf completion :rounds)
          collect (format nil "~a: ~d review round~:p" (first round) (second round)))
    (loop for stage in (getf completion :stage-metrics)
@@ -401,14 +629,20 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                                       (loop-handoff-advisory part) advisory)
                                 (when (loop-handoff-notice part)
                                   (note workflow "~a" (loop-handoff-notice part)))))
-                            ;; Refresh restart state before the continuation can
-                            ;; start another turn or pause. Its newer capture wins.
-                            (refresh-recovery-baseline workflow nil)
-                            (handler-case (funcall (step-then step) text nil)
-                              (error (e)
-                                (setf (step-reason step) :continuation-failed
-                                      (step-progress step) (format nil "~a~%~%Continuation stopped: ~a" text e))
-                                (pause-step workflow step)))
+                            (let ((held (take-turn-records workflow step text)))
+                              ;; Refresh restart state before the continuation can
+                              ;; start another turn or pause. Its newer capture wins.
+                              (refresh-recovery-baseline workflow nil)
+                              (if held
+                                  (hold-for-answers workflow step text held)
+                                  (handler-case (funcall (step-then step) text nil)
+                                    (error (e)
+                                      (setf (step-reason step) :continuation-failed
+                                            (step-progress step) (format nil "~a~%~%Continuation stopped: ~a" text e))
+                                      (pause-step workflow step))))
+                              ;; Answers can free held work; held work can need an answer turn.
+                              (release-question-holds workflow)
+                              (ask-blocking-questions workflow))
                             (checkpoint-changed workflow))))))))
 
 ;;; Carrying on past the last round
@@ -467,6 +701,7 @@ unapproved has its author address the last review. True if it carried on."
       (:check (format nil "~a’s check" name))
       (:propose (format nil "~a's proposal" name))
       (:resolve (format nil "~a's resolving of the merge conflicts" name))
+      (:answer (format nil "~a's answers to questions" name))
       (:plan (format nil "~a's plan for splitting the work" name))
       (:replan (format nil "~a's revised plan" name))
       (:work (format nil "~a's work~@[ on ~a~]" name (and loop (loop-label loop))))
@@ -544,6 +779,7 @@ from a checkpoint saved before its snapshot was ready."
     (setf (step-progress step) (agent-partial-text (step-agent step))))
   (setf (step-state step) :paused)
   (pushnew step (workflow-paused workflow) :test #'eq)
+  (record-blocked workflow (step-id step) t)
   (unless (step-reason step) (setf (step-reason step) :out-of-usage))
   (setf (step-repositories step) (workflow-recovery-baseline workflow))
   (refresh-recovery-baseline workflow (list step))
@@ -552,21 +788,24 @@ from a checkpoint saved before its snapshot was ready."
   ;; Waiting for a prerequisite is part of the plan: it starts again by
   ;; itself (CHECK-FINISHED), so the user isn't asked, unless it deadlocks.
   (let ((waiting (and (step-loop step) (waiting-step-p step))))
-    (if waiting
-        (note workflow "~a waits for ~{~a~^ and ~}." (step-description step)
-              (mapcar #'part-name (loop-dependencies (step-loop step))))
-        (progn
-          (note workflow "~a paused (~a). Available progress: ~a"
-                (step-description step) (step-reason step) (or (step-progress step) "No final reply yet."))
-          (let ((other (other-agent workflow (step-agent step)))
-                (message (format nil "~a paused (~a). Its incomplete result is unavailable; continue only independent work."
-                                 (step-description step) (step-reason step))))
-            (post workflow :system other message :note))
-          ;; Blocked, not invalidated: they go on once it's complete.
-          (dolist (dependent (workflow-loops workflow))
-            (when (and (step-loop step) (member (step-loop step) (loop-dependencies dependent)))
-              (note workflow "~a is blocked until ~a is complete."
-                    (string-capitalize (part-name dependent) :end 1) (part-name (step-loop step)))))))
+    (cond
+      (waiting
+       (note workflow "~a waits for ~{~a~^ and ~}." (step-description step)
+             (mapcar #'part-name (loop-dependencies (step-loop step)))))
+      ;; ESCALATE-DISAGREEMENT has said why; the other agent's work isn't affected.
+      ((eq (step-reason step) :disagreement))
+      (t
+       (note workflow "~a paused (~a). Available progress: ~a"
+             (step-description step) (step-reason step) (or (step-progress step) "No final reply yet."))
+       (let ((other (other-agent workflow (step-agent step)))
+             (message (format nil "~a paused (~a). Its incomplete result is unavailable; continue only independent work."
+                              (step-description step) (step-reason step))))
+         (post workflow :system other message :note))
+       ;; Blocked, not invalidated: they go on once it's complete.
+       (dolist (dependent (workflow-loops workflow))
+         (when (and (step-loop step) (member (step-loop step) (loop-dependencies dependent)))
+           (note workflow "~a is blocked until ~a is complete."
+                 (string-capitalize (part-name dependent) :end 1) (part-name (step-loop step)))))))
     (note-retained-worktrees workflow)
     (checkpoint-changed workflow)
     (when (and (workflow-on-pause workflow) (not waiting))
@@ -584,6 +823,7 @@ from a checkpoint saved before its snapshot was ready."
   "Take STEP off the paused list; true if it was on it (so each choice counts once)."
   (when (member step (workflow-paused workflow))
     (setf (workflow-paused workflow) (remove step (workflow-paused workflow)))
+    (record-blocked workflow (step-id step) nil)
     t))
 
 (defun %resume-step (workflow step)
@@ -615,6 +855,12 @@ does then goes unreviewed, since the one that would review it is out."
       (ecase (step-role step)
         (:propose
          (proposal-in workflow out nil (format nil "~a is unavailable" (agent-name out))))
+        (:answer
+         ;; The asker can't answer its own questions: its work goes on without.
+         (note workflow "Held work goes on without ~a's answers." (agent-name out))
+         (give-up-questions workflow (coerce (step-target step) 'list)
+                            (format nil "No answer: ~a is unavailable." (agent-name out)))
+         (release-question-holds workflow))
         ((:resolve :replan)
          (note workflow "~a ~a instead." (agent-name other)
                (if (eq (step-role step) :resolve) "resolves the conflicts" "revises the plan"))
@@ -643,8 +889,13 @@ does then goes unreviewed, since the one that would review it is out."
 (defun work-prompt (reviewer task)
   (format nil "~a~%~%(When you finish, ~a will review your work.)" task (agent-name reviewer)))
 
-(defun full-review-prompt (loop &optional changes)
-  "CHANGES: a note on where to find the changes under review, or nil."
+(defparameter *severity-instruction*
+  "Put [suggestion] after the status of an optional finding; an unmarked finding is a blocker. Approve only if none of your blockers is left [open]: open suggestions don't stop approval."
+  "How reviewers mark findings' severity, and what it means for approval.")
+
+(defun full-review-prompt (loop &optional changes evidence)
+  "CHANGES: a note on where to find the changes under review, or nil.
+EVIDENCE: the evidence index (REVIEW-EVIDENCE-TEXT), or nil."
   (let ((author (agent-name (loop-author loop)))
         (findings (loop-findings loop)))
     (format nil "~a was asked to do this:~%~%~a~%~%~a reports:~%~%~a~%~%~
@@ -659,17 +910,17 @@ Be brief; put the substance in the FINDINGS lines. List ~:[~;any new ~]issues in
 most important first, one line each, in this form (the location is optional):~%~%~
 FINDINGS:~%~
 - F~d [open] `path/to/file:line` What is wrong, and what to do about it~%~%~
-Write FINDINGS: NONE if there are none. Approve only if none of your findings is left [open].~%~%~
+Write FINDINGS: NONE if there are none. ~a~%~%~
 End your reply with one line on its own, exactly one of:~%~
 VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
             author (loop-task loop) author (review-handoff-report loop)
-            (let ((text (format nil "~@[~a~]~@[~a~%~%~]~@[~a~%~%~]"
+            (let ((text (format nil "~@[~a~]~@[~a~%~%~]~@[~a~%~%~]~@[~a~%~%~]"
                                 (and (loop-tree loop) (worktree-note loop))
-                                changes (loop-check-report loop))))
+                                changes (loop-check-report loop) evidence)))
               (and (plusp (length text)) text))
             findings (findings-lines findings) findings
-            (next-finding-id findings))))
+            (next-finding-id findings) *severity-instruction*)))
 
 (defun review-prompt (loop &key full workflow)
   "Use a compact follow-up only while the same reviewer retains its history.
@@ -679,15 +930,16 @@ its last review."
   (let* ((reviewer (loop-reviewer loop))
          (handle (agent-conversation-handle reviewer))
          (snapshot (and workflow (take-review-snapshot loop)))
-         (complete (full-review-prompt loop (and snapshot (review-start-note workflow loop snapshot)))))
+         (evidence (and workflow (review-evidence-text workflow loop snapshot)))
+         (complete (full-review-prompt loop (and snapshot (review-start-note workflow loop snapshot)) evidence)))
     (if (and (not full) (plusp (loop-round loop)) (loop-findings loop) handle
              (equal (loop-review-history loop) (list reviewer handle)))
         (let* ((delta (and snapshot (review-delta-note loop snapshot reviewer handle)))
                (prompt
-                (format nil "~a reports:~%~%~a~%~%~a~@[~a~%~%~]~
+                (format nil "~a reports:~%~%~a~%~%~a~@[~a~%~%~]~@[~a~%~%~]~
 ~a Don't change files.~%~
 Earlier findings:~%~a~%~
-Repeat each finding with its updated status: [fixed] if dealt with, [dismissed] if the reasons convince you, [open] if it still stands. Keep existing IDs. Approve only if none is left [open].~%~
+Repeat each finding with its updated status: [fixed] if dealt with, [dismissed] if the reasons convince you, [open] if it still stands. Keep existing IDs. ~a~%~
 Be brief; put the substance in the FINDINGS lines.~%~
 FINDINGS:~%- F~d [open] `path/to/file:line` Issue and remedy~%~
 Or FINDINGS: NONE. End with exactly VERDICT: APPROVED or VERDICT: CHANGES REQUESTED on its own line."
@@ -695,22 +947,23 @@ Or FINDINGS: NONE. End with exactly VERDICT: APPROVED or VERDICT: CHANGES REQUES
                         (cond ((null (loop-tree loop)) "")
                               (delta (worktree-location-note loop))
                               (t (worktree-note loop)))
-                        (loop-check-report loop)
+                        (loop-check-report loop) evidence
                         (or delta "Review the work again; read the changed files and git diff.")
-                        (findings-lines (loop-findings loop))
+                        (findings-lines (loop-findings loop)) *severity-instruction*
                         (next-finding-id (loop-findings loop)))))
           (remember-context-fallback reviewer prompt complete)
           prompt)
         complete)))
 
 (defun confirm-prompt (loop)
-  (format nil "You approved, but these findings of yours are still open:~%~%~a~%~%~
-Settle each of them in a FINDINGS section: [fixed] if it has been dealt with, [dismissed] if it needn't be. ~
-If any still stands, keep it [open] and request changes instead.~%~%~
+  (format nil "You approved, but these blockers of yours are still open:~%~%~a~%~%~
+Settle each of them in a FINDINGS section: [fixed] if it has been dealt with, [dismissed] if it needn't be, ~
+or [open] [suggestion] if it's only optional. If any blocker still stands, keep it [open] and request changes instead.~%~%~
 End your reply with one line on its own, exactly one of:~%~
 VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
-          (findings-lines (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq))))
+          (findings-lines (remove-if-not (lambda (f) (and (eq (finding-status f) :open) (eq (finding-severity f) :blocker)))
+                                         (loop-findings loop)))))
 
 (defparameter *split-reply-limit* 60000 "Maximum inline part reply length in combined results.")
 
@@ -799,7 +1052,8 @@ a conversation that can't be resumed."
                 (loop-findings loop))))
     (format nil "~a reviewed your work~:[ and requested changes~;~]:~%~%~a~%~%~
 ~@[These findings are still open:~%~%~a~%~%~]~
-Address the points you agree with, and say briefly why for any you don't. ~a"
+Address the points you agree with, and say briefly why for any you don't; list the blockers you dispute on a line ~
+DISPUTED: F2, F5. Suggestions are optional. ~a"
             (agent-name (loop-reviewer loop)) (eq (review-verdict review) :approved) review
             (and open (findings-lines open))
             (work-reply-instruction loop))))
@@ -811,11 +1065,15 @@ Address the points you agree with, and say briefly why for any you don't. ~a"
 one for you and one for ~a. Reply in exactly this form:~%~%~
 LEAD TASK:~%<your part>~%~%~
 PARTNER TASK:~%<~a's part, complete in itself: ~a won't see this conversation>~%~%~
-ORDER: PARALLEL~%~%~
-Split it so both parts can be done at the same time if you can. If one part can't start without the ~
-other's result, write ORDER: LEAD FIRST (yours is done first) or ORDER: PARTNER FIRST (~a's is) ~
-instead; neither part can wait for the other both ways. ~
-If the task is too small to split, write NONE under PARTNER TASK."
+ORDER: PARALLEL~%~
+ORDER REASON: <why this order>~%~%~
+Choose the order from: what each part depends on; how settled the interfaces between them are ~
+(an unsettled one is cheaper to fix first, in one part, than to guess at in both); and the cost ~
+of integrating and reviewing the parts (overlapping changes conflict and are reviewed twice). ~
+Parallel parts suit independent work with settled interfaces. If one part can't start without the ~
+other's result, or depends on an unsettled interface it defines, write ORDER: LEAD FIRST (yours is done first) ~
+or ORDER: PARTNER FIRST (~a's is) instead; neither part can wait for the other both ways. ~
+If splitting costs more to integrate and review than it saves, write NONE under PARTNER TASK."
             p p p p)))
 
 (defun revise-plan-prompt (partner problem)
@@ -966,13 +1224,25 @@ APPROVED (give or take Markdown emphasis and punctuation), otherwise
                   (plan-order (string-trim '(#\Space #\Tab #\Return #\* #\_ #\` #\.) value))))
         (values text nil))))
 
+(defun split-order-reason (text)
+  "TEXT without its ORDER REASON: lines, and the last one's reason (nil without one)."
+  (let ((reason nil) (kept '()))
+    (dolist (line (uiop:split-string text :separator '(#\Newline)))
+      (let ((clean (string-left-trim '(#\Space #\Tab #\* #\_ #\#) line)))
+        (if (and (>= (length clean) 13) (string-equal "ORDER REASON:" clean :end2 13))
+            (setf reason (blank-to-nil (string-trim '(#\Space #\Tab #\Return #\* #\_) (subseq clean 13))))
+            (push line kept))))
+    (values (format nil "~{~a~^~%~}" (nreverse kept)) reason)))
+
 (defun parse-plan (text)
-  "The lead's and partner's tasks from a plan's TEXT, and its order, as three
-values. The partner's is nil when there is none (NONE, or no PARTNER TASK
-section). The order (PLAN-ORDER) is :parallel without an ORDER line."
-  (multiple-value-bind (text order) (split-order-line text)
-    (multiple-value-bind (lead partner) (parse-plan-parts text)
-      (values lead partner (or order :parallel)))))
+  "The lead's and partner's tasks from a plan's TEXT, its order and the
+reason for that order, as four values. The partner's is nil when there is
+none (NONE, or no PARTNER TASK section). The order (PLAN-ORDER) is :parallel
+without an ORDER line; the reason is nil without an ORDER REASON line."
+  (multiple-value-bind (text reason) (split-order-reason text)
+    (multiple-value-bind (text order) (split-order-line text)
+      (multiple-value-bind (lead partner) (parse-plan-parts text)
+        (values lead partner (or order :parallel) reason)))))
 
 (defun parse-plan-parts (text)
   (let ((lead-at (search "LEAD TASK:" text :test #'char-equal))
@@ -998,16 +1268,25 @@ section). The order (PLAN-ORDER) is :parallel without an ORDER line."
   (status :open)                        ; :open :fixed :dismissed
   location                              ; "src/a.lisp:42", or nil
   (text "")
+  (severity :blocker)                   ; :blocker stops approval; :suggestion doesn't
+  (disputes 0)                          ; consecutive rounds it stayed open while its author disputed it
   round)                                ; the review round that raised it
 
 (defparameter *finding-statuses*
   '(("open" . :open) ("still open" . :open) ("fixed" . :fixed) ("addressed" . :fixed) ("resolved" . :fixed)
     ("dismissed" . :dismissed) ("wontfix" . :dismissed) ("won't fix" . :dismissed)))
 
+(defparameter *finding-severities*
+  '(("blocker" . :blocker) ("blocking" . :blocker) ("suggestion" . :suggestion)
+    ("optional" . :suggestion) ("non-blocking" . :suggestion) ("nit" . :suggestion)))
+
+(defparameter *dispute-escalation-rounds* 2
+  "Reviews in a row a blocker may stay open while its author disputes it before the user is asked to decide.")
+
 (defun parse-finding-line (line)
-  "A finding from one LINE of a FINDINGS section, \"- F2 [open] `a.lisp:4` What's wrong\",
-as a plist (:id :status :location :text); nil for a line that isn't one.
-It needs an F number or a [status]; the location is optional."
+  "A finding from one LINE of a FINDINGS section, \"- F2 [open] [suggestion] `a.lisp:4` What's wrong\",
+as a plist (:id :status :severity :location :text); nil for a line that isn't one.
+It needs an F number or a [status]; the severity (nil if not given) and location are optional."
   (let* ((line (string-trim '(#\Space #\Tab #\Return) line))
          (start (cond ((and (plusp (length line)) (find (char line 0) "-*+")) 1)
                       ((let ((dot (position #\. line)))
@@ -1015,22 +1294,29 @@ It needs an F number or a [status]; the location is optional."
                       (t nil))))
     (when start
       (let ((rest (string-left-trim " *_" (subseq line start)))
-            id status location)
+            id status severity location)
         (when (and (> (length rest) 1) (char-equal (char rest 0) #\F) (digit-char-p (char rest 1)))
           (multiple-value-bind (n end) (parse-integer rest :start 1 :junk-allowed t)
             (setf id n rest (string-left-trim " *_:." (subseq rest end)))))
-        (when (and (plusp (length rest)) (char= (char rest 0) #\[))
-          (let ((close (position #\] rest)))
-            (when close
-              (setf status (cdr (assoc (string-trim " " (subseq rest 1 close)) *finding-statuses* :test #'string-equal))
-                    rest (string-left-trim " *_:" (subseq rest (1+ close)))))))
+        ;; A first [tag] is always taken; a second only if it's a status or severity.
+        (loop for first in '(t nil)
+              while (and (plusp (length rest)) (char= (char rest 0) #\[))
+              do (let* ((close (position #\] rest))
+                        (tag (and close (string-trim " " (subseq rest 1 close))))
+                        (known-status (and tag (cdr (assoc tag *finding-statuses* :test #'string-equal))))
+                        (known-severity (and tag (cdr (assoc tag *finding-severities* :test #'string-equal)))))
+                   (unless (and close (or first known-status known-severity)) (return))
+                   (if known-severity
+                       (setf severity known-severity)
+                       (setf status (or known-status status)))
+                   (setf rest (string-left-trim " *_:" (subseq rest (1+ close))))))
         (when (and (plusp (length rest)) (char= (char rest 0) #\`))
           (let ((close (position #\` rest :start 1)))
             (when close
               (setf location (subseq rest 1 close)
                     rest (subseq rest (1+ close))))))
         (when (or id status)
-          (list :id id :status (or status :open) :location location
+          (list :id id :status (or status :open) :severity severity :location location
                 :text (string-trim '(#\Space #\Tab #\— #\– #\- #\: #\*) rest)))))))
 
 (defun parse-findings (text)
@@ -1057,23 +1343,32 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
       (let ((old (and (getf p :id) (find (getf p :id) findings :key #'finding-id))))
         (if old
             (progn (setf (finding-status old) (getf p :status))
+              (when (getf p :severity) (setf (finding-severity old) (getf p :severity)))
               (when (getf p :location) (setf (finding-location old) (getf p :location)))
               (when (zerop (length (finding-text old))) (setf (finding-text old) (getf p :text))))
             (push (make-finding :id (or (getf p :id) (next-finding-id findings))
                                 :status (getf p :status) :location (getf p :location)
+                                :severity (or (getf p :severity) :blocker)
                                 :text (getf p :text) :round round)
                   findings))))
     (sort findings #'< :key #'finding-id)))
 
 (defun findings-lines (findings)
-  "FINDINGS in the form a review lists them."
+  "FINDINGS in the form a review lists them; a blocker, the default, isn't marked."
   (format nil "~{~a~^~%~}"
           (loop for f in findings
-                collect (format nil "- F~d [~(~a~)] ~@[`~a` ~]~a"
-                                (finding-id f) (finding-status f) (finding-location f) (finding-text f)))))
+                collect (format nil "- F~d [~(~a~)] ~:[~;[suggestion] ~]~@[`~a` ~]~a"
+                                (finding-id f) (finding-status f) (eq (finding-severity f) :suggestion)
+                                (finding-location f) (finding-text f)))))
 
-(defun count-findings (findings status)
-  (count status findings :key #'finding-status))
+(defun count-findings (findings status &optional severity)
+  "How many FINDINGS have STATUS (and SEVERITY, if given)."
+  (count-if (lambda (f) (and (eq (finding-status f) status)
+                             (or (null severity) (eq (finding-severity f) severity))))
+            findings))
+
+(defun open-blockers (findings)
+  (count-findings findings :open :blocker))
 
 (defun checklist-findings-text (findings)
   "Group findings by status without changing their stable IDs or stored order."
@@ -1086,9 +1381,10 @@ ROUND. Those it leaves out stay as they were. A fresh list, by id."
               when group do
                 (format out "**~a (~d)**~%~%" title (length group))
                 (dolist (f group)
-                  (format out "- ~a **F~d** ~(~a~)~@[ · `~a`~] — ~a~%"
+                  (format out "- ~a **F~d** ~(~a~)~:[~; · suggestion~]~@[ · `~a`~] — ~a~%"
                           (ecase status (:open "☐") (:fixed "☑") (:dismissed "☒"))
-                          (finding-id f) status (finding-location f) (finding-text f)))
+                          (finding-id f) status (eq (finding-severity f) :suggestion)
+                          (finding-location f) (finding-text f)))
                 (terpri out)))))
 
 (defun checklist-text (loop)
@@ -1243,7 +1539,10 @@ the lead reconciles them into a plan."
 (defun plan-ready (workflow plan)
   "The lead's PLAN is in: wait for the user to approve it, if asked to, or start on it."
   (post workflow (workflow-lead workflow) (workflow-partner workflow) plan :plan)
-  (multiple-value-bind (lead-task partner-task order) (parse-plan plan)
+  (multiple-value-bind (lead-task partner-task order reason) (parse-plan plan)
+    (when (and lead-task partner-task)
+      (note workflow "Order: ~(~a~)~:[ (no reason given)~;~:*: ~a~]"
+            (substitute #\Space #\- (string order)) reason))
     (let ((problem (and lead-task partner-task (plan-order-problem order))))
       (cond ((workflow-approve-plan-p workflow)
              (await-plan workflow lead-task partner-task :order order :error problem))
@@ -1427,6 +1726,18 @@ why it couldn't start in that order: then nothing has started."
   (publish-checklist workflow loop)
   (loop-work workflow loop prompt))
 
+(defun make-work-step (workflow loop prompt)
+  "A step for LOOP's author to work on PROMPT; then its work is checked and reviewed."
+  (make-step :agent (loop-author loop) :prompt (author-work-prompt loop prompt) :role :work :loop loop
+             :then (lambda (text error)
+                     (cond (error
+                            (loop-failed workflow loop (format nil "~a's turn failed: ~a"
+                                                               (agent-name (loop-author loop)) text)))
+                           (t
+                            (work-done loop text)
+                            (post workflow (loop-author loop) (loop-reviewer loop) text :work)
+                            (loop-check workflow loop))))))
+
 (defun loop-work (workflow loop prompt &key prepare)
   "LOOP's author works on PROMPT. PREPARE: it starts as a dependent part
 does (START-DEPENDENT-STEP), given its ready prerequisites' work; one not
@@ -1434,16 +1745,7 @@ ready waits for it in any case."
   (setf (loop-check-report loop) nil
         (loop-check-failed loop) nil)
   (update-loop-state workflow loop :working)
-  (let* ((prompt (author-work-prompt loop prompt))
-         (step (make-step :agent (loop-author loop) :prompt prompt :role :work :loop loop
-                         :then (lambda (text error)
-                                 (cond (error
-                                        (loop-failed workflow loop (format nil "~a's turn failed: ~a"
-                                                                           (agent-name (loop-author loop)) text)))
-                                       (t
-                                        (work-done loop text)
-                                        (post workflow (loop-author loop) (loop-reviewer loop) text :work)
-                                        (loop-check workflow loop)))))))
+  (let ((step (make-work-step workflow loop prompt)))
     (if (and prepare (loop-dependencies loop) (loop-prerequisites-ready-p loop))
         (progn (setf (step-reason step) :dependency)
                (push step (workflow-steps workflow))
@@ -1483,6 +1785,13 @@ ready waits for it in any case."
 until it passes: request changes, saying what needs fixing.~%~%~a"
                           fixes report))
               (loop-check-failed loop) (not passed))
+        ;; Indexed against the state it ran on; a repeat on the same state is waste.
+        (let ((state (repository-state-id (review-directory loop))))
+          (add-evidence workflow :check status state :check)
+          (when (and log-path (not passed))
+            (add-evidence workflow :artifact (format nil "Failed check log: ~a" log-path) state :check))
+          (when state
+            (record-efficiency workflow :check :command command :repo-state state :passed passed)))
         (post workflow :system (loop-author loop) report :check)
         (when (workflow-live-p workflow)
           (if (or passed (>= fixes *check-fix-attempts*))
@@ -1557,7 +1866,14 @@ still open, and is asked once to settle them (that's no new round)."
         (loop-last-review loop) text)
   (post workflow (loop-reviewer loop) (loop-author loop) text :review)
   (take-findings workflow loop text)
-  (let ((open (count-findings (loop-findings loop) :open)))
+  (unless confirming
+    (dolist (f (loop-findings loop))
+      (when (eq (finding-status f) :open)
+        (record-efficiency workflow :finding :id (finding-id f) :location (finding-location f)
+                                             :text (finding-text f) :round (loop-round loop))))
+    (count-disputes loop))
+  ;; Open suggestions don't stop approval.
+  (let ((open (open-blockers (loop-findings loop))))
     (cond ((and (eq (review-verdict text) :approved) (loop-check-failed loop))
            ;; Approval means the check passes too; the user can continue it.
            (update-loop-state workflow loop :unresolved)
@@ -1579,6 +1895,9 @@ still open, and is asked once to settle them (that's no new round)."
            (update-loop-state workflow loop :approved)
            (note workflow "~a approved ~a." (agent-name (loop-reviewer loop)) (or (loop-label loop) "the work"))
            (check-finished workflow))
+          ;; Before the round limit: the user decides even in the last round.
+          ((find-if (lambda (f) (>= (finding-disputes f) *dispute-escalation-rounds*)) (loop-findings loop))
+           (escalate-disagreement workflow loop text))
           ((>= (loop-round loop) (workflow-max-rounds workflow))
            (update-loop-state workflow loop :unresolved)
            (note workflow "Stopping ~a after ~d review round~:p without approval."
@@ -1588,6 +1907,78 @@ still open, and is asked once to settle them (that's no new round)."
            (note workflow "Round ~d~@[ (~a)~]: ~a addresses the review."
                  (1+ (loop-round loop)) (loop-label loop) (agent-name (loop-author loop)))
            (loop-work workflow loop (fix-prompt loop text))))))
+
+(defun count-disputes (loop)
+  "Count one more review for each blocker LOOP's author disputed that stays
+open; the rest start over."
+  (dolist (f (loop-findings loop))
+    (setf (finding-disputes f)
+          (if (and (eq (finding-status f) :open) (eq (finding-severity f) :blocker)
+                   (member (finding-id f) (loop-disputed loop)))
+              (1+ (finding-disputes f))
+              0)))
+  (setf (loop-disputed loop) nil))
+
+(defun disputed-findings (loop)
+  (remove-if (lambda (f) (< (finding-disputes f) *dispute-escalation-rounds*)) (loop-findings loop)))
+
+(defun escalate-disagreement (workflow loop review)
+  "The author keeps disputing blockers the reviewer keeps open: rather than
+another round, the author's next step waits for the user (DECIDE-DISAGREEMENT)."
+  (let ((ids (mapcar #'finding-id (disputed-findings loop)))
+        (step (make-work-step workflow loop (fix-prompt loop review))))
+    (note workflow "~a disputes ~{F~d~^, ~} and ~a keeps ~:[it~;them~] open after ~d reviews: you decide whether ~:*~:*~:[it stands~;they stand~]."
+          (agent-name (loop-author loop)) ids (agent-name (loop-reviewer loop)) (rest ids)
+          *dispute-escalation-rounds*)
+    (setf (step-reason step) :disagreement
+          (step-original-prompt step) (step-prompt step))
+    (push step (workflow-steps workflow))
+    (pause-step workflow step)))
+
+(defun work-again (workflow loop step)
+  "Submit LOOP's paused work STEP as LOOP-WORK starts work: its check is run afresh."
+  (setf (loop-check-report loop) nil
+        (loop-check-failed loop) nil)
+  (update-loop-state workflow loop :working)
+  (submit-step workflow step))
+
+(defun decide-disagreement (workflow step decision)
+  "The user settles the disagreement STEP waits on (ESCALATE-DISAGREEMENT):
+DECISION :keep has the author address the disputed blockers; :dismiss
+dismisses them, approving the work if no blocker is left open. True if done."
+  (when (and (workflow-live-p workflow) (eq (step-reason step) :disagreement) (step-loop step)
+             (agent-quiescent-p (step-agent step)) (unpause workflow step))
+    (let* ((loop (step-loop step))
+           (disputed (disputed-findings loop)))
+      (dolist (f disputed) (setf (finding-disputes f) 0))
+      (ecase decision
+        (:keep
+         (note workflow "You decided ~{F~d~^, ~} stand~:[s~;~]: ~a addresses ~:*~:*~:[it~;them~]."
+               (mapcar #'finding-id disputed) (rest disputed) (agent-name (loop-author loop)))
+         (setf (step-reason step) nil
+               (step-prompt step)
+               (format nil "The user has decided that these findings stand: address them, rather than disputing them again.~%~%~a~%~%~a"
+                       (findings-lines disputed) (step-prompt step)))
+         (work-again workflow loop step))
+        (:dismiss
+         (dolist (f disputed) (setf (finding-status f) :dismissed))
+         (note workflow "You dismissed ~{F~d~^, ~}." (mapcar #'finding-id disputed))
+         ;; Approval also needs the check to pass.
+         (cond ((and (zerop (open-blockers (loop-findings loop))) (not (loop-check-failed loop)))
+                (incf (step-generation step))
+                (setf (step-state step) :superseded)
+                (update-loop-state workflow loop :approved)
+                (note workflow "No blocker is left open, so ~a is approved by your decision." (or (loop-label loop) "the work"))
+                (check-finished workflow))
+               (t
+                (setf (step-reason step) nil
+                      (step-prompt step)
+                      (format nil "The user dismissed these findings: leave them as they are.~@[ ~a~]~%~%~a~%~%~a"
+                              (and (loop-check-failed loop) "The check still fails: fix that.")
+                              (findings-lines disputed) (step-prompt step)))
+                (work-again workflow loop step)))))
+      (checkpoint-changed workflow)
+      t)))
 
 (defun loop-failed (workflow loop why)
   (setf (workflow-completion-error workflow) why)
@@ -1641,8 +2032,9 @@ still open, and is asked once to settle them (that's no new round)."
   (checkpoint-changed workflow)
   (note workflow "Done: ~{~a~^; ~}."
         (loop for l in (workflow-loops workflow)
-              collect (format nil "~@[~a ~]~a~[~:;, ~:*~d finding~:p open~]" (loop-label l)
-                              (loop-outcome l) (count-findings (loop-findings l) :open))))
+              collect (format nil "~@[~a ~]~a~[~:;, ~:*~d finding~:p open~]~[~:;, ~:*~d suggestion~:p open~]"
+                              (loop-label l) (loop-outcome l) (open-blockers (loop-findings l))
+                              (count-findings (loop-findings l) :open :suggestion))))
   (note-retained-worktrees workflow)
   (capture-workflow-completion workflow)
   (when (workflow-on-finish workflow)
@@ -1775,6 +2167,36 @@ for before; nil outside a git repository, or if it fails."
       (forget-review-snapshot (loop-review-snapshot loop))
       (setf (loop-review-snapshot loop) (cons directory snapshot))
       snapshot)))
+
+(defparameter *review-evidence-limit* 8 "Most evidence entries listed for a reviewer.")
+
+(defun snapshot-state-id (directory snapshot)
+  "SNAPSHOT's working-state content as a Git tree id, or nil."
+  (and snapshot
+       (ignore-errors (worktree-git-line directory "rev-parse"
+                                         (format nil "~a^{tree}" (snapshot-working-tree snapshot))))))
+
+(defun repository-state-id (directory)
+  "DIRECTORY's working-state content (a Git tree id, untracked files
+included), to tell which evidence describes it; nil outside a repository."
+  (and directory
+       (ignore-errors
+        (let ((snapshot (funcall *review-snapshot* directory (format nil "state-~a" (subseq (make-uuid) 0 8)))))
+          (when snapshot
+            (unwind-protect (snapshot-state-id directory snapshot)
+              (ignore-errors (delete-snapshot directory snapshot))))))))
+
+(defun review-evidence-text (workflow loop snapshot)
+  "The evidence index for a reviewer of LOOP, against the state under review, SNAPSHOT."
+  (let ((evidence (workflow-task-evidence workflow)))
+    (when evidence
+      (let ((lines (records-text (evidence-index-lines
+                                  (subseq evidence 0 (min (length evidence) *review-evidence-limit*))
+                                  (snapshot-state-id (review-directory loop) snapshot)))))
+        (and lines
+             (format nil "Evidence so far, newest first (current: recorded for the files as they are now; stale: for ~
+an earlier or other state). It is what was reported or run, not a verdict: verify independently what matters.~%~a"
+                     lines))))))
 
 (defun reviewed (loop)
   "LOOP's reviewer has replied: what it was asked to review becomes its baseline."
@@ -2022,6 +2444,7 @@ conflicts; then the merged result is reviewed."
                (note workflow "Merged ~a." (or (cdr (assoc (first trees) (workflow-tree-branches workflow) :test #'equal)) branch))
                (merge-parts workflow (rest trees)))
               (:conflict
+               (record-efficiency workflow :rework :part (format nil "merge conflicts in ~a" branch))
                (note workflow "Merging ~a conflicts in ~{~a~^, ~}; ~a resolves them."
                      branch files (agent-name (workflow-lead workflow)))
                (submit workflow (workflow-lead workflow) (resolve-prompt (workflow-request workflow) branch files)
@@ -2041,11 +2464,16 @@ conflicts; then the merged result is reviewed."
                        :role :resolve))
               (t (integration-failed workflow files trees))))))))
 
-(defun long-part-reply (workflow reply)
-  "Use a retained reply only when both receiving agents have unrestricted reads."
+(defun long-part-reply (workflow reply &optional source directory)
+  "Use a retained reply only when both receiving agents have unrestricted reads.
+SOURCE: the agent id the reply is from, and DIRECTORY the work it describes,
+for the evidence index."
   (let ((path (and (every (lambda (agent) (eq :full (agent-permission agent)))
                           (list (workflow-lead workflow) (workflow-partner workflow)))
                    (retain-task-artifact "reply" :text reply))))
+    (when path
+      (add-evidence workflow :artifact (format nil "Full part reply: ~a" path)
+                    (repository-state-id directory) source))
     (if path
         (format nil "Reply excerpt (read the full reply before combining results):~%~a~%Full reply: ~a"
                 (subseq reply 0 (min 1200 (length reply))) path)
@@ -2065,7 +2493,8 @@ conflicts; then the merged result is reviewed."
                                   (loop-task part)
                                   (let ((reply (loop-summary part)))
                                     (if (> (length reply) *split-reply-limit*)
-                                        (long-part-reply workflow reply)
+                                        (long-part-reply workflow reply (and (loop-author part) (agent-id (loop-author part)))
+                                                         (loop-tree part))
                                         reply))))))
 
 (defun note-retained-worktrees (workflow)
@@ -2180,6 +2609,10 @@ the worktrees are kept: ~{~a~^, ~}."
                 :rounds (mapcar (lambda (l) (list (or (loop-label l) "Work") (loop-round l))) loops)
                 :open-findings (reduce #'+ loops :key (lambda (l) (count-findings (loop-findings l) :open))
                                        :initial-value 0)
+                :open-suggestions (reduce #'+ loops :key (lambda (l) (count-findings (loop-findings l) :open :suggestion))
+                                          :initial-value 0)
+                :efficiency (efficiency-summary (workflow-efficiency-events workflow))
+                :unanswered-questions (count-if-not #'task-question-answer (workflow-task-questions workflow))
                 :summary (or (workflow-completion-error workflow)
                              (let ((summaries (remove-if
                                                (lambda (text) (or (null text) (zerop (length text))))
@@ -2542,6 +2975,16 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                    (workflow-metrics workflow)) 'vector)
           "contract-revision" (workflow-contract-revision workflow)
           "contract-directions" (coerce (workflow-contract-directions workflow) 'vector)
+          "task-records" (task-records-json-object (task-records-to-json (workflow-task-questions workflow)
+                                                            (workflow-task-evidence workflow)
+                                                            (workflow-task-decisions workflow)
+                                                            (workflow-efficiency-events workflow)))
+          "delivered-answers" (coerce (workflow-delivered-answers workflow) 'vector)
+          "answer-turns" (coerce (workflow-answer-turns workflow) 'vector)
+          "question-holds" (coerce (mapcar (lambda (hold)
+                                             (jobj "loop" (position (first hold) (workflow-loops workflow))
+                                                   "step" (second hold) "questions" (coerce (cddr hold) 'vector)))
+                                           (workflow-question-holds workflow)) 'vector)
           "request" (workflow-request workflow) "max-rounds" (workflow-max-rounds workflow)
           "check-command" (workflow-check-command workflow)
           "review-target" (workflow-review-target workflow) "review-base" (workflow-review-base workflow)
@@ -2592,6 +3035,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                                    (loop-prerequisite-revisions l)) 'vector)
                                    "handoff-advisory" (loop-handoff-advisory l)
                                    "handoff-notice" (loop-handoff-notice l)
+                                   "disputed" (coerce (loop-disputed l) 'vector)
                                    "task" (loop-task l) "label" (loop-label l) "summary" (loop-summary l)
                                    "last-review" (loop-last-review l) "state" (loop-state l) "round" (loop-round l)
                                    "tree" (and (loop-tree l) (namestring (loop-tree l)))
@@ -2601,6 +3045,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                    "check-failed" (loop-check-failed l)
                                    "findings" (coerce
                                                (mapcar (lambda (f) (jobj "id" (finding-id f) "status" (finding-status f)
+                                                                        "severity" (finding-severity f) "disputes" (finding-disputes f)
                                                                         "location" (finding-location f) "text" (finding-text f)
                                                                         "round" (finding-round f))) (loop-findings l)) 'vector)))
                            (workflow-loops workflow)) 'vector)
@@ -2629,6 +3074,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                      (review-in workflow l text (step-confirming step))))
         (:plan (plan-ready workflow text))
         (:replan (order-revised workflow text))
+        (:answer (give-up-questions workflow (coerce (step-target step) 'list) "No answer was given."))
         (:propose (proposal-in workflow (step-agent step) text))
         (:resolve
          ;; Recovery never repeats a merge from an arbitrary old prompt.
@@ -2657,6 +3103,15 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                  :on-checkpoint on-checkpoint)))
     (setf (workflow-contract-revision workflow) (or (jget checkpoint "contract-revision") 1)
           (workflow-contract-directions workflow) (jlist (jget checkpoint "contract-directions")))
+    ;; Older checkpoints have no task records.
+    (multiple-value-bind (questions evidence decisions events)
+        (task-records-from-json (recovery-null (jget checkpoint "task-records")))
+      (setf (workflow-task-questions workflow) questions
+            (workflow-task-evidence workflow) evidence
+            (workflow-task-decisions workflow) decisions
+            (workflow-efficiency-events workflow) events
+            (workflow-delivered-answers workflow) (jlist (jget checkpoint "delivered-answers"))
+            (workflow-answer-turns workflow) (jlist (jget checkpoint "answer-turns"))))
     (labels ((agent-for (id)
                (or (find (recovery-keyword id) (list lead partner) :key #'agent-id)
                    (error "Unknown checkpoint agent ~a" id)))
@@ -2719,6 +3174,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                        :task (jget data "task") :label (recovery-null (jget data "label"))
                        :handoff-advisory (recovery-null (jget data "handoff-advisory"))
                        :handoff-notice (recovery-null (jget data "handoff-notice"))
+                       :disputed (jlist (jget data "disputed"))
                        :summary (or (recovery-null (jget data "summary")) "")
                        :last-review (recovery-null (jget data "last-review"))
                        :state (recovery-keyword (jget data "state") :paused) :round (or (jget data "round") 0)
@@ -2731,6 +3187,8 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                        :check-report (recovery-null (jget data "check-report"))
                        :findings (mapcar (lambda (f) (make-finding :id (jget f "id") :text (jget f "text")
                                                                   :status (recovery-keyword (jget f "status") :open)
+                                                                  :severity (recovery-keyword (jget f "severity") :blocker)
+                                                                  :disputes (or (jget f "disputes") 0)
                                                                   :location (recovery-null (jget f "location"))
                                                                   :round (jget f "round"))) (jlist (jget data "findings")))))
                     (jlist (jget checkpoint "loops"))))
@@ -2747,7 +3205,11 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                              (jlist (jget data "prerequisite-revisions")))))
       ;; Unknown or circular dependencies would leave parts waiting for ever.
       (check-dependency-graph (workflow-loops workflow))
-      (setf (workflow-merged-loop workflow) (loop-for (jget checkpoint "merged-loop")))
+      (setf (workflow-merged-loop workflow) (loop-for (jget checkpoint "merged-loop"))
+            (workflow-question-holds workflow)
+            (loop for hold in (jlist (jget checkpoint "question-holds"))
+                  for l = (loop-for (jget hold "loop"))
+                  when l collect (list* l (jget hold "step") (jlist (jget hold "questions")))))
       (dolist (data (jlist (jget checkpoint "steps")))
         (let* ((state (recovery-keyword (jget data "state")))
                (step (make-step :id (jget data "id") :agent (agent-for (jget data "agent"))
@@ -2786,7 +3248,9 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
             (push s (workflow-steps workflow)) (push s (workflow-paused workflow)))))
       (dolist (l (workflow-loops workflow))
         (when (and (member (loop-state l) '(:working :reviewing :assigned :paused))
-                   (not (find l (workflow-paused workflow) :key #'step-loop)))
+                   (not (find l (workflow-paused workflow) :key #'step-loop))
+                   ;; Held for answers: it goes on once they come (RELEASE-QUESTION-HOLDS).
+                   (not (assoc l (workflow-question-holds workflow))))
           (let* ((reviewing (eq (loop-state l) :reviewing))
                  (s (make-step :agent (if reviewing (loop-reviewer l) (loop-author l))
                                :role (if reviewing :review :work) :loop l :state :paused :reason :restart
@@ -2795,6 +3259,17 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                              (t (loop-task l))))))
             (setf (step-then s) (restored-step-continuation workflow s))
             (push s (workflow-steps workflow)) (push s (workflow-paused workflow)))))
+      ;; Held work needs its answers: an answer turn to recover if none is saved.
+      (dolist (agent (list lead partner))
+        (let ((ids (loop for q in (open-questions-to workflow agent)
+                         for id = (task-question-id q)
+                         when (member id (held-question-ids workflow)) collect id)))
+          (when (and ids (notany (lambda (s) (and (eq (step-agent s) agent) (eq (step-role s) :answer)))
+                                 (workflow-paused workflow)))
+            (let ((s (make-step :agent agent :role :answer :target ids :state :paused :reason :restart
+                                :prompt (answer-prompt workflow agent))))
+              (setf (step-then s) (restored-step-continuation workflow s))
+              (push s (workflow-steps workflow)) (push s (workflow-paused workflow))))))
       (when (and (workflow-home workflow)
                  (member (workflow-integration-state workflow) '(:merging :interrupted))
                  (ignore-errors (merge-in-progress-p (workflow-home workflow)))
@@ -2978,6 +3453,12 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
             ;; Its prerequisites are ready now: it starts as it would have by itself.
             ((and (waiting-step-p step) (step-loop step))
              (start-dependent-step workflow step))
+            ;; Restored while waiting for the user's decision: ask again, rather
+            ;; than replaying fix work as though the findings were upheld.
+            ((eq (step-reason step) :disagreement)
+             (if (workflow-on-pause workflow)
+                 (funcall (workflow-on-pause workflow) workflow step)
+                 (decide-disagreement workflow step :keep)))
             (t
              (setf (step-prompt step)
                    (if (eq action :retry) (or (step-original-prompt step) (step-prompt step))
@@ -3085,6 +3566,7 @@ DEPENDENT's written result and findings are kept."
                                                     (and (eq (step-state s) :running)
                                                          (agent-partial-text (step-agent s)))))
                                               old)))))
+    (record-efficiency workflow :rework :part (part-name dependent))
     (note workflow "~a changed after ~a started on it: ~a revalidates it once ~a is ready again."
           (string-capitalize (part-name prerequisite) :end 1) (part-name dependent) (agent-name author)
           (part-name prerequisite))

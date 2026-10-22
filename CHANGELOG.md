@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Agents can ask each other questions between turns. A work handoff's
+  `QUESTIONS` section marks each question blocking or non-blocking. Questions are
+  numbered for the task and reach the other agent with its next prompt; its
+  `ANSWERS` are linked back and reach the asker with its next prompt. A blocking
+  question holds the asker's part (its check and review wait). An idle partner
+  gets one turn of its own to answer, and the part goes on once answered or
+  given up. Findings can be marked `[suggestion]`. Only open blockers stop
+  approval, and the settling turn asks only about blockers. A blocker its author
+  keeps disputing (`DISPUTED: F2`) and its reviewer keeps open for two reviews
+  waits for your decision on a card: **They stand** or **Dismiss them**.
+  Handoffs can record decisions with reasons and rejected options. These join
+  the shared contract and turn `[stale]` when shared direction arrives. Check
+  results, reported verification and retained artifacts are indexed against
+  the repository content they describe. Reviewers see each entry as current or
+  stale, with its source, and verify independently. The split prompt
+  weighs dependencies, how settled the interfaces are, and integration and
+  review cost, and asks for an `ORDER REASON:`. The summary card adds blocked
+  time, repeated checks, recurring findings, integration rework, open suggestions
+  and unanswered questions. All of it is saved with the checkpoint.
+
 - Reviews spend less on rereading. In git repositories, each review's state is
   snapshotted. Reviewers in the folder get the task's diff command and stat,
   and later reviews in the same reviewer conversation get only the changes
