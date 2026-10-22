@@ -25,6 +25,8 @@
       (ai:start-workflow workflow)
       (true (wait-until (lambda () (eq :finished (ai:workflow-state workflow)))))
       (true (search "passed" (first (fake-prompts reviewer))))
+      (true (search "rerun it only for a specific reason" (first (fake-prompts reviewer))))
+      (true (search "runs automatically after your turn" (first (fake-prompts author))))
       (false (search "checkederror" (first (fake-prompts reviewer))))
       (true (search (format nil "```~%checkederror~%```") (second (first messages))))
       (is = 2 (length messages))
@@ -342,7 +344,8 @@
          (agent (make-instance 'ai:claude-agent :permission :full)))
     (unwind-protect
          (progn
-           (true (search "For noisy builds" (ai::collaboration-instructions agent)))
+           (true (search "for noisy builds" (ai::collaboration-instructions agent)))
+           (true (search "user or project instructions name a command wrapper" (ai::collaboration-instructions agent)))
            (let ((helper (merge-pathnames "helpers/quiet-command.sh" directory)))
              (multiple-value-bind (output err code)
                  (uiop:run-program (list "/bin/sh" (namestring helper) "--" "/bin/sh" "-c"

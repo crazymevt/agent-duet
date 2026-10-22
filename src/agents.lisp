@@ -74,6 +74,8 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
    (context-fallback :initform nil :accessor agent-context-fallback
                      :documentation "Recent (compact . full) prompts, newest first, for lost history")
    (callback :initform nil :accessor agent-callback :documentation "The running turn's")
+   (turn-light :initform nil :accessor agent-turn-light
+               :documentation "True when the running turn needs little reasoning (see AGENT-SUBMIT)")
    (turn-images :initform '() :accessor agent-turn-images
                 :documentation "The images (paths) to show the agent with the running turn's prompt")
    (turn-token :initform (list nil) :accessor agent-turn-token
@@ -155,13 +157,15 @@ then :sent; :dropped if cancelled first")))
   (when (agent-listener agent)
     (apply (agent-listener agent) agent kind plist)))
 
-(defun agent-submit (agent prompt &optional callback attachments metrics-reporter)
+(defun agent-submit (agent prompt &optional callback attachments metrics-reporter light)
   "Have AGENT work on PROMPT, now or after the turns before it. CALLBACK
 gets the final reply's text and whether the turn failed (then the text
 says why). ATTACHMENTS are the paths of files given with PROMPT (see
 PROMPT-WITH-ATTACHMENTS). METRICS-REPORTER, when supplied, receives a unique
-turn ID and a metrics plist once, before CALLBACK (or at cancellation)."
-  (setf (agent-queue agent) (append (agent-queue agent) (list (list prompt callback attachments metrics-reporter))))
+turn ID and a metrics plist once, before CALLBACK (or at cancellation).
+LIGHT: the turn needs little reasoning, so an agent that can lower its
+effort for one turn does (Codex; Claude would have to restart its CLI)."
+  (setf (agent-queue agent) (append (agent-queue agent) (list (list prompt callback attachments metrics-reporter light))))
   (unless (agent-busy agent) (agent-next agent)))
 
 (defgeneric agent-steer (agent prompt &optional images)
@@ -177,6 +181,20 @@ turn ID and a metrics plist once, before CALLBACK (or at cancellation)."
               (if (typep agent 'claude-agent) " ≈" "")
               (agent-context-tokens agent) (agent-context-limit agent))
       "Context: unknown"))
+
+(defparameter *fresh-context-fraction* 1/2
+  "How full an agent's context is before a new task offers a new conversation.")
+
+(defun agent-context-fraction (agent)
+  "How full AGENT's context is, if known, from 0 to 1."
+  (let ((tokens (agent-context-tokens agent)) (limit (agent-context-limit agent)))
+    (and (realp tokens) (realp limit) (plusp limit) (min 1 (/ tokens limit)))))
+
+(defun agent-context-heavy-p (agent)
+  "True when AGENT's context is known to be at least *FRESH-CONTEXT-FRACTION* full:
+each turn rereads it, so a new task may be cheaper in a new conversation."
+  (let ((fraction (agent-context-fraction agent)))
+    (and fraction (>= fraction *fresh-context-fraction*))))
 
 (defmethod agent-new-conversation :after ((agent agent))
   (setf (agent-context-tokens agent) nil (agent-context-limit agent) nil)
@@ -199,7 +217,7 @@ Preserve the running callback."
     (when next
       (when (and (consp (agent-retry agent)) (eq next (second (agent-retry agent))))
         (setf (agent-retry agent) :sent))
-      (destructuring-bind (prompt callback attachments &optional metrics-reporter) next
+      (destructuring-bind (prompt callback attachments &optional metrics-reporter light) next
         (let ((text (prompt-with-attachments prompt attachments)))
           (setf (agent-metrics agent) nil
                 (agent-metrics-seen agent) nil
@@ -210,6 +228,7 @@ Preserve the running callback."
                 (agent-partial-text agent) ""
                 (agent-busy agent) t
                 (agent-turn agent) next
+                (agent-turn-light agent) light
                 (agent-stall-noticed agent) nil
                 (agent-callback agent) callback
                 (agent-turn-images agent) (attachment-images attachments)
@@ -530,14 +549,14 @@ by its own. Lines of the other file that only import AGENT's own are left out."
                        (namestring (truename path)))))))
     (format nil "Keep tool output focused: search for filenames and matching lines first, then read relevant sections. ~
 Use bounded searches and file reads; avoid dumping whole files or broad diffs when a targeted read suffices. ~
-Follow project command-wrapper instructions when present. ~a ~
+If your user or project instructions name a command wrapper, use it. ~a ~
 Inspect relevant log excerpts when needed; a successful exit alone may not provide the requested results. ~
 Preserve exit status and report verification failures. Never discard substantive answers or required evidence."
             (if path
-                (format nil "For noisy builds, tests, installs and batch jobs without a project wrapper, use `/bin/sh ~a -- <command> [args...]`; ~
+                (format nil "Otherwise, for noisy builds, tests, installs and batch jobs, use `/bin/sh ~a -- <command> [args...]`; ~
 for pipelines, pass `sh -c '<script>'` as the command. It returns status and a full-log path, with bounded failure excerpts."
                         (shell-quote path))
-                "For noisy commands, use an available permitted project wrapper or bounded output supported by the tool; respect read-only restrictions."))))
+                "Otherwise, for noisy commands, use bounded output supported by the tool; respect read-only restrictions."))))
 
 (defun collaboration-instructions (agent)
   (let ((partner (agent-partner-name agent))
@@ -988,6 +1007,8 @@ also one a recovery or follow-up wraps in more text."
    (thread-id :initform nil :accessor codex-agent-thread-id)
    (last-text :initform nil :accessor codex-agent-last-text :documentation "The turn's last agent message")
    (models :initform '() :accessor codex-agent-models :documentation "From model/list")
+   (lowered :initform nil :accessor codex-agent-lowered
+            :documentation "(thread . effort): the effort a light turn replaced there, until restored")
    (usage :initform nil :accessor agent-usage :documentation "Rate-limit buckets, (id . snapshot)s"))
   (:default-initargs :id :codex :name "ChatGPT" :partner-name "Claude" :model *codex-model*))
 
@@ -1149,12 +1170,43 @@ rather than using a server with no thread."
                                   (if code (format nil "exited (status ~a)" code) "connection closed")
                                   (let ((s (agent-recent-stderr agent))) (and (plusp (length s)) s))))))
 
+(defparameter *codex-effort-order* '("none" "minimal" "low" "medium" "high" "xhigh"))
+
+(defun codex-current-model-entry (agent)
+  "AGENT's model's model/list entry: the default one for the CLI's default."
+  (let ((models (codex-agent-models agent)))
+    (if (agent-model agent)
+        (find (agent-model agent) models :key #'codex-model-id :test #'equal)
+        (find t models :key (lambda (m) (jget m "isDefault"))))))
+
+(defun codex-turn-effort (agent &key (light (agent-turn-light agent)) (usual (agent-effort agent))
+                                     (thread (codex-agent-thread-id agent)))
+  "The effort to start AGENT's turn on THREAD with. A light turn uses low
+where the model supports it and USUAL, the effort chosen in the app, is
+higher. Without a chosen effort, the effective one (CLI configuration, a
+resumed thread) isn't known, so nothing is lowered. A turn's effort carries
+on to later turns of the thread, so the next turn on that thread restores the
+effort it replaced; another thread never gets it."
+  (let* ((entry (codex-current-model-entry agent))
+         (rank (position usual *codex-effort-order* :test #'equal))
+         (low (position "low" *codex-effort-order* :test #'equal))
+         (lowered (codex-agent-lowered agent))
+         (replaced (and lowered thread (equal (car lowered) thread) (cdr lowered))))
+    (cond ((and light rank (> rank low) entry thread
+                (member "low" (codex-model-efforts entry) :test #'equal))
+           (setf (codex-agent-lowered agent) (cons thread (or replaced usual)))
+           "low")
+          (t
+           (setf (codex-agent-lowered agent) nil)
+           (or usual replaced)))))
+
 (defmethod agent-begin-turn ((agent codex-agent) prompt)
   (setf (codex-agent-last-text agent) nil
         (codex-agent-metrics-baseline agent) nil)
   (let ((deliver (agent-deliver agent))
         (model (agent-model agent))
-        (effort (agent-effort agent))
+        (light (agent-turn-light agent))
+        (usual (agent-effort agent))
         (sandbox (codex-agent-sandbox agent))
         (policy (codex-agent-approval-policy agent))
         (images (agent-turn-images agent))
@@ -1174,9 +1226,12 @@ rather than using a server with no thread."
                (when (eq token (agent-turn-token agent)) (capture-agent-process-baseline agent))
                (if (not (car token))
                    (stopped)
+                   ;; Decided once the thread is known: a failed resume starts another.
                    (let ((turn-id (jget (codex-start-turn server
                                         (if (equal history (agent-conversation-handle agent)) prompt
-                                            (prompt-without-history agent prompt)) :model model :effort effort
+                                            (prompt-without-history agent prompt))
+                                        :model model :effort (codex-turn-effort agent :light light :usual usual
+                                                                                 :thread (codex-thread-id server))
                                                           :approval-policy policy :images images)
                                         "turn" "id")))
                      (unless (car token)
@@ -1222,7 +1277,7 @@ rather than using a server with no thread."
 
 (defmethod agent-new-conversation ((agent codex-agent))
   (agent-shutdown agent)
-  (setf (codex-agent-thread-id agent) nil))
+  (setf (codex-agent-thread-id agent) nil (codex-agent-lowered agent) nil))
 
 (defmethod agent-conversation-handle ((agent codex-agent))
   (codex-agent-thread-id agent))

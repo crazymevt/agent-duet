@@ -1872,7 +1872,8 @@ tests/fake-claude, its notes pushed onto NOTES."
           (true (search "agent-duet/claude-" part)))
         ;; Reviewers get a stat and instructions to inspect the diff themselves.
         (dolist (prompts (list (fake-prompts claude) (fake-prompts codex)))
-          (let ((review (find "Diff stat:" prompts :test #'search)))
+          (let ((review (find-if (lambda (p) (and (search "Diff stat:" p) (search "worked in its own git worktree" p)))
+                                 prompts)))
             (true review)
             (true (search "git diff --cached" review))
             (false (search "from ChatGPT" review))

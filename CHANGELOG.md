@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Reviews spend less on rereading. In git repositories, each review's state is
+  snapshotted. Reviewers in the folder get the task's diff command and stat,
+  and later reviews in the same reviewer conversation get only the changes
+  since the last review, with a full-review fallback. Work prompts say the check
+  command runs automatically, and passing results discourage reruns. Review
+  prompts say approval leaves no finding open. The rare settle-findings turn
+  runs ChatGPT at low effort when an effort is chosen in the app, restoring it after. Before a task,
+  a context at least half full is offered a new conversation. The task contract
+  and handoff lines are shorter, and agents may use a command wrapper from their
+  user instructions as well as project instructions.
+
 - Workflow prompts share a revisioned task brief with the request, assignments,
   and subsequent direction addressed to both agents. Shared direction survives
   restart and is recorded once across partial-delivery retries. Work handoffs

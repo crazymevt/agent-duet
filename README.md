@@ -228,7 +228,38 @@ dismissed (the author's reasons convinced the reviewer) or still open, so an
 unresolved finding stays in view from one round to the next. A reviewer that
 approves with findings still open is asked once to settle them; if it
 leaves them open again, the part isn't approved, and **Continue** has the
-author pick them up.
+author pick them up. Review prompts already say that an approval leaves no
+finding open, so this extra turn should be rare. For ChatGPT it runs at `low`
+effort when its model supports that and the effort chosen in the app is
+higher. With the model's default chosen, the effective effort isn't known, so
+it's left alone. The next turn sends the replaced effort again, because Codex
+keeps a turn's effort for later turns. Claude keeps its effort,
+because changing it would restart its CLI.
+
+In a git repository with a commit, each review's state is recorded as a
+snapshot (a commit under `refs/agent-duet/snapshots/`, untracked files
+included). A reviewer in the folder is given `git diff <task start> <now>`
+and its diff stat, capped at 40 lines. A reviewer in a worktree keeps its
+worktree note. The folder's diff can include your edits or the other part's.
+A later review in the same reviewer conversation gets only what changed since
+its previous review, with its diff stat (for a worktree, just its location), and is asked to check how the fixes
+interact with what it reviewed before. A different reviewer, a new or lost
+conversation, or a restart gets the full review, with all of the task's
+changes. Each loop keeps at most two of these snapshots: the one under review
+and the previous one. They count toward the latest-50 limit below.
+
+With a check command, work prompts say it runs automatically after the turn,
+so authors run targeted checks rather than the whole command. A passing
+result tells the reviewer that it ran on the state under review, so it reruns
+it only for a specific reason.
+
+Before a task starts, an agent whose reported context is at least half full
+gets a card offering **New conversation and start** or **Keep and start**:
+every turn rereads the conversation. Each conversation gets the offer only
+once, so pressing Start again also keeps it. A card acts only while the
+folder, mode, request, attachments, task and conversations are those it was
+offered for, and no task has started since; otherwise it asks you to press
+Start again.
 
 The checklist is useful from the moment work is handed out: each task
 appears as soon as it's assigned, with the agent doing it and its progress
@@ -319,12 +350,12 @@ the card is open, the card says so and goes away. The time is
 
 Both agents are instructed to search for filenames and matching lines before
 reading relevant sections, and to keep searches, file reads and diffs focused.
-For noisy builds, tests, installs and batch jobs, project command-wrapper
-instructions take precedence.
+For noisy builds, tests, installs and batch jobs, a command wrapper named in
+the agent's user or project instructions takes precedence.
 
 With Full access, unless the agent is read-only, Agent Duet also provides a
 portable `quiet-command.sh` helper in its history directory and gives the agent
-its full path. When no project wrapper is specified, agents are told to use:
+its full path. When their instructions name no wrapper, agents are told to use:
 
 ```sh
 /bin/sh /path/to/helpers/quiet-command.sh -- <command> [args...]
@@ -337,8 +368,7 @@ diagnostic excerpts. Agents are told to inspect relevant log excerpts even after
 a successful exit when needed, report verification failures, and retain required
 evidence in their answers. Temporary logs follow the operating system's
 temporary-file lifecycle. If the helper is unavailable, or access is restricted,
-agents are told to use a permitted project wrapper or bounded tool output and
-respect read-only restrictions.
+agents are told to use bounded tool output and respect read-only restrictions.
 
 ## Folder, models and look
 

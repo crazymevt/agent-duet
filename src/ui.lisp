@@ -3148,7 +3148,10 @@ and summary, with Changes and, when the work can be committed, Commit changes."
              (pane-note *middle* "Wait for both agents to finish, or stop them, before starting." "error"))
             ((and (worktrees-wanted-p) (setf problem (worktrees-problem *directory*)))
              (pane-note *middle* (format nil "Can't give each part its own worktree: ~a." problem) "error"))
+            ((heavy-context-agents)
+             (show-fresh-context-card (heavy-context-agents) attachments))
             (t
+             (setf *context-card* nil)
              ;; A task that can still be recovered keeps its conversation, and
              ;; checkpoint: this one starts another.
              (when (and *history* (history-recoverable-p *history*))
@@ -3181,6 +3184,75 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                                     (ignore-errors
                                       (repository-start-state *directory* (task-changes-start *task-changes*)))))
                (update-controls))))))))
+
+;;; A long conversation is reread on every turn: before a task, one whose
+;;; context is well filled is offered a new start, once per conversation.
+
+(defvar *context-offered* '() "(agent conversation)s already offered a new conversation.")
+
+(defvar *context-card* nil "The latest offer's token; older cards, and any once a task starts, are inert.")
+
+(defun heavy-context-agents ()
+  "The agents with a heavily filled context not yet offered a new conversation."
+  (remove-if-not (lambda (agent)
+                   (and (agent-context-heavy-p agent)
+                        (not (member (list agent (agent-conversation-handle agent)) *context-offered*
+                                     :test #'equal))))
+                 (list *claude* *codex*)))
+
+(defun show-fresh-context-card (agents attachments)
+  "Offer AGENTS new conversations before the task starts; either choice starts
+it, while the request, folder, task and conversations are those it was offered for."
+  (dolist (agent agents)
+    (push (list agent (agent-conversation-handle agent)) *context-offered*))
+  (let* ((buttons (make-instance 'gtk:box :spacing 6 :halign :end))
+         (token (list :context-card))
+         (state (lambda ()
+                  (let ((holder (control :composer-attachments)))
+                    (list *directory* *workflow* (selected-mode) (text-view-text (control :input))
+                          (copy-list (and holder (agent-pane-attachments holder)))
+                          (mapcar #'agent-conversation-handle (list *claude* *codex*))))))
+         (offered (funcall state)))
+    (setf *context-card* token)
+    (labels ((settled (text)
+               (clear-box buttons)
+               (gtk:box-append buttons (make-instance 'gtk:label :label text :css-classes '("dim-label"))))
+             (go-on (fresh)
+               (cond ((or (not (eq token *context-card*)) (workflow-running-p)
+                          (not (equal offered (funcall state))))
+                      (when (eq token *context-card*) (setf *context-card* nil))
+                      (settled "Out of date: press Start again"))
+                     ((some #'agent-busy (list *claude* *codex*))
+                      (pane-note *middle* "Wait for both agents to finish, or stop them, before starting." "error"))
+                     (t
+                      (setf *context-card* nil)
+                      (when fresh (dolist (agent agents) (new-conversation agent)))
+                      (settled (if fresh "Started in new conversations" "Kept the conversations"))
+                      (start-request attachments)
+                      (let ((holder (control :composer-attachments)))
+                        (when (and holder (workflow-running-p)) (set-attachments holder nil))))))
+             (button (label fresh &rest options)
+               (let ((b (apply #'make-instance 'gtk:button :label label options)))
+                 (gobject:connect b :clicked (lambda (b) (declare (ignore b)) (go-on fresh)))
+                 (gtk:box-append buttons b))))
+      (button "Keep and start" nil)
+      (button "New conversation and start" t :css-classes '("suggested-action")
+              :tooltip-text "The new conversation is given the request, the task contract and the project notes")
+      (pane-append *middle*
+                   (gtk:build
+                    (gtk:box :orientation :vertical :spacing 6 :css-classes '("duet-approval")
+                             (gtk:label :label "Start in a new conversation?" :xalign 0.0 :css-classes '("heading"))
+                             (gtk:label :label (format nil "~{~a~^ ~} Every turn rereads the conversation, so a new one makes ~
+this task's turns cheaper."
+                                                       (mapcar (lambda (agent)
+                                                                 (format nil "~a's context is about ~d% full (~:d of ~:d tokens)."
+                                                                         (agent-name agent)
+                                                                         (round (* 100 (agent-context-fraction agent)))
+                                                                         (round (agent-context-tokens agent))
+                                                                         (round (agent-context-limit agent))))
+                                                               agents))
+                                        :xalign 0.0 :wrap t)
+                             buttons))))))
 
 (defun worktrees-wanted-p ()
   (and (member (selected-mode) '(:divide :compare)) (gtk:check-button-get-active (control :worktrees))))

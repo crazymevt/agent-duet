@@ -559,3 +559,135 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
       (is = 2 (ai::workflow-contract-revision started))
       (true (search "SHARED TASK CONTRACT — revision 2" (first (fake-prompts lead))))
       (true (search "SHARED TASK CONTRACT — revision 2" (first (fake-prompts partner)))))))
+
+(define-test review-snapshots-and-deltas :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((author (make-instance 'fake-agent :name "Claude" :directory repo))
+           (reviewer (make-instance 'fake-agent :name "ChatGPT" :directory repo))
+           (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Do it"))
+           (part (ai::make-review-loop :author author :reviewer reviewer :task "Do it" :summary "Report"
+                                      :findings (list (ai::make-finding :id 1 :text "Fix this")))))
+      (setf (ai::workflow-repository-start workflow) (ai::repository-start-state repo))
+      (write-file (merge-pathnames "first.txt" repo) "one")
+      ;; The first review is pointed at the task's changes, untracked files included.
+      (let ((full (ai::review-prompt part :workflow workflow)))
+        (true (search "since the task started" full))
+        (true (search "first.txt" full))
+        (true (search "Approve only if none" full)))
+      ;; The same conversation's next review sees only what changed since.
+      (ai::reviewed part)
+      (setf (ai::loop-round part) 1
+            (ai::loop-review-history part) (list reviewer (fake-handle reviewer)))
+      (write-file (merge-pathnames "second.txt" repo) "two")
+      (let ((compact (ai::review-prompt part :workflow workflow)))
+        (true (search "since your last review" compact))
+        (true (search "second.txt" compact))
+        (false (search "first.txt" compact))
+        (true (search "Approve only if none" compact))
+        ;; Lost history replays the full review, with all of the task's changes.
+        (let ((expanded (ai::prompt-without-history reviewer compact)))
+          (true (search "first.txt" expanded))
+          (true (search "second.txt" expanded))))
+      (ai::reviewed part)
+      (true (search "Nothing has changed" (ai::review-prompt part :workflow workflow)))
+      ;; A new conversation hasn't seen the earlier changes: no delta.
+      (ai::reviewed part)
+      (setf (fake-handle reviewer) "conversation-2")
+      (let ((full (ai::review-prompt part :workflow workflow)))
+        (false (search "since your last review" full))
+        (true (search "first.txt" full))
+        (true (search "second.txt" full)))
+      ;; Only the pending snapshot and the baseline keep refs.
+      (ai::reviewed part)
+      (is = 1 (length (remove "" (uiop:split-string
+                                  (ai::worktree-git repo "for-each-ref" "--format=%(refname)"
+                                                    "refs/agent-duet/snapshots/")
+                                  :separator '(#\Newline))
+                              :test #'string=))))))
+
+(define-test codex-light-turn-effort :parent agent-duet
+  (let ((agent (make-instance 'ai:codex-agent)))
+    (setf (ai::agent-model agent) nil
+          (ai::codex-agent-thread-id agent) "thread-1"
+          (ai::codex-agent-models agent)
+          (list (ai:parse-json "{\"id\":\"m\",\"isDefault\":true,\"defaultReasoningEffort\":\"medium\",\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"medium\"}]}")))
+    ;; Without a chosen effort the effective one is unknown: never lowered,
+    ;; whatever the catalog's default.
+    (setf (ai::agent-turn-light agent) t)
+    (false (ai::codex-turn-effort agent))
+    (false (ai::codex-agent-lowered agent))
+    (setf (ai::agent-effort agent) "medium")
+    (is string= "low" (ai::codex-turn-effort agent))
+    (is string= "low" (ai::codex-turn-effort agent))
+    ;; Turn efforts carry on in a Codex thread: the next turn restores it,
+    ;; even if the choice was cleared meanwhile.
+    (setf (ai::agent-turn-light agent) nil (ai::agent-effort agent) nil)
+    (is string= "medium" (ai::codex-turn-effort agent))
+    (false (ai::codex-turn-effort agent))
+    ;; Never raised.
+    (setf (ai::agent-effort agent) "low" (ai::agent-turn-light agent) t)
+    (is string= "low" (ai::codex-turn-effort agent))
+    (false (ai::codex-agent-lowered agent))
+    ;; Another thread, whether a failed resume's replacement or a new or
+    ;; resumed conversation, never gets the replaced effort.
+    (setf (ai::agent-effort agent) "medium")
+    (is string= "low" (ai::codex-turn-effort agent))
+    (setf (ai::agent-turn-light agent) nil (ai::agent-effort agent) nil)
+    (false (ai::codex-turn-effort agent :thread "thread-2"))
+    (setf (ai::agent-effort agent) "medium" (ai::agent-turn-light agent) t)
+    (is string= "low" (ai::codex-turn-effort agent))
+    (ai::agent-new-conversation agent)
+    (false (ai::codex-agent-lowered agent))
+    (ai::agent-resume-conversation agent "thread-1")
+    (setf (ai::agent-turn-light agent) nil (ai::agent-effort agent) nil)
+    (false (ai::codex-turn-effort agent))))
+
+(define-test confirm-turns-are-light :parent agent-duet
+  (let* ((lights '())
+         (author (make-instance 'fake-agent :id :claude :name "Claude"
+                                :replies (list (says "Done"))))
+         (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT"))
+         (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Do it")))
+    (flet ((reply (text)
+             (lambda (prompt) (declare (ignore prompt))
+               (push (ai::agent-turn-light reviewer) lights)
+               text)))
+      (setf (fake-replies reviewer)
+            (list (reply (format nil "FINDINGS:~%- F1 [open] Fix this~%VERDICT: APPROVED"))
+                  (reply (format nil "FINDINGS:~%- F1 [dismissed] Fine~%VERDICT: APPROVED")))))
+    (ai:start-workflow workflow)
+    (is eq :approved (ai::loop-state (first (ai:workflow-loops workflow))))
+    (is equal '(t nil) lights)))
+
+(define-test context-heavy-offer :parent agent-duet
+  (let ((agent (make-instance 'fake-agent :name "Claude")))
+    (false (ai::agent-context-heavy-p agent))
+    (setf (ai::agent-context-tokens agent) 40000 (ai::agent-context-limit agent) 200000)
+    (false (ai::agent-context-heavy-p agent))
+    (setf (ai::agent-context-tokens agent) 100000)
+    (true (ai::agent-context-heavy-p agent))
+    (setf (ai::agent-context-limit agent) 0)
+    (false (ai::agent-context-heavy-p agent))))
+
+(define-test worktree-delta-review-omits-full-diff :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((author (make-instance 'fake-agent :name "Claude"))
+           (reviewer (make-instance 'fake-agent :name "ChatGPT"))
+           (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Do it"))
+           (part (ai::make-review-loop :author author :reviewer reviewer :task "Do it" :summary "Report"
+                                      :tree repo :findings (list (ai::make-finding :id 1 :text "Fix this")))))
+      (ai::worktree-git repo "config" (ai::worktree-base-key (ai::worktree-branch repo))
+                        (ai::worktree-git-line repo "rev-parse" "HEAD"))
+      (write-file (merge-pathnames "first.txt" repo) "one")
+      (true (search "git diff --cached" (ai::review-prompt part :workflow workflow)))
+      (ai::reviewed part)
+      (setf (ai::loop-round part) 1
+            (ai::loop-review-history part) (list reviewer (fake-handle reviewer)))
+      (write-file (merge-pathnames "second.txt" repo) "two")
+      (let ((compact (ai::review-prompt part :workflow workflow)))
+        (true (search "since your last review" compact))
+        (true (search (namestring repo) compact))
+        (false (search "git diff --cached" compact))
+        (false (search "first.txt" compact))
+        ;; The fallback keeps the full worktree note.
+        (true (search "git diff --cached" (ai::prompt-without-history reviewer compact)))))))

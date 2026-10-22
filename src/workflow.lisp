@@ -152,6 +152,8 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   (handoff-notice nil)                 ; only changed gaps go to the next review
   (summary "")                          ; the author's latest report
   (review-history nil)                 ; (reviewer conversation) from its last reply
+  (review-snapshot nil)                ; (directory . snapshot) of the state asked to be reviewed
+  (review-baseline nil)                ; (reviewer conversation directory . snapshot) last reviewed
   (work-history nil)                    ; (author conversation) from its last report
   (last-review nil)                     ; the reviewer's latest review
   (findings '())                        ; the review checklist: FINDINGs, by id
@@ -213,7 +215,7 @@ preserve the step for explicit recovery (PAUSE-STEP)."
 (defun task-contract (workflow)
   "A shared brief from authoritative inputs, without inventing requirements."
   (with-output-to-string (out)
-    (format out "SHARED TASK CONTRACT — revision ~d~%Goal, acceptance criteria, scope and interfaces are those in the request and subsequent user direction. Do not invent missing requirements.~%Use the original request supplied in the step or conversation; it is not repeated here.~%"
+    (format out "SHARED TASK CONTRACT — revision ~d~%Goal, acceptance criteria, scope and interfaces: the request (in the step or conversation, not repeated here) and later user direction. Don't invent requirements.~%"
             (workflow-contract-revision workflow))
     (dolist (direction (workflow-contract-directions workflow))
       (format out "~%Subsequent user direction (later direction takes precedence):~%~a~%" direction))
@@ -222,7 +224,7 @@ preserve the step for explicit recovery (PAUSE-STEP)."
               (agent-name (loop-author part)) (agent-name (loop-reviewer part))
               (if (equal (loop-task part) (workflow-request workflow))
                   "The overall request." (loop-task part))))
-    (format out "~%Reconsider earlier decisions affected by later direction. Report any conflict between an assignment and the current direction.")))
+    (format out "~%Revisit decisions that later direction affects; report any conflict between an assignment and it.")))
 
 (defun handoff-field (text name)
   "Read an optional plain NAME: value line, without imposing a reply grammar."
@@ -257,10 +259,11 @@ preserve the step for explicit recovery (PAUSE-STEP)."
          (brief (task-contract workflow))
          (handle (agent-conversation-handle agent))
          (seen (assoc agent (workflow-contract-context workflow)))
+         (check (blank-to-nil (workflow-check-command workflow)))
          (instructions
            (when (eq (step-role step) :work)
-             (format nil "In your handoff, include plain lines TASK REVISION: ~d, DECISIONS: <choices and reasons, or NONE>, and VERIFICATION: <checks and results, or NOT RUN with reason>. Keep the substantive answer and existing handoff details. Missing fields produce advisory flags only."
-                     (step-contract-revision step))))
+             (format nil "After the full answer, add plain lines TASK REVISION: ~d, DECISIONS: <choices and reasons, or NONE>, VERIFICATION: <checks and results, or NOT RUN with reason>.~@[ `~a` runs automatically after your turn and its result goes to the reviewer: run targeted checks as needed instead of running it yourself.~]"
+                     (step-contract-revision step) check)))
          (full (format nil "~a~@[~%~%~a~]~%~%~a" brief instructions prompt))
          (prompt
            (if (and handle (equal handle (second seen)) (equal brief (third seen)))
@@ -290,7 +293,9 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                                     :key (lambda (m) (getf m :id)) :test #'equal))
                       (push (list :id id :agent (agent-id agent) :role (step-role step) :metrics (list* :prompt-characters (length prompt) metrics))
                             (workflow-metrics workflow))
-                      (checkpoint-changed workflow))))))
+                      (checkpoint-changed workflow)))
+                  ;; Settling already-reviewed findings needs little reasoning.
+                  (and (eq (step-role step) :review) (step-confirming step) t))))
 
 (defun task-metric-totals (workflow &optional role)
   "Known sums and their coverage, so partial measurements never look complete."
@@ -638,7 +643,8 @@ does then goes unreviewed, since the one that would review it is out."
 (defun work-prompt (reviewer task)
   (format nil "~a~%~%(When you finish, ~a will review your work.)" task (agent-name reviewer)))
 
-(defun full-review-prompt (loop)
+(defun full-review-prompt (loop &optional changes)
+  "CHANGES: a note on where to find the changes under review, or nil."
   (let ((author (agent-name (loop-author loop)))
         (findings (loop-findings loop)))
     (format nil "~a was asked to do this:~%~%~a~%~%~a reports:~%~%~a~%~%~
@@ -653,36 +659,45 @@ Be brief; put the substance in the FINDINGS lines. List ~:[~;any new ~]issues in
 most important first, one line each, in this form (the location is optional):~%~%~
 FINDINGS:~%~
 - F~d [open] `path/to/file:line` What is wrong, and what to do about it~%~%~
-Write FINDINGS: NONE if there are none.~%~%~
+Write FINDINGS: NONE if there are none. Approve only if none of your findings is left [open].~%~%~
 End your reply with one line on its own, exactly one of:~%~
 VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
             author (loop-task loop) author (review-handoff-report loop)
-            (let ((tree (and (loop-tree loop) (worktree-note loop))))
-              (if (loop-check-report loop)
-                  (format nil "~a~a~%~%" (or tree "") (loop-check-report loop))
-                  tree))
+            (let ((text (format nil "~@[~a~]~@[~a~%~%~]~@[~a~%~%~]"
+                                (and (loop-tree loop) (worktree-note loop))
+                                changes (loop-check-report loop))))
+              (and (plusp (length text)) text))
             findings (findings-lines findings) findings
             (next-finding-id findings))))
 
-(defun review-prompt (loop &key full)
-  "Use a compact follow-up only while the same reviewer retains its history."
+(defun review-prompt (loop &key full workflow)
+  "Use a compact follow-up only while the same reviewer retains its history.
+With WORKFLOW, the state under review is snapshotted, so the reviewer can be
+pointed at the task's changes and, while it keeps its history, at those since
+its last review."
   (let* ((reviewer (loop-reviewer loop))
          (handle (agent-conversation-handle reviewer))
-         (complete (full-review-prompt loop)))
+         (snapshot (and workflow (take-review-snapshot loop)))
+         (complete (full-review-prompt loop (and snapshot (review-start-note workflow loop snapshot)))))
     (if (and (not full) (plusp (loop-round loop)) (loop-findings loop) handle
              (equal (loop-review-history loop) (list reviewer handle)))
-        (let ((prompt
+        (let* ((delta (and snapshot (review-delta-note loop snapshot reviewer handle)))
+               (prompt
                 (format nil "~a reports:~%~%~a~%~%~a~@[~a~%~%~]~
-Review the work again; read the changed files and git diff. Don't change files.~%~
+~a Don't change files.~%~
 Earlier findings:~%~a~%~
-Repeat each finding with its updated status: [fixed] if dealt with, [dismissed] if the reasons convince you, [open] if it still stands. Keep existing IDs.~%~
+Repeat each finding with its updated status: [fixed] if dealt with, [dismissed] if the reasons convince you, [open] if it still stands. Keep existing IDs. Approve only if none is left [open].~%~
 Be brief; put the substance in the FINDINGS lines.~%~
 FINDINGS:~%- F~d [open] `path/to/file:line` Issue and remedy~%~
 Or FINDINGS: NONE. End with exactly VERDICT: APPROVED or VERDICT: CHANGES REQUESTED on its own line."
                         (agent-name (loop-author loop)) (review-handoff-report loop)
-                        (if (loop-tree loop) (worktree-note loop) "")
-                        (loop-check-report loop) (findings-lines (loop-findings loop))
+                        (cond ((null (loop-tree loop)) "")
+                              (delta (worktree-location-note loop))
+                              (t (worktree-note loop)))
+                        (loop-check-report loop)
+                        (or delta "Review the work again; read the changed files and git diff.")
+                        (findings-lines (loop-findings loop))
                         (next-finding-id (loop-findings loop)))))
           (remember-context-fallback reviewer prompt complete)
           prompt)
@@ -698,6 +713,12 @@ VERDICT: CHANGES REQUESTED"
           (findings-lines (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq))))
 
 (defparameter *split-reply-limit* 60000 "Maximum inline part reply length in combined results.")
+
+(defun worktree-location-note (loop)
+  "Where LOOP's worktree is, for a reviewer given only the changes since its last review."
+  (format nil "~a works in its own git worktree, ~a, so its changes aren't in your folder: read the files ~
+and run the commands below there.~%~%"
+          (agent-name (loop-author loop)) (namestring (loop-tree loop))))
 
 (defun worktree-note (loop)
   "Give the reviewer the worktree and a summary against its saved starting revision."
@@ -1456,7 +1477,8 @@ ready waits for it in any case."
         ;; to the review. Failures stay explicit even after the fix budget,
         ;; and the work can't be approved until the check passes.
         (setf (loop-check-report loop)
-              (if passed status
+              (if passed
+                  (format nil "~a It ran on the state under review; rerun it only for a specific reason." status)
                   (format nil "The check still fails after ~d fix attempt~:p, so the work can't be approved ~
 until it passes: request changes, saying what needs fixing.~%~%~a"
                           fixes report))
@@ -1520,7 +1542,7 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
   "Have LOOP's reviewer review the work; CONFIRMING: it approved with findings
 still open, and is asked once to settle them (that's no new round)."
   (update-loop-state workflow loop :reviewing)
-  (submit workflow (loop-reviewer loop) (if confirming (confirm-prompt loop) (review-prompt loop))
+  (submit workflow (loop-reviewer loop) (if confirming (confirm-prompt loop) (review-prompt loop :workflow workflow))
           (lambda (text error)
             (if error
                 (loop-failed workflow loop (format nil "~a's review failed: ~a" (agent-name (loop-reviewer loop)) text))
@@ -1529,6 +1551,7 @@ still open, and is asked once to settle them (that's no new round)."
 
 (defun review-in (workflow loop text confirming)
   (unless confirming (incf (loop-round loop)))
+  (reviewed loop)
   (setf (loop-review-history loop)
         (list (loop-reviewer loop) (agent-conversation-handle (loop-reviewer loop)))
         (loop-last-review loop) text)
@@ -1723,6 +1746,85 @@ and end the turn, even if it doesn't answer an interrupt (AGENT-END-TURN)."
   "Takes (directory label); returns a snapshot, or nil outside a git repository with a commit.")
 (defvar *task-snapshot-delete* 'delete-snapshot "Takes (directory snapshot).")
 (defvar *task-snapshot-prune* 'prune-snapshots "Takes (directory).")
+
+;;; Each review's state is snapshotted too, so the reviewer can be given the
+;;; changes as exact commits (untracked files included) and, while it keeps
+;;; the conversation that saw the last one, only what changed since.
+
+(defvar *review-snapshot* 'snapshot-folder
+  "Takes (directory label); returns a snapshot, or nil outside a git repository with a commit.")
+
+(defparameter *review-stat-lines* 40 "Most diff stat lines given to a reviewer.")
+
+(defun review-directory (loop)
+  (or (loop-tree loop) (agent-directory (loop-author loop))))
+
+(defun forget-review-snapshot (entry)
+  "Delete ENTRY's (directory . snapshot) ref; the commits stay until Git prunes them."
+  (when entry (ignore-errors (delete-snapshot (car entry) (cdr entry)))))
+
+(defun take-review-snapshot (loop)
+  "Snapshot the state LOOP's reviewer is about to review, replacing one asked
+for before; nil outside a git repository, or if it fails."
+  (let* ((directory (review-directory loop))
+         (snapshot (and directory
+                        (ignore-errors
+                          (funcall *review-snapshot* directory
+                                   (format nil "review-~d-~a" (get-universal-time) (subseq (make-uuid) 0 8)))))))
+    (when snapshot
+      (forget-review-snapshot (loop-review-snapshot loop))
+      (setf (loop-review-snapshot loop) (cons directory snapshot))
+      snapshot)))
+
+(defun reviewed (loop)
+  "LOOP's reviewer has replied: what it was asked to review becomes its baseline."
+  (let ((pending (loop-review-snapshot loop)))
+    (when pending
+      (forget-review-snapshot (cddr (loop-review-baseline loop)))
+      (setf (loop-review-baseline loop)
+            (list* (loop-reviewer loop) (agent-conversation-handle (loop-reviewer loop)) pending)
+            (loop-review-snapshot loop) nil))))
+
+(defun snapshot-stat (directory from to)
+  "A bounded `git diff --stat` from commit FROM to TO; \"\" if they're the same."
+  (let ((lines (remove "" (uiop:split-string
+                           (snapshot-output directory (list "diff" "--no-ext-diff" "--no-color" "--stat=100" "-M" from to "--"))
+                           :separator '(#\Newline))
+                       :test #'string=)))
+    (format nil "~{~a~^~%~}"
+            (if (<= (length lines) *review-stat-lines*)
+                lines
+                (append (subseq lines 0 (1- *review-stat-lines*))
+                        (list (format nil " … ~d more files" (- (length lines) *review-stat-lines*))
+                              (car (last lines))))))))
+
+(defun review-start-note (workflow loop snapshot)
+  "Where a reviewer in the folder finds the task's changes; worktrees have their own (WORKTREE-NOTE)."
+  (let ((start (getf (workflow-repository-start workflow) :tree))
+        (to (snapshot-working-tree snapshot)))
+    (unless (or (loop-tree loop) (null start))
+      (let ((stat (ignore-errors (snapshot-stat (review-directory loop) start to))))
+        (when stat
+          (format nil "Changes in the folder since the task started (they can include the user's or the other ~
+part's edits), untracked files included: `git diff ~a ~a --`~%~%Diff stat:~%~a"
+                  start to (if (plusp (length stat)) stat "(no changes)")))))))
+
+(defun review-delta-note (loop snapshot reviewer handle)
+  "Where REVIEWER finds what changed since its last review, if it still has
+that conversation, HANDLE, and it was of the same folder; else nil."
+  (let ((baseline (loop-review-baseline loop)))
+    (when (and baseline (equal (list (first baseline) (second baseline)) (list reviewer handle))
+               (equal (third baseline) (review-directory loop)))
+      (let* ((from (snapshot-working-tree (cdddr baseline)))
+             (to (snapshot-working-tree snapshot))
+             (stat (ignore-errors (snapshot-stat (review-directory loop) from to))))
+        (when stat
+          (if (zerop (length stat))
+              "Nothing has changed in the files since your last review."
+              (format nil "Review what changed since your last review: `git diff ~a ~a --` (untracked files ~
+included; ~:[it can include the user's or the other part's edits~;from the worktree~]). Check the fixes and how they interact with what you reviewed before; read other files as needed.~%~%~
+Diff stat:~%~a"
+                      from to (loop-tree loop) stat)))))))
 
 (defstruct (task-changes (:constructor %make-task-changes))
   workflow directory label
