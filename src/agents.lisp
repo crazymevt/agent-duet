@@ -50,7 +50,9 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
 ;;; whose CLI was started otherwise is refused.
 
 (defclass agent ()
-  ((metrics :initform nil :accessor agent-metrics)
+  ((context-tokens :initform nil :accessor agent-context-tokens)
+   (context-limit :initform nil :accessor agent-context-limit)
+   (metrics :initform nil :accessor agent-metrics)
    (metrics-id :initform nil :accessor agent-metrics-id)
    (metrics-start :initform nil :accessor agent-metrics-start)
    (metrics-reporter :initform nil :accessor agent-metrics-reporter)
@@ -168,6 +170,17 @@ turn ID and a metrics plist once, before CALLBACK (or at cancellation)."
 (defmethod agent-steer ((agent agent) prompt &optional images)
   (declare (ignore prompt images))
   (error "This agent does not support sending while working."))
+
+(defun agent-context-summary (agent)
+  (if (agent-context-tokens agent)
+      (format nil "Context~a: ~:d~@[ / ~:d~] tokens"
+              (if (typep agent 'claude-agent) " ≈" "")
+              (agent-context-tokens agent) (agent-context-limit agent))
+      "Context: unknown"))
+
+(defmethod agent-new-conversation :after ((agent agent))
+  (setf (agent-context-tokens agent) nil (agent-context-limit agent) nil)
+  (agent-emit agent :usage))
 
 (defun agent-send-now (agent prompt &optional attachments)
   "Send a side-pane message, with ATTACHMENTS (paths), steering if busy.
@@ -683,6 +696,13 @@ the PreToolUse hook, which replaces its command with a helper-free invocation."
     (case (event-kind event)
       (:init (when (event-session-id event)
                (setf (claude-agent-session-id agent) (event-session-id event))))
+      (:context
+       (let* ((usage (event-data event))
+              (values (mapcar (lambda (key) (metric-number (jget usage key)))
+                              '("input_tokens" "cache_read_input_tokens" "cache_creation_input_tokens"))))
+         (setf (agent-context-tokens agent)
+               (and (first values) (reduce #'+ values :key (lambda (v) (or v 0)))))
+         (agent-emit agent :usage)))
       (:text-delta (agent-emit agent :delta :text (event-text event)))
       (:text (agent-emit agent :text :text (event-text event)))
       (:thinking (agent-emit agent :thinking :text (event-text event)))
@@ -1080,6 +1100,9 @@ rather than using a server with no thread."
                 (mapping '((:input-tokens . "inputTokens") (:output-tokens . "outputTokens")
                            (:cache-read-tokens . "cachedInputTokens")
                            (:reasoning-tokens . "reasoningOutputTokens") (:total-tokens . "totalTokens"))))
+           (setf (agent-context-tokens agent) (metric-number (jget last "totalTokens"))
+                 (agent-context-limit agent) (metric-number (jget data "modelContextWindow")))
+           (agent-emit agent :usage)
            ;; LAST is one model request, not necessarily the whole tool-using
            ;; turn. Anchor the cumulative thread total at its first update.
            ;; Subtracting LAST also excludes usage from a resumed conversation.

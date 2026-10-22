@@ -10,6 +10,14 @@ command-line tools: Claude Code (`claude -p`, stream-json) and Codex
 ChatGPT is asking to run the tests. The conversation is a made-up demo; no CLI
 command is running.*
 
+Each agent's status shows its latest reported context token count (unknown until
+reported). Claude's estimate includes cached input; ChatGPT also shows the context
+window limit when supplied by its CLI. These are snapshots, not cumulative usage.
+Use **Clear context** or send `/clear` to an individual agent to start a fresh
+conversation, cancelling standalone work if necessary. Stop an active task before
+clearing one of its agents. Clearing context keeps
+saved history and does not send a slash command to the model.
+
 The window has a shared conversation and a panel for each agent:
 
 - **The conversation between them.** Your request, each plan, each report of

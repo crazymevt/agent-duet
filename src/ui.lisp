@@ -656,8 +656,9 @@ for Codex, the one marked as the default)."
                      (attachments (agent-pane-attachments pane)))
                  (when (and (or (plusp (length text)) attachments) (not (committing-p pane)))
                    (handler-case
-                       (progn (agent-send-now agent (if (plusp (length text)) text "Take a look at these.")
-                                              attachments)
+                       (progn (unless (handle-clear-context-command text attachments (list agent))
+                                (agent-send-now agent (if (plusp (length text)) text "Take a look at these.")
+                                                attachments))
                               (clear-text-view input)
                               (set-attachments pane '()))
                      (error (e) (pane-note pane (princ-to-string e) "error")))))))
@@ -678,8 +679,8 @@ for Codex, the one marked as the default)."
                                    status
                                    (make-workflow-activity-pill agent "WORKFLOW-ACTIVITY")
                                    (gtk:box :hexpand t)
-                                   (gtk:button :label "New" :css-classes '("flat")
-                                               :tooltip-text (format nil "Start a new conversation with ~a" (agent-name agent))
+                                   (gtk:button :label "Clear context" :css-classes '("flat")
+                                               :tooltip-text (format nil "Clear ~a's context (/clear); starts a new conversation" (agent-name agent))
                                                :on-clicked (lambda (b) (declare (ignore b)) (new-conversation agent))))
                           (make-agent-disclosure agent "MODEL-EXPANDED" "Model & thinking" (wrapping-controls models efforts))
                           (make-agent-activity-label pane)
@@ -735,14 +736,14 @@ for Codex, the one marked as the default)."
          (out (agent-out-until agent))
          (out-now (or (agent-out-of-usage-p agent) (eq out :unknown))))
     (gtk:label-set-text (pane-status pane)
-                        (format nil "~a~:[~@[ · ~a left~]~;~*~]"
+                        (format nil "~a~:[~@[ · ~a left~]~;~*~] · ~a"
                                 (cond (waiting "Waiting for you")
                                       ((agent-busy agent) "Working…")
                                       (out-now (if (integerp out)
                                                    (format nil "Out of usage until ~a" (format-reset-time out))
                                                    "Out of usage"))
                                       (t (agent-pane-ready pane)))
-                                out-now usage))
+                                out-now usage (agent-context-summary agent)))
     (gtk:widget-set-css-classes (pane-status pane)
                                 (if (or out-now (usage-low-p windows)) '("warning") '("dim-label")))
     (gtk:widget-set-tooltip-text (pane-status pane)
@@ -1174,9 +1175,23 @@ few such prompts made resizing take a large part of a second.")
   (pane-finish-stream pane nil)
   (pane-update-status pane))
 
+(defun handle-clear-context-command (text attachments agents)
+  "Consume /clear locally, using the same reset and history path as the button."
+  (when (string= text "/clear")
+    (when attachments (error "/clear does not accept attachments."))
+    ;; Check all recipients before resetting any of them.
+    (when (some (lambda (agent)
+                  (and (workflow-running-p) (workflow-agent-p *workflow* agent))) agents)
+      (error "Stop the task before clearing this agent's context."))
+    (dolist (agent agents) (new-conversation agent))
+    t))
+
 (defun new-conversation (agent)
   "A new conversation with AGENT alone. The history goes on, AGENT's part
 of it now carried on from here."
+  (when (and (workflow-running-p) (workflow-agent-p *workflow* agent))
+    (pane-note (agent-pane-of agent) "Stop the task before clearing this agent's context.")
+    (return-from new-conversation nil))
   (agent-cancel agent)
   (agent-new-conversation agent)
   (let ((pane (agent-pane-of agent)))
@@ -1184,7 +1199,8 @@ of it now carried on from here."
     (pane-note pane "New conversation."))
   (when *history*
     (record (agent-id agent) :note "New conversation.")
-    (save-current-history)))
+    (save-current-history))
+  t)
 
 ;;; History: each conversation kept, to look back on and carry on (history.lisp)
 
@@ -2998,6 +3014,16 @@ and summary, with Changes and, when the work can be committed, Commit changes."
          (text (string-trim '(#\Space #\Newline #\Tab) (text-view-text (control :input))))
          (key (list recipient text attachments *workflow* *directory*))
          (pending (control :composer-delivery)))
+    (when (and (string= text "/clear") (not (committing-p *middle*)))
+      (handler-case
+          (when (handle-clear-context-command
+                 text attachments (case recipient
+                                    (:claude (list *claude*)) (:codex (list *codex*))
+                                    (t (list *claude* *codex*))))
+            (clear-text-view (control :input))
+            (setf (getf *controls* :composer-delivery) nil))
+        (error (e) (pane-note *middle* (princ-to-string e) "error")))
+      (return-from send-composer-message))
     (unless (equal key (getf pending :key))
       (setf pending nil (getf *controls* :composer-delivery) nil))
     (unless (committing-p *middle*)

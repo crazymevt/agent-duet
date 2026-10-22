@@ -107,8 +107,9 @@
     (is = 30 (getf (ai::agent-metrics agent) :input-tokens))
     (ai::codex-agent-event agent server
                           (ai::make-codex-event :kind :token-usage :turn-id "active" :thread-id "thread"
-                                               :data (ai:jobj "last" (ai:jobj "inputTokens" 40 "outputTokens" 5)
+                                               :data (ai:jobj "last" (ai:jobj "inputTokens" 40 "outputTokens" 5 "totalTokens" 45)
                                                               "total" (ai:jobj "inputTokens" 170 "outputTokens" 33))))
+    (is = 45 (ai::agent-context-tokens agent))
     (is = 70 (getf (ai::agent-metrics agent) :input-tokens))
     (is = 13 (getf (ai::agent-metrics agent) :output-tokens))
     (false (getf (ai::agent-metrics agent) :cost-usd))))
@@ -182,3 +183,24 @@
            (restored (ai:restore-workflow cp :lead author :partner reviewer)))
       (is equalp (ai::task-metric-totals workflow :work)
           (ai::task-metric-totals restored :work)))))
+
+(define-test agent-context-usage-and-clear :parent agent-duet
+  (let* ((agent (make-instance 'ai:claude-agent))
+         (cp (ai::make-claude-process)))
+    (setf (ai::claude-agent-process agent) cp)
+    (dolist (event (ai::parse-claude-event
+                    "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":8}}}}"))
+      (ai::claude-agent-event agent cp event))
+    (is = 120 (ai::agent-context-tokens agent))
+    (setf (ai::claude-agent-process agent) nil
+          (ai::claude-agent-started agent) t
+          (ai::claude-agent-session-id agent) "old")
+    (ai::agent-new-conversation agent)
+    (false (ai::agent-conversation-handle agent))
+    (false (ai::agent-context-tokens agent)))
+  (let ((agent (make-instance 'ai:codex-agent)))
+    (setf (ai::codex-agent-thread-id agent) "keep"
+          (ai::agent-context-fallback agent) '(("compact" . "full")))
+    (ai::agent-new-conversation agent)
+    (is equal '(("compact" . "full")) (ai::agent-context-fallback agent))
+    (false (ai::agent-conversation-handle agent))))
