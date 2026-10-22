@@ -2,31 +2,41 @@
 (in-package #:agent-duet)
 
 (defvar *pane-search-window* nil)
-(defvar *pane-search-highlight* nil "Highlighted label and its original explicit attributes.")
+(defvar *pane-search-highlight* nil "Highlighted labels and their original explicit attributes.")
 
 (defun clear-pane-search-highlight ()
   (when *pane-search-highlight*
-    (destructuring-bind (label attributes) *pane-search-highlight*
-      (gtk:label-set-attributes label attributes))
+    (dolist (saved *pane-search-highlight*)
+      (destructuring-bind (label attributes) saved
+        (gtk:label-set-attributes label attributes)))
     (setf *pane-search-highlight* nil)))
+
+(defun highlight-pane-search-matches (matches)
+  "Replace search highlights, saving each label's styling only once."
+  (clear-pane-search-highlight)
+  (dolist (match matches)
+    (destructuring-bind (label start end &rest ignored) match
+      (declare (ignore ignored))
+      (unless (assoc label *pane-search-highlight* :test #'eq)
+        (let ((original (gtk:label-get-attributes label)))
+          (push (list label (and original (pango:attr-list-copy original)))
+                *pane-search-highlight*)))
+      (let* ((original (gtk:label-get-attributes label))
+             (attributes (if original (pango:attr-list-copy original) (pango:attr-list-new)))
+             (text (gtk:label-get-text label))
+             (byte-start (length (sb-ext:string-to-octets text :external-format :utf-8 :end start)))
+             (byte-end (length (sb-ext:string-to-octets text :external-format :utf-8 :end end))))
+        (dolist (attribute (list (pango:attr-background-new 65535 55255 16448)
+                                (pango:attr-foreground-new 7710 6425 2570)))
+          (setf (pango:attribute-start-index attribute) byte-start
+                (pango:attribute-end-index attribute) byte-end)
+          (pango:attr-list-insert attributes attribute))
+        (gtk:label-select-region label 0 0)
+        (gtk:label-set-attributes label attributes)))))
 
 (defun highlight-pane-search-match (label start end)
   "Paint the exact match independently of keyboard focus; preserve label styling."
-  (clear-pane-search-highlight)
-  (let* ((original (gtk:label-get-attributes label))
-         (saved (and original (pango:attr-list-copy original)))
-         (attributes (if original (pango:attr-list-copy original) (pango:attr-list-new)))
-         (text (gtk:label-get-text label))
-         (byte-start (length (sb-ext:string-to-octets text :external-format :utf-8 :end start)))
-         (byte-end (length (sb-ext:string-to-octets text :external-format :utf-8 :end end))))
-    (dolist (attribute (list (pango:attr-background-new 65535 55255 16448)
-                             (pango:attr-foreground-new 7710 6425 2570)))
-      (setf (pango:attribute-start-index attribute) byte-start
-            (pango:attribute-end-index attribute) byte-end)
-      (pango:attr-list-insert attributes attribute))
-    (setf *pane-search-highlight* (list label saved))
-    (gtk:label-select-region label 0 0)
-    (gtk:label-set-attributes label attributes)))
+  (highlight-pane-search-matches (list (list label start end))))
 
 (defun pane-search-matches (pane query)
   "Return (label start end expanders) for each literal, case-insensitive match.
@@ -48,7 +58,7 @@ Walk rendered labels, including collapsed details, without searching composers."
                           while child append (walk child expanders))))))
       (walk (pane-messages pane) nil))))
 
-(defun reveal-pane-search-match (pane match)
+(defun reveal-pane-search-match (pane match &optional (highlight t))
   (destructuring-bind (label start end expanders) match
     (when (typep pane 'agent-pane)
       (let ((transcript (getf *controls* (agent-setting-key (agent-pane-agent pane) "TRANSCRIPT"))))
@@ -59,7 +69,7 @@ Walk rendered labels, including collapsed details, without searching composers."
           while parent
           when (typep parent 'gtk:expander) do (gtk:expander-set-expanded parent t))
     (gtk:label-set-selectable label t)
-    (highlight-pane-search-match label start end)
+    (when highlight (highlight-pane-search-match label start end))
     (glib:timeout-add glib:+priority-default+ 80
                    (lambda ()
                      (multiple-value-bind (ok x y)
@@ -108,6 +118,7 @@ Walk rendered labels, including collapsed details, without searching composers."
                              :margin-start 12 :margin-end 12 :margin-top 12 :margin-bottom 12))
          (entry (make-instance 'gtk:entry :placeholder-text "Find text"))
          (selector (make-instance 'gtk:drop-down :model (gtk:string-list-new names)))
+         (highlight-all (make-instance 'gtk:check-button :label "Highlight all"))
          (row (make-instance 'gtk:box :spacing 8))
          (count (make-instance 'gtk:label :label "Enter text to search" :hexpand t :xalign 0.0))
          (previous (make-instance 'gtk:button :label "Previous"))
@@ -127,10 +138,15 @@ Walk rendered labels, including collapsed details, without searching composers."
                (when selected
                  (gtk:label-select-region (first selected) 0 0)
                  (setf selected nil)))
+             (paint ()
+               (highlight-pane-search-matches
+                (if (gtk:check-button-get-active highlight-all) matches
+                    (when selected (list selected)))))
              (refresh ()
                (clear-selection)
                (resume-following)
                (setf matches (pane-search-matches (pane) (gtk:editable-get-text entry)) index -1)
+               (paint)
                (gtk:label-set-text count (cond (matches (format nil "~d matches" (length matches)))
                                                ((zerop (length (gtk:editable-get-text entry))) "Enter text to search")
                                                (t "No matches")))
@@ -146,9 +162,11 @@ Walk rendered labels, including collapsed details, without searching composers."
                                       (length matches))
                            selected (nth index matches))
                      (setf *pane-search-scroller* (pane-scroller (pane)))
-                     (reveal-pane-search-match (pane) selected)
+                     (paint)
+                     (reveal-pane-search-match (pane) selected nil)
                      (gtk:label-set-text count (format nil "~d of ~d" (1+ index) (length matches))))
                    (refresh))))
+      (gobject:connect highlight-all :toggled (lambda (b) (declare (ignore b)) (paint)))
       (gobject:connect entry :changed (lambda (e) (declare (ignore e)) (refresh)))
       (gobject:connect entry :activate (lambda (e) (declare (ignore e)) (move 1)))
       (gobject:connect selector "notify::selected" (lambda (w p) (declare (ignore w p)) (refresh)))
@@ -167,7 +185,7 @@ Walk rendered labels, including collapsed details, without searching composers."
         (gtk:event-controller-set-propagation-phase keys :capture)
         (gtk:widget-add-controller window keys))
       (refresh))
-    (dolist (widget (list selector entry row)) (gtk:box-append box widget))
+    (dolist (widget (list selector entry row highlight-all)) (gtk:box-append box widget))
     (dolist (widget (list count previous next close)) (gtk:box-append row widget))
     (setf *pane-search-window* window)
     (gtk:window-set-destroy-with-parent window t)
