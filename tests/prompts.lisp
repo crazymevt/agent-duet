@@ -952,3 +952,41 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
                 (lambda (prompt) (if (search "Review the work" prompt) *approve* "B done")))
     (declare (ignore workflow))
     (true (find "Order: parallel: independent files" messages :key #'third :test #'search))))
+
+(define-test answer-repeated-after-failed-turn :parent agent-duet
+  (multiple-value-bind (workflow messages claude codex)
+      (run-fake :review
+                (list (says (format nil "Done.~%QUESTIONS:~%- Q1 [non-blocking] Is frob a good name?"))
+                      (says '(:error "Disconnected")))
+                (list (says (format nil "ANSWERS:~%- Q1 Prefer frobnicate.~%FINDINGS:~%- F1 [open] Rename it~%VERDICT: CHANGES REQUESTED"))))
+    (declare (ignore messages))
+    ;; The turn carrying the answer failed: it doesn't count as given.
+    (true (search "Prefer frobnicate." (first (fake-prompts claude))))
+    (false (ai::workflow-delivered-answers workflow))
+    (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+           (restored (ai:restore-workflow cp :lead claude :partner codex)))
+      (setf (fake-replies claude) (list (says "Renamed."))
+            (fake-replies codex) (list (says (format nil "FINDINGS:~%- F1 [fixed] Rename it~%VERDICT: APPROVED"))))
+      (is eq :started (ai:recover-workflow restored :resume))
+      (true (search "Prefer frobnicate." (first (fake-prompts claude))))
+      (is equal '(1) (ai::workflow-delivered-answers restored)))))
+
+(define-test review-only-open-suggestions-approve :parent agent-duet
+  (with-git-folder (repo)
+    (let ((approved (format nil "FINDINGS:~%- F1 [open] [suggestion] `a.lisp:1` Nicer name~%VERDICT: APPROVED")))
+      (multiple-value-bind (workflow claude codex)
+          (review-only-fixture repo :agents :lead :reply (lambda (a p) (declare (ignore a p)) approved))
+        (declare (ignore codex))
+        (ai:start-workflow workflow)
+        (is eq :approved (ai::loop-state (first (ai::workflow-loops workflow))))
+        (true (search "[suggestion]" (first (fake-prompts claude)))))
+      ;; The restored continuation decides the same way.
+      (multiple-value-bind (workflow claude codex)
+          (review-only-fixture repo :agents :lead :reply (lambda (a p) (declare (ignore a p)) '(:error "failed")))
+        (ai:start-workflow workflow)
+        (is eq :paused (ai::loop-state (first (ai::workflow-loops workflow))))
+        (let* ((cp (ai:parse-json (ai:json-string (ai:workflow-checkpoint workflow))))
+               (restored (ai:restore-workflow cp :lead claude :partner codex)))
+          (setf (fake-replies claude) (list (says approved)))
+          (is eq :started (ai:recover-workflow restored :resume))
+          (is eq :approved (ai::loop-state (first (ai::workflow-loops restored)))))))))

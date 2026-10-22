@@ -403,3 +403,27 @@
                            (ai::task-summary-lines (ai::workflow-completion-data workflow)))))
           (ai:stop-workflow workflow)
           (uiop:delete-directory-tree history :validate t :if-does-not-exist :ignore))))))
+
+(define-test check-evidence-describes-launch-state :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((author (make-instance 'fake-agent :id :claude :name "Claude" :directory repo
+                                  :replies (list (says "Done"))))
+           (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT" :directory repo
+                                    :replies (list (says (format nil "FINDINGS: NONE~%VERDICT: APPROVED")))))
+           ;; A check that changes the files it checks.
+           (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Do it"
+                                   :check-command "printf x >> a.txt")))
+      (let* ((history (merge-pathnames (format nil "duet-history-~a/" (ai::make-uuid)) (uiop:temporary-directory)))
+             (ai::*history-directory* history))
+        (unwind-protect
+             (progn
+               (write-file-text repo "a.txt" "work")
+               (let ((before (ai::repository-state-id repo)))
+                 (ai:start-workflow workflow)
+                 (true (wait-until (lambda () (eq :finished (ai:workflow-state workflow)))))
+                 (let ((check (find :check (ai::workflow-task-evidence workflow) :key #'ai::evidence-kind)))
+                   (is equal before (ai::evidence-repo-state check))
+                   ;; The check's own edit makes its result stale, not current.
+                   (false (ai::evidence-current-p check (ai::repository-state-id repo))))))
+          (ai:stop-workflow workflow)
+          (uiop:delete-directory-tree history :validate t :if-does-not-exist :ignore))))))

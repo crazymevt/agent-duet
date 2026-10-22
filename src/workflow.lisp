@@ -329,7 +329,8 @@ preserve the step for explicit recovery (PAUSE-STEP)."
 
 (defun turn-records-text (workflow agent)
   "What AGENT is to see at this turn boundary: the questions put to it, and
-answers to its own it hasn't been given, which now count as given."
+answers to its own it hasn't been given. The second value is those answers'
+ids, which count as given only once the turn is accepted (ANSWERS-DELIVERED)."
   (let* ((asked (open-questions-to workflow agent))
          (answered (remove-if-not (lambda (q) (and (eq (task-question-from q) (agent-id agent))
                                                    (task-question-answer q)
@@ -344,8 +345,12 @@ ANSWERS section, one line each: `- Q1 answer`. A blocking one holds up its work 
                               (and answered
                                    (format nil "Answers to your questions:~%~a"
                                            (records-text (questions-prompt-lines answered))))))))
-    (dolist (q answered) (push (task-question-id q) (workflow-delivered-answers workflow)))
-    (and parts (format nil "~{~a~^~%~%~}" parts))))
+    (values (and parts (format nil "~{~a~^~%~%~}" parts))
+            (mapcar #'task-question-id answered))))
+
+(defun answers-delivered (workflow ids)
+  "Count answers IDS as given; until then a retried or restored turn repeats them."
+  (dolist (id ids) (pushnew id (workflow-delivered-answers workflow))))
 
 (defun disputed-finding-ids (text)
   "The finding ids on a report's DISPUTED: F2, F5 line."
@@ -485,7 +490,9 @@ For decisions worth keeping, use a DECISIONS section instead, one line each: `- 
 To ask ~a something, add a QUESTIONS section: `- Q1 [blocking] question` if your work can't go on without the answer (it waits for it), else `- Q1 [non-blocking] question`.~
 ~@[ `~a` runs automatically after your turn and its result goes to the reviewer: run targeted checks as needed instead of running it yourself.~]"
                      (step-contract-revision step) (agent-name (other-agent workflow agent)) check)))
-         (records (turn-records-text workflow agent))
+         (records+ids (multiple-value-list (turn-records-text workflow agent)))
+         (records (first records+ids))
+         (answer-ids (second records+ids))
          (full (format nil "~a~@[~%~%~a~]~@[~%~%~a~]~%~%~a" brief instructions records prompt))
          (prompt
            (if (and handle (equal handle (second seen)) (equal brief (third seen)))
@@ -507,6 +514,7 @@ To ask ~a something, add a QUESTIONS section: `- Q1 [blocking] question` if your
                           (let ((others (remove agent (workflow-contract-context workflow) :key #'car)))
                             (if error others
                                 (cons (list agent (agent-conversation-handle agent) brief) others))))
+                    (unless error (answers-delivered workflow answer-ids))
                     (when callback (funcall callback text error))) nil
                   (lambda (id metrics)
                     (unless (find id (workflow-metrics workflow) :key (lambda (m) (getf m :id)) :test #'equal)
@@ -1762,8 +1770,9 @@ ready waits for it in any case."
         (check-finished workflow))
       (loop-review workflow loop)))
 
-(defun check-in (workflow loop token command fixes code output timed-out)
-  "Accept only the current check's result, delivered on the workflow thread."
+(defun check-in (workflow loop token command fixes code output timed-out &optional state)
+  "Accept only the current check's result, delivered on the workflow thread.
+STATE is the repository state the check was launched on."
   (when (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
     (let ((log-path (second token)))
       (setf (loop-check-handle loop) nil)
@@ -1785,8 +1794,9 @@ ready waits for it in any case."
 until it passes: request changes, saying what needs fixing.~%~%~a"
                           fixes report))
               (loop-check-failed loop) (not passed))
-        ;; Indexed against the state it ran on; a repeat on the same state is waste.
-        (let ((state (repository-state-id (review-directory loop))))
+        ;; Indexed against the state it was launched on, not one it may have
+        ;; changed; a repeat on the same state is waste.
+        (progn
           (add-evidence workflow :check status state :check)
           (when (and log-path (not passed))
             (add-evidence workflow :artifact (format nil "Failed check log: ~a" log-path) state :check))
@@ -1820,7 +1830,8 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
   (let ((command (blank-to-nil (workflow-check-command workflow))))
     (if (null command)
         (loop-checked workflow loop)
-        (let ((token (list nil nil)))
+        (let ((token (list nil nil))
+              (state (repository-state-id (review-directory loop))))
           (setf (loop-check-handle loop) token)
           (update-loop-state workflow loop :checking)
           (post workflow :system (loop-author loop)
@@ -1832,7 +1843,7 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
                   (run-check command (or (loop-tree loop) (agent-directory (loop-author loop)))
                              (agent-deliver (loop-author loop))
                              (lambda (code output timed-out)
-                               (check-in workflow loop token command fixes code output timed-out))
+                               (check-in workflow loop token command fixes code output timed-out state))
                              (lambda (path) (setf (second token) path))))
             ;; Also cover cancellation between launching and storing the handle.
             (unless (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
@@ -2891,8 +2902,8 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
           (let ((loop loop))
             (publish-checklist workflow loop)
             (submit workflow (loop-reviewer loop)
-                    (format nil "Review only. Do not modify files or run commands that write. ~a~%~%Review focus: ~a~%~%Report bugs and missed requirements with locations. List findings in this form:~%FINDINGS:~%- F1 [open] `path:line` Problem and suggested fix~%Write FINDINGS: NONE if there are none. End with VERDICT: APPROVED or VERDICT: CHANGES REQUESTED."
-                            target (workflow-request workflow))
+                    (format nil "Review only. Do not modify files or run commands that write. ~a~%~%Review focus: ~a~%~%Report bugs and missed requirements with locations. List findings in this form:~%FINDINGS:~%- F1 [open] `path:line` Problem and suggested fix~%~a Write FINDINGS: NONE if there are none. End with VERDICT: APPROVED or VERDICT: CHANGES REQUESTED."
+                            target (workflow-request workflow) *severity-instruction*)
                     (lambda (text error)
                       (if error
                           (loop-failed workflow loop (format nil "Review failed: ~a" text))
@@ -2902,13 +2913,15 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                   (loop-summary loop) text)
                             (post workflow (loop-reviewer loop) :user text :review)
                             (take-findings workflow loop text)
-                            (update-loop-state workflow loop
-                                               (if (and (eq (review-verdict text) :approved)
-                                                        (zerop (count-findings (loop-findings loop) :open)))
-                                                   :approved :unresolved))
+                            (update-loop-state workflow loop (review-only-outcome loop text))
                             (check-finished workflow))))
                     :role :review :loop loop))))
     (error (e) (fail workflow "Can't start review: ~a" e))))
+
+(defun review-only-outcome (loop text)
+  "A review-only LOOP's state after review TEXT: as in review loops, only open blockers stop approval."
+  (if (and (eq (review-verdict text) :approved) (zerop (open-blockers (loop-findings loop))))
+      :approved :unresolved))
 
 (defun review-fix-request (workflow)
   "A standalone writing task, retaining reviewer identity and local finding IDs."
@@ -3066,10 +3079,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                      (progn (incf (loop-round l))
                             (setf (loop-summary l) text (loop-last-review l) text)
                             (take-findings workflow l text)
-                            (update-loop-state workflow l
-                                               (if (and (eq (review-verdict text) :approved)
-                                                        (zerop (count-findings (loop-findings l) :open)))
-                                                   :approved :unresolved))
+                            (update-loop-state workflow l (review-only-outcome l text))
                             (check-finished workflow))
                      (review-in workflow l text (step-confirming step))))
         (:plan (plan-ready workflow text))
