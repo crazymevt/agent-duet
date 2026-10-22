@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Find text in conversation and agent panes with Cmd+F / Ctrl+F or **Find in
+  pane…**, with next/previous matches and a pane selector. History searches
+  saved titles and message text in the current folder. Terminal Ctrl+F and
+  configured panel shortcuts retain their existing behavior.
+
 - Each agent's status shows its latest reported context usage, including in
   workflow status headers. **Clear context** and `/clear` start a new agent
   conversation while keeping saved history; active tasks must be stopped first.

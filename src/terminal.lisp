@@ -404,3 +404,9 @@ any variables of the same names."
 
 (defun toggle-terminal ()
   (set-terminal-visible (not (terminal-visible-p))))
+
+(defun terminal-focus-p (window)
+  "Whether keyboard focus is anywhere inside the embedded terminal panel."
+  (and *terminal-panel*
+       (loop for widget = (gtk:window-get-focus window) then (gtk:widget-get-parent widget)
+             while widget thereis (eq widget *terminal-panel*))))

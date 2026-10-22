@@ -38,6 +38,7 @@
   :pathname "src/"
   :serial t
   :components ((:file "ui")
+               (:file "search")
                (:file "ui-presentation")
                (:file "terminal")
                (:file "preview")

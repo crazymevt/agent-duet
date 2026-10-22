@@ -594,8 +594,9 @@ or before a synchronous read or destructive operation that needs durability."
           (setf (gethash file *history-summary-cache*) (cons signature summary))
           summary))))
 
-(defun list-histories (&key directory (limit 50))
-  "Newest summaries. Parse only files whose metadata changed since last listing."
+(defun list-histories (&key directory (limit 50) (query ""))
+  "Newest metadata summaries. Non-empty queries also search saved message text.
+Cache only metadata; load message bodies on demand without retaining them."
   (flush-history-saves)
   (let* ((folder (and directory (namestring (uiop:ensure-directory-pathname directory))))
          (files (ignore-errors (uiop:directory-files (history-directory) "*.json")))
@@ -604,7 +605,14 @@ or before a synchronous read or destructive operation that needs durability."
                  for summary = (cached-history-summary file)
                  when (and summary (or (null folder)
                                        (equal folder (namestring (uiop:ensure-directory-pathname
-                                                                 (getf summary :directory))))))
+                                                                 (getf summary :directory)))))
+                           (or (zerop (length query))
+                               (search query (or (getf summary :title) "") :test #'char-equal)
+                               (let ((history (load-history (getf summary :id))))
+                                 (and history
+                                      (some (lambda (entry)
+                                              (search query (or (getf entry :text) "") :test #'char-equal))
+                                            (history-entries history))))))
                    collect (copy-list summary))))
     ;; Bound cache retention when histories or storage directories disappear.
     (maphash (lambda (file value) (declare (ignore value))

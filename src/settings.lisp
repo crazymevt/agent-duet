@@ -233,6 +233,15 @@ Sidebar and responsive layouts split the child space in half."
        (member :meta-mask modifiers)
        (not (intersection '(:control-mask :alt-mask :shift-mask) modifiers))))
 
+(defun find-shortcut-p (key modifiers &key terminal-focused (macos (uiop:os-macosx-p)))
+  "Use Cmd+F on macOS; preserve terminal Ctrl+F on other platforms."
+  (and (string-equal key "f")
+       (if macos
+           (and (member :meta-mask modifiers) (not (member :control-mask modifiers)))
+           (and (member :control-mask modifiers) (not terminal-focused)
+                (not (member :meta-mask modifiers))))
+       (not (intersection '(:alt-mask :shift-mask) modifiers))))
+
 (defun terminal-grave-shortcut-p (key modifiers)
   "Ctrl+`, with any other modifiers, the fixed terminal toggle."
   (and (member key '("grave" "dead_grave") :test #'string=)

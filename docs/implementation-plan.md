@@ -454,11 +454,36 @@ message-entry checks. GTK emitted frame-timing warnings during layout checks.
 - [x] Verify dirty repositories, untracked files, text-only results, failed
   checks, worktree integrations, and changes made after task completion.
 
-## Milestone 4: search and task export
+## Milestone 4: search
 
-- [ ] Search within transcripts and the conversation/history list.
+Implemented for review: Cmd+F / Ctrl+F or **Find in pane…** opens a pane
+selector and literal, case-insensitive search with occurrence counts,
+Previous/Next, Enter/Shift+Enter, and Escape to close. Navigation selects the
+matching rendered text and expands containing details. History filters titles
+and saved message text within the current folder, across all saved conversations
+rather than only the recent 30. Pane search matches within individual rendered
+labels; it does not span separate Markdown blocks or formatting labels.
+
+- [x] Search within transcripts and the conversation/history list.
+
+Validation: `make test-parallel` passed 3,268 assertions across eight workers
+with zero failures or skips. `make test-ui` passed, including occurrence counts,
+Unicode offsets, collapsed details, navigation wrapping, no-match feedback,
+visible scrolling and preserving search position during new replies.
+
+Review corrections F1–F4: Find uses Cmd+F on macOS, leaving Ctrl+F to the
+Terminal; elsewhere Ctrl+F is ignored while terminal focus is active. Configured
+panel shortcuts take precedence. Automatic following pauses only after match
+navigation and resumes on query/pane changes or closing Find. History summaries
+retain metadata only; non-empty body searches read messages on demand. Selector
+names and panes are built from the same filtered pairs.
+
+### Deferred: task export
+
 - [ ] Export a task as Markdown, including request, plans, reviews, checklist,
   and the combined written result for text-only tasks.
+
+Export has no scheduled milestone; deferred at the user's request until needed.
 
 ## Remaining backlog
 

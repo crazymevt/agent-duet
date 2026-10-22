@@ -3691,3 +3691,13 @@ VERDICT: APPROVED" nil)
     (multiple-value-bind (task findings) (ai::checklist-sections legacy)
       (is equal legacy task)
       (is equal "" findings))))
+
+(define-test find-shortcut-preserves-terminal-keys
+    :parent agent-duet
+  (true (ai::find-shortcut-p "f" '(:meta-mask) :macos t :terminal-focused t))
+  (false (ai::find-shortcut-p "f" '(:control-mask) :macos t))
+  (true (ai::find-shortcut-p "f" '(:control-mask) :macos nil))
+  (false (ai::find-shortcut-p "f" '(:control-mask) :macos nil :terminal-focused t))
+  (false (ai::find-shortcut-p "f" '(:meta-mask) :macos nil))
+  (false (ai::find-shortcut-p "f" '(:control-mask :shift-mask) :macos nil))
+  (false (ai::find-shortcut-p "f" '(:meta-mask :control-mask) :macos t)))

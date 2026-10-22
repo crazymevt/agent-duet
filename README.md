@@ -409,11 +409,25 @@ agents are told to use bounded tool output and respect read-only restrictions.
   (`@AGENTS.md`) for Claude; Codex isn't given lines that only import `AGENTS.md`.
 - **Workspace › Appearance**: Dark, Light or System.
 - **History** (top left, beside the folder): start a new conversation, or
-  carry on an earlier one in this folder.
+  carry on an earlier one in this folder. The search field filters titles and
+  saved message text across all conversations in the folder.
 
 These, the permission setting, the recent folders and each folder's check
 command are remembered in `~/.config/agent-duet/settings.lisp`, with how
 long a turn may be quiet (see above).
+
+## Search
+
+Press **Cmd+F** / **Ctrl+F**, or choose **Workspace › Find in pane…**.
+Search starts in the focused pane, with a selector for the conversation, agent
+transcripts, checklist and findings. On macOS, Ctrl+F remains available to the
+Terminal; on other platforms Ctrl+F opens Find only outside the Terminal.
+Configured panel shortcuts take priority over Find. Matching is literal and case-insensitive.
+Use **Next** / **Previous** or Enter / Shift+Enter to navigate; Escape closes
+Find. Navigation selects the match, opens containing details and pauses that
+pane's automatic scrolling after navigation. Clearing the query, changing panes
+or closing Find resumes following at the end. Matches stay within individual
+rendered text labels; phrases split by Markdown formatting may not match.
 
 ## Terminal
 

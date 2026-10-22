@@ -588,3 +588,29 @@
       (true (eq buffer (ai::agent-partial-buffer agent)))
       (is string= "first" snapshot)
       (is = 1005 (length (ai::agent-partial-text agent))))))
+
+(define-test history-search
+    :parent agent-duet
+  (with-history-directory
+    (let ((older (saved-history "/a/" "Older title" 10)))
+      (saved-history "/a/" "Recent title" 20)
+      (saved-history "/b/" "Needle elsewhere" 30)
+      (ai::history-add-entry older :codex :text "A Unicode λ NEEDLE in the reply")
+      (setf (ai::history-updated older) 10)
+      (ai::save-history older)
+      ;; Ordinary listings retain only lightweight metadata in the cache.
+      (let ((summaries (ai::list-histories :limit nil)))
+        (false (some (lambda (summary) (getf summary :search-text)) summaries))
+        (false (loop for cached being the hash-values of ai::*history-summary-cache*
+                     thereis (getf (cdr cached) :search-text))))
+      ;; Filter before limiting, include bodies, and respect the folder boundary.
+      (is equal (list (ai::history-id older))
+          (mapcar (lambda (s) (getf s :id))
+                  (ai::list-histories :directory "/a/" :query "λ needle" :limit 1)))
+      (is = 2 (length (ai::list-histories :query "title" :limit nil)))
+      (false (ai::list-histories :query "absent"))
+      (is = 3 (length (ai::list-histories :query "" :limit nil)))
+      ;; Body searches read current saved text rather than retaining message bodies.
+      (ai::history-add-entry older :claude :text "New searchable response")
+      (ai::save-history older)
+      (is = 1 (length (ai::list-histories :query "searchable response"))))))

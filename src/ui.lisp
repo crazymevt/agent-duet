@@ -14,6 +14,7 @@
   (+ +conversation-chat-head-size+ +conversation-chat-head-spacing+))
 
 (defvar *window* nil)
+(defvar *pane-search-scroller* nil "The scroller whose automatic following is paused for Find.")
 (defvar *claude* nil)
 (defvar *codex* nil)
 (defvar *panes* '() "Agent id → AGENT-PANE.")
@@ -380,7 +381,8 @@ and the images follow it as thumbnails."
                            (glib:idle-add glib:+priority-default-idle+
                                           (lambda ()
                                             (setf pending nil)
-                                            (scroll-adjustment-to-end adjustment)
+                                            (unless (eq scroller *pane-search-scroller*)
+                                              (scroll-adjustment-to-end adjustment))
                                             nil))))))
     (values messages scroller)))
 
@@ -394,7 +396,8 @@ and the images follow it as thumbnails."
     (glib:idle-add glib:+priority-default-idle+
                    (lambda ()
                      (setf (pane-scroll-pending pane) nil)
-                     (scroll-adjustment-to-end (gtk:scrolled-window-get-vadjustment (pane-scroller pane)))
+                     (unless (eq (pane-scroller pane) *pane-search-scroller*)
+                       (scroll-adjustment-to-end (gtk:scrolled-window-get-vadjustment (pane-scroller pane))))
                      nil))))
 
 (defun pane-append (pane widget)
@@ -1373,7 +1376,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
         (offer-recovery history))
       (update-controls)))))
 
-(defun fill-history-list (box popover)
+(defun fill-history-list (box popover &optional (query ""))
   (clear-box box)
   (flet ((item (child tooltip action)
            (let ((b (make-instance 'gtk:button :css-classes '("flat") :child child :tooltip-text tooltip)))
@@ -1387,9 +1390,9 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (gtk:box-append box (make-instance 'gtk:label :label (format nil "Earlier in ~a" (folder-label *directory*))
                                        :xalign 0.0 :margin-start 6 :ellipsize :start :max-width-chars 24
                                        :css-classes '("caption-heading" "dim-label")))
-    (let ((summaries (list-histories :directory *directory* :limit 30)))
+    (let ((summaries (list-histories :directory *directory* :limit (if (zerop (length query)) 30 nil) :query query)))
       (unless summaries
-        (gtk:box-append box (make-instance 'gtk:label :label "Nothing yet" :xalign 0.0 :margin-start 6
+        (gtk:box-append box (make-instance 'gtk:label :label (if (zerop (length query)) "Nothing yet" "No matching conversations") :xalign 0.0 :margin-start 6
                                            :css-classes '("dim-label"))))
       (dolist (summary summaries)
         (let ((id (getf summary :id))
@@ -1407,12 +1410,18 @@ comes without one (a turn stopped as the folder changes) isn't kept."
   (let* ((button (make-instance 'gtk:menu-button :label "History"
                                 :tooltip-text "Start a new conversation, or carry on an earlier one in this folder"))
          (popover (make-instance 'gtk:popover))
+         (entry (make-instance 'gtk:entry :placeholder-text "Search conversations"))
+         (content (make-instance 'gtk:box :orientation :vertical :spacing 6))
          (box (make-instance 'gtk:box :orientation :vertical :spacing 2
                              :margin-start 4 :margin-end 4 :margin-top 4 :margin-bottom 4)))
-    (gtk:popover-set-child popover (make-instance 'gtk:scrolled-window :child box :hscrollbar-policy :never
-                                                  :max-content-height 480 :propagate-natural-height t))
+    (gtk:box-append content entry)
+    (gtk:box-append content (make-instance 'gtk:scrolled-window :child box :hscrollbar-policy :never
+                                             :max-content-height 480 :propagate-natural-height t))
+    (gtk:popover-set-child popover content)
+    (gobject:connect entry :changed
+                     (lambda (e) (fill-history-list box popover (gtk:editable-get-text e))))
     ;; Read the saved conversations when the menu opens, not before.
-    (gobject:connect popover :show (lambda (p) (declare (ignore p)) (fill-history-list box popover)))
+    (gobject:connect popover :show (lambda (p) (declare (ignore p)) (fill-history-list box popover (gtk:editable-get-text entry))))
     (gtk:menu-button-set-popover button popover)
     button))
 
@@ -3667,6 +3676,7 @@ this task's turns cheaper."
                                            (setting :shared-notes) *shared-notes*)))
         (gtk:box-append box terminal)
         (action "Keyboard shortcuts…" #'show-shortcut-settings)
+        (action "Find in pane…" #'show-pane-search)
         (action "Documents" #'show-documents)
         (action "Changes" #'show-task-changes)
         (gtk:box-append box checklist)
@@ -3830,6 +3840,9 @@ this task's turns cheaper."
                           ((run-panel-shortcut
                             (event-panel-shortcut (gtk:event-controller-get-current-event c)
                                                   keyval modifiers)))
+                          ((find-shortcut-p key modifiers :terminal-focused (terminal-focus-p window))
+                           (show-pane-search)
+                           t)
                           ((terminal-grave-shortcut-p key modifiers)
                            (toggle-terminal)
                            t)))))

@@ -50,7 +50,7 @@ Review-only mode and restart recovery are complete. The task summary card is
 implemented for review. Next priorities, in order:
 
 1. **Commit at the end:** review the implementation, including the pre-task dirty-folder prompt.
-2. **Search and task export:** milestone 4. Undo is deferred to the backlog.
+2. **Search:** milestone 4, implemented for review. Export and undo are deferred to the backlog.
 
 The earlier top five, and the rest:
 
@@ -79,8 +79,8 @@ Later:
 - [x] **Commit at the end:** After an approved task outside *Own worktrees*, offer **Commit**: the task's changed files (from the changes view) are preselected, files that were already changed before the task are unselected and marked, the user can change the selection, and the proposed staged diff is shown with a message drafted by the lead (editable) before committing. Before writing tasks, offer committing current edits, continuing with them, or cancelling. Completion offers all changes or task-changed files; selected files include all their edits, and excluded files retain their staging. Implemented for review.
 - [ ] **Cost and time in status lines:** Turn records and per-task CLI metric totals are implemented in the completion card. Showing per-turn totals in status lines remains open.
 - [x] **End-of-task summary card:** Files changed (linked to the changes view), rounds per loop, check result, open findings, elapsed time and available per-agent CLI metrics in one card. Unknown/partial values are explicit and turn records survive recovery.
-- [ ] **Search** in a pane (⌘F) and in the conversation list.
-- [ ] **Export a task as Markdown:** request, plans, reviews and checklist, for a PR description or notes.
+- [x] **Search** in a pane (⌘F / Ctrl+F) and in the conversation list. Implemented for review.
+- [ ] **Export a task as Markdown (deferred):** request, plans, reviews and checklist, for a PR description or notes.
 - [ ] **Artifact creation and viewing:** Support deliverables created by either CLI as local files (HTML, Markdown, images, PDFs, spreadsheets, presentations, and other documents), using available tools and dependencies rather than assuming a shared native artifact protocol. Define how agents report artifact paths and metadata; discover outputs from structured events where supported and explicit file references otherwise. Show per-task artifact cards with creator, type, creation/update status, preview, open externally, and save/export actions. Extend the existing Markdown Documents viewer with suitable previews and an external-app fallback; isolate active HTML content. Preserve artifacts and their history links across restart, handoff, and worktree cleanup, and make them available to the other agent for review. Detect supported CLI output types and capabilities by version, including generated-image events where available, and clearly report missing generation tools or unsupported preview formats.
 - [ ] **Prompt templates:** per-folder saved requests in the request box.
 - [ ] **Keyboard shortcuts and a help sheet:** Start/Stop, mode, focus each pane, checklist, terminal.
