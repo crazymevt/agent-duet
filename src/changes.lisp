@@ -7,6 +7,14 @@
   (preview-tag buffer "diff-remove" :paragraph-background "rgba(230,65,65,0.22)")
   (preview-tag buffer "diff-hunk" :paragraph-background "rgba(70,140,230,0.22)" :weight 700))
 
+(defun diff-display-text (diff)
+  "Bound GTK insertion and per-line highlighting; retain the full diff for committing."
+  (if (or (> (length diff) 65536)
+          (> (count #\Newline diff) 1000)
+          (search "GIT binary patch" diff))
+      "This diff is too large or contains binary data, so its contents are not displayed. Review the selected files with Git before committing. The commit still includes their complete contents."
+      diff))
+
 (defun set-diff-text (buffer diff)
   "Replace BUFFER's text with DIFF, tagging hunk headers and added and removed lines.
 BUFFER needs the tags from ADD-DIFF-TAGS. DIFF may span several files."
@@ -139,27 +147,67 @@ once the window has closed. With EMBEDDED, return the widget and a disposal func
          (task (make-instance 'gtk:button :label "Select task-changed files" :visible (and start t)))
          (commit (make-instance 'gtk:button :label (if on-continue "Commit and start task" "Commit selected files")
                                 :sensitive nil :css-classes '("suggested-action")))
+         (retry (make-instance 'gtk:button :label "Retry loading changes" :visible nil))
          (cancel (make-instance 'gtk:button :label "Cancel"))
          (continue (and on-continue (make-instance 'gtk:button :label "Continue without committing")))
          (commit-controls (make-instance 'gtk:box :orientation :vertical :spacing 8 :vexpand t))
          (default-paths nil)
-         (rows nil) (preview nil) (generation 0) (closed nil) (busy nil))
+         (rows nil) (preview nil) (generation 0) (closed nil) (busy nil)
+         (load-timer nil) (retry-initial t) (active-loads 0))
     (labels ((say (text) (gtk:label-set-text status text))
+             (stop-load-timer ()
+               (when load-timer
+                 (glib:source-remove load-timer)
+                 (setf load-timer nil)))
+             (failed (why initial)
+               (setf preview nil)
+               (gtk:widget-set-sensitive commit nil)
+               (say (format nil "Couldn't load the changes: ~a" why))
+               (gtk:widget-set-visible retry t)
+               (when (and initial on-continue)
+                 (gtk:widget-set-visible commit-controls nil)
+                 (gtk:widget-set-visible commit nil)))
              (refresh (&optional initial)
                (let ((serial (incf generation))
                      (paths (loop for (path . check) in rows when (gtk:check-button-get-active check) collect path)))
+                 (stop-load-timer)
+                 (setf retry-initial initial)
+                 (when initial
+                   (setf rows nil)
+                   (clear-box files))
                  (setf preview nil)
+                 (say "Loading changes…")
+                 (gtk:widget-set-visible retry nil)
+                 (gtk:widget-set-visible commit-controls t)
+                 (gtk:widget-set-visible commit t)
                  (gtk:widget-set-sensitive commit nil)
+                 ;; A slow Git worker must not strand the dialog in Loading.
+                 ;; It may still complete; generations reject results after retry.
+                 (setf load-timer
+                       (glib:timeout-add-seconds glib:+priority-default+ 10
+                         (lambda ()
+                           (setf load-timer nil)
+                           (when (and (not closed) (= serial generation))
+                             (say (if on-continue
+                                      "Still preparing changes. You can retry, cancel, or continue without committing."
+                                      "Still preparing changes. You can retry or cancel."))
+                             (gtk:widget-set-visible retry t))
+                           nil)))
+                 (incf active-loads)
+                 (gtk:widget-set-sensitive retry (< active-loads 2))
                  (in-background "commit preview"
                    (lambda () (if initial (prepare-repository-commit root :start start)
                                   (prepare-repository-commit root :start start :paths paths)))
                    (lambda (result why)
+                     (decf active-loads)
+                     (unless closed (gtk:widget-set-sensitive retry (< active-loads 2)))
                      (when (and (not closed) (= serial generation))
-                       (if why
-                           (progn (say why)
-                                  (when (and initial on-continue)
-                                    (gtk:widget-set-visible commit-controls nil)
-                                    (gtk:widget-set-visible commit nil)))
+                       (stop-load-timer)
+                       (gtk:widget-set-visible retry nil)
+                       ;; Catch rendering errors locally so the dialog can recover.
+                       (handler-case
+                         (if why
+                           (failed why initial)
                            (progn
                              (setf preview result)
                              (when initial
@@ -173,10 +221,11 @@ once the window has closed. With EMBEDDED, return the widget and a disposal func
                                    (push (cons path check) rows)
                                    (gtk:box-append files check)
                                    (gobject:connect check :toggled (lambda (w) (declare (ignore w)) (refresh))))))
-                             (set-diff-text (gtk:text-view-get-buffer view) (getf result :diff))
+                             (set-diff-text (gtk:text-view-get-buffer view) (diff-display-text (getf result :diff)))
                              (say (format nil "~d file~:p selected. Existing staging is preserved for unselected files."
                                           (length (getf result :paths))))
-                             (gtk:widget-set-sensitive commit (and (getf result :paths) (plusp (length (getf result :diff))) (not busy) t)))))))))
+                             (gtk:widget-set-sensitive commit (and (getf result :paths) (plusp (length (getf result :diff))) (not busy) t))))
+                         (error (e) (failed e initial))))))))
              (select-files (paths)
                (dolist (row rows)
                  (gtk:check-button-set-active (cdr row) (and (member (car row) paths :test #'equal) t)))
@@ -193,10 +242,15 @@ once the window has closed. With EMBEDDED, return the widget and a disposal func
       (gtk:box-append body commit-controls)
       (gtk:box-append body status)
       (let ((buttons (gtk:build (gtk:box :spacing 8 :halign :end cancel))))
+        (gtk:box-append buttons retry)
         (when continue (gtk:box-append buttons continue))
         (gtk:box-append buttons commit)
         (gtk:box-append body buttons))
       (gtk:window-set-child window body)
+      ;; Retry may start one extra worker; never interrupt Git mid-snapshot.
+      (gobject:connect retry :clicked
+        (lambda (w) (declare (ignore w))
+          (when (and (not busy) (< active-loads 2)) (refresh retry-initial))))
       (gobject:connect all :clicked (lambda (w) (declare (ignore w)) (when preview (select-files (getf preview :all)))))
       (gobject:connect task :clicked (lambda (w) (declare (ignore w)) (select-files default-paths)))
       (gobject:connect cancel :clicked (lambda (w) (declare (ignore w)) (unless busy (gtk:window-close window))))
@@ -229,7 +283,7 @@ once the window has closed. With EMBEDDED, return the widget and a disposal func
                         (progn (setf preview nil) (gtk:widget-set-sensitive commit nil)
                                (say (or why (getf result :message) "Commit failed. Reopen the preview to retry.")))))))))))
       (gobject:connect window :close-request
-        (lambda (w) (declare (ignore w)) (if busy t (progn (setf closed t) nil))))
+        (lambda (w) (declare (ignore w)) (if busy t (progn (stop-load-timer) (setf closed t) nil))))
       (refresh t)
       (gtk:window-present window)
       window)))

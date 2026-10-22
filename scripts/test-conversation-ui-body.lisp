@@ -784,6 +784,139 @@
           (symbol-function 'prepare-repository-commit) prepare)))
 (format t "~&Commit selection UI checks passed.~%")
 
+;; Real untracked generated output stays in the commit, but is bounded for display.
+(let* ((root (uiop:ensure-directory-pathname
+              (string-trim '(#\Space #\Newline) (uiop:run-program '("mktemp" "-d") :output :string))))
+       (buffer (make-instance 'gtk:text-buffer)))
+  (unwind-protect
+       (progn
+         (worktree-git root "init")
+         (worktree-git root "config" "user.name" "UI test")
+         (worktree-git root "config" "user.email" "ui@example.invalid")
+         (worktree-git root "config" "commit.gpgsign" "false")
+         (worktree-git root "commit" "--allow-empty" "-m" "Initial")
+         (with-open-file (out (merge-pathnames "generated.txt" root) :direction :output)
+           (dotimes (i 100000) (format out "generated output ~d~%" i)))
+         (let* ((preview (prepare-repository-commit root))
+                (diff (getf preview :diff)))
+           (assert (> (length diff) 65536))
+           (add-diff-tags buffer)
+           (set-diff-text buffer (diff-display-text diff))
+           (assert (< (gtk:text-buffer-get-char-count buffer) 1024))
+           (assert (eq diff (getf preview :diff)))
+           ;; The shared renderer used by read-only Changes remains unrestricted.
+           (set-diff-text buffer diff)
+           (assert (= (length diff) (gtk:text-buffer-get-char-count buffer)))
+           (assert (string= diff (gtk:text-buffer-get-text buffer
+                     (gtk:text-buffer-get-start-iter buffer) (gtk:text-buffer-get-end-iter buffer) t)))
+           (commit-repository-preview preview "Add generated output")
+           (assert (string= "" (worktree-git root "status" "--porcelain")))
+           (assert (= 100000 (count #\Newline (worktree-git root "show" "HEAD:generated.txt"))))
+           (set-diff-text buffer (diff-display-text "GIT binary patch"))
+           (assert (search "binary data" (gtk:text-buffer-get-text buffer
+                     (gtk:text-buffer-get-start-iter buffer) (gtk:text-buffer-get-end-iter buffer) t))))
+         ;; Many short lines must also be capped, even below the character limit.
+         (assert (search "not displayed" (diff-display-text (make-string 1001 :initial-element #\Newline)))))
+    (uiop:delete-directory-tree root :validate t)))
+(format t "~&Large untracked commit preview display checks passed.~%")
+
+;; A slow worker offers recovery before completion; retry retains the selection
+;; and an obsolete worker cannot replace the newer preview.
+(let ((background (symbol-function 'in-background))
+      (prepare (symbol-function 'prepare-repository-commit))
+      (timeout (symbol-function 'glib:timeout-add-seconds))
+      (remove-source (symbol-function 'glib:source-remove))
+      (pending nil) (watchdog nil) (window nil) (calls nil))
+  (unwind-protect
+       (progn
+         (setf (symbol-function 'in-background)
+               (lambda (name work done) (declare (ignore name))
+                 (push (lambda () (funcall done (funcall work) nil)) pending))
+               (symbol-function 'prepare-repository-commit)
+               (lambda (root &key start (paths '("a.txt" "b.txt")))
+                 (declare (ignore root start))
+                 (push paths calls)
+                 (list :all '("a.txt" "b.txt") :paths paths :diff "selected diff"))
+               (symbol-function 'glib:timeout-add-seconds)
+               (lambda (priority seconds callback) (declare (ignore priority seconds))
+                 (setf watchdog callback) 123)
+               (symbol-function 'glib:source-remove) (lambda (id) (declare (ignore id)) t))
+         (setf window (show-commit-preview #p"/tmp/" :opening-state '(:status "dirty") :on-continue #'identity))
+         (funcall (pop pending))
+         (let* ((checks (find-widgets window 'gtk:check-button))
+                (retry (find "Retry loading changes" (find-widgets window 'gtk:button)
+                             :key #'gtk:button-get-label :test #'equal)))
+           (gtk:check-button-set-active (first checks) nil)
+           (funcall watchdog)
+           (assert (gtk:widget-get-visible retry))
+           (assert (some (lambda (label) (search "Still preparing" (gtk:label-get-text label)))
+                         (find-widgets window 'gtk:label)))
+           (gobject:emit retry :clicked)
+           (assert (= 2 (length pending)))
+           (funcall watchdog)
+           (assert (gtk:widget-get-visible retry))
+           (assert (not (gtk:widget-get-sensitive retry)))
+           ;; Even a programmatic click cannot accumulate additional workers.
+           (gobject:emit retry :clicked)
+           (assert (= 2 (length pending)))
+           (funcall (pop pending))
+           (assert (= 1 (length (first calls))))
+           (assert (not (gtk:check-button-get-active (first checks))))
+           (assert (not (gtk:widget-get-visible retry)))
+           (funcall (pop pending))
+           (assert (not (gtk:widget-get-visible retry)))))
+    (when window (gtk:window-close window))
+    (setf (symbol-function 'in-background) background
+          (symbol-function 'prepare-repository-commit) prepare
+          (symbol-function 'glib:timeout-add-seconds) timeout
+          (symbol-function 'glib:source-remove) remove-source)))
+(format t "~&Slow commit preview recovery and selection checks passed.~%")
+
+;; A delivered result can fail while GTK renders it, after Git has succeeded.
+;; Keep DONE outside the worker's handler, as the real IN-BACKGROUND does.
+(let ((background (symbol-function 'in-background))
+      (prepare (symbol-function 'prepare-repository-commit))
+      (render (symbol-function 'set-diff-text))
+      (pending nil) (window nil) (fail-render t))
+  (unwind-protect
+       (progn
+         (setf (symbol-function 'in-background)
+               (lambda (name work done)
+                 (declare (ignore name))
+                 (multiple-value-bind (value why)
+                     (handler-case (values (funcall work) nil)
+                       (error (e) (values nil (princ-to-string e))))
+                   (setf pending (lambda () (funcall done value why)))))
+               (symbol-function 'prepare-repository-commit)
+               (lambda (root &key start)
+                 (declare (ignore root start))
+                 (list :all '("edit.txt") :paths '("edit.txt") :diff "changes"))
+               (symbol-function 'set-diff-text)
+               (lambda (buffer diff)
+                 (if fail-render (error "Preview rendering failed")
+                     (funcall render buffer diff))))
+         (setf window (show-commit-preview #p"/tmp/" :opening-state '(:status "dirty")
+                        :on-continue #'identity))
+         (labels ((button (text)
+                    (find text (find-widgets window 'gtk:button)
+                          :key #'gtk:button-get-label :test #'equal)))
+           (funcall pending)
+           (assert (some (lambda (label) (search "Preview rendering failed" (gtk:label-get-text label)))
+                         (find-widgets window 'gtk:label)))
+           (assert (gtk:widget-get-visible (button "Retry loading changes")))
+           (assert (not (gtk:widget-get-sensitive (button "Commit and start task"))))
+           (setf fail-render nil)
+           (gobject:emit (button "Retry loading changes") :clicked)
+           (funcall pending)
+           (assert (= 1 (length (find-widgets window 'gtk:check-button))))
+           (assert (gtk:widget-get-sensitive (button "Commit and start task")))
+           (assert (not (gtk:widget-get-visible (button "Retry loading changes"))))))
+    (when window (gtk:window-close window))
+    (setf (symbol-function 'in-background) background
+          (symbol-function 'prepare-repository-commit) prepare
+          (symbol-function 'set-diff-text) render)))
+(format t "~&Commit preview delivery failure and retry checks passed.~%")
+
 ;; Dirty folders pause before task creation; continuing checks the same state.
 (let* ((*directory* #p"/tmp/") (*workflow* nil) (*request-preflight* nil)
        (*controls* (list :input (make-input)))
