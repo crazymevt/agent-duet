@@ -425,16 +425,69 @@ also shown to the agent (ATTACHMENT-IMAGES); other files it reads itself."
   "The notes file AGENT doesn't read by itself: the other agent's."
   (if (eq (agent-id agent) :claude) "AGENTS.md" "CLAUDE.md"))
 
+(defun own-notes-file (agent)
+  "The notes file AGENT reads by itself."
+  (if (eq (agent-id agent) :claude) "CLAUDE.md" "AGENTS.md"))
+
+(defun read-notes-file (directory name)
+  "The file NAME in DIRECTORY, as (truename . text); nil if missing or unreadable."
+  (let ((file (probe-file (merge-pathnames name (uiop:ensure-directory-pathname directory)))))
+    (when (and file (not (uiop:directory-pathname-p file)))
+      (let ((text (ignore-errors (uiop:read-file-string file :external-format '(:utf-8 :replacement #\?)))))
+        (and text (cons file text))))))
+
+(defun notes-import-line-p (line name)
+  "Whether LINE is a Claude Code import of the file NAME, such as @AGENTS.md."
+  (member (string-trim '(#\Space #\Tab #\Return) line)
+          (list (format nil "@~a" name) (format nil "@./~a" name)) :test #'string=))
+
+(defun notes-fence (line)
+  "For LINE (without leading space) starting a code fence: (character . length)."
+  (let ((c (and (plusp (length line)) (char line 0))))
+    (when (member c '(#\` #\~))
+      (let ((n (or (position c line :test-not #'char=) (length line))))
+        (when (>= n 3) (cons c n))))))
+
+(defun notes-without-imports (text name)
+  "TEXT without its lines importing NAME, trimmed, and whether it had any.
+As in Claude Code, lines inside fenced code blocks aren't imports."
+  (let ((fence nil) (found nil))
+    (values
+     (string-trim '(#\Space #\Tab #\Newline #\Return)
+                  (format nil "~{~a~^~%~}"
+                          (remove-if (lambda (line)
+                                       (let ((trimmed (string-left-trim '(#\Space #\Tab) line)))
+                                         (cond ((notes-fence trimmed)
+                                                (let ((marker (notes-fence trimmed)))
+                                                  (cond ((null fence) (setf fence marker))
+                                                        ;; Closed by the same character, at least as
+                                                        ;; many times, followed by nothing but space.
+                                                        ((and (char= (car fence) (car marker))
+                                                              (>= (cdr marker) (cdr fence))
+                                                              (every (lambda (c) (member c '(#\Space #\Tab #\Return)))
+                                                                     (subseq trimmed (cdr marker))))
+                                                         (setf fence nil))))
+                                                nil)
+                                               ((and (null fence) (notes-import-line-p line name))
+                                                (setf found t))
+                                               (t nil))))
+                                     (uiop:split-string text :separator '(#\Newline)))))
+     found)))
+
 (defun shared-notes (agent)
   "The text of the notes file in AGENT's folder that AGENT doesn't read by
-itself, cut to *SHARED-NOTES-LIMIT*; nil when off, missing or empty."
-  (let* ((directory (agent-directory agent))
-         (file (and *shared-notes* directory
-                    (probe-file (merge-pathnames (shared-notes-file agent)
-                                                 (uiop:ensure-directory-pathname directory)))))
-         (text (and file (not (uiop:directory-pathname-p file))
-                    (ignore-errors (uiop:read-file-string file :external-format '(:utf-8 :replacement #\?))))))
-    (when (and text (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) text))))
+itself, cut to *SHARED-NOTES-LIMIT*; nil when off, missing or empty, or when
+AGENT already reads it: the same file or text as its own, or (Claude) imported
+by its own. Lines of the other file that only import AGENT's own are left out."
+  (let* ((directory (and *shared-notes* (agent-directory agent)))
+         (other (and directory (read-notes-file directory (shared-notes-file agent))))
+         (own (and other (read-notes-file directory (own-notes-file agent))))
+         (text (and other (notes-without-imports (cdr other) (own-notes-file agent)))))
+    (when (and text (plusp (length text))
+               (not (and own (or (equal (car own) (car other))
+                                 (string= text (notes-without-imports (cdr own) (shared-notes-file agent)))
+                                 (and (eq (agent-id agent) :claude)
+                                      (nth-value 1 (notes-without-imports (cdr own) (shared-notes-file agent))))))))
       (if (> (length text) *shared-notes-limit*)
           (format nil "~a~%~%[… cut: the file is ~:d characters long; read it for the rest.]"
                   (subseq text 0 *shared-notes-limit*) (length text))

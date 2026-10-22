@@ -93,6 +93,36 @@
           (true (uiop:string-prefix-p "Use " notes))
           (false (search "tabs." notes))
           (true (search "cut" notes))))
+      ;; Notes an agent already reads aren't repeated: Claude's file imports
+      ;; AGENTS.md, and Codex's import line alone is no notes.
+      (write-file (merge-pathnames "AGENTS.md" dir) "Use tabs.")
+      (write-file (merge-pathnames "CLAUDE.md" dir) (format nil "@AGENTS.md~%"))
+      (false (ai::shared-notes claude))
+      (false (ai::shared-notes codex))
+      (write-file (merge-pathnames "CLAUDE.md" dir) (format nil "@./AGENTS.md~%~%Run make test.~%"))
+      (false (ai::shared-notes claude))
+      (is string= "Run make test." (ai::shared-notes codex))
+      ;; An import line in a fenced example isn't an import.
+      (write-file (merge-pathnames "CLAUDE.md" dir)
+                  (format nil "Example:~%```~%@AGENTS.md~%```~%~~~~~~~%@./AGENTS.md~%~~~~~~~%"))
+      (is string= "Use tabs." (ai::shared-notes claude))
+      (true (search "@AGENTS.md" (ai::shared-notes codex)))
+      (true (search "@./AGENTS.md" (ai::shared-notes codex)))
+      ;; A shorter or annotated fence line doesn't close a longer fence.
+      (write-file (merge-pathnames "CLAUDE.md" dir)
+                  (format nil "````md~%```~%@AGENTS.md~%```` more~%````~%"))
+      (is string= "Use tabs." (ai::shared-notes claude))
+      ;; After the fence closes, an import line is an import again.
+      (write-file (merge-pathnames "CLAUDE.md" dir)
+                  (format nil "````md~%```~%````  ~%@AGENTS.md~%"))
+      (false (ai::shared-notes claude))
+      ;; Nor are identical copies.
+      (write-file (merge-pathnames "CLAUDE.md" dir) (format nil "Use tabs.~%"))
+      (false (ai::shared-notes claude))
+      (false (ai::shared-notes codex))
+      ;; Without its own file, an agent still gets the other's.
+      (delete-file (merge-pathnames "CLAUDE.md" dir))
+      (is string= "Use tabs." (ai::shared-notes claude))
       ;; A blank file is no notes.
       (write-file (merge-pathnames "AGENTS.md" dir) (format nil "  ~%"))
       (false (ai::shared-notes claude)))))

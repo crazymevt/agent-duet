@@ -322,6 +322,9 @@ the card is open, the card says so and goes away. The time is
   other's, from the folder, with its instructions, so a project's
   conventions needn't be restated each task. It's read when a conversation
   starts (a new one, or in another folder), and cut at 20,000 characters.
+  Notes a CLI already reads aren't repeated: nothing is added when both files
+  are the same file or text, or when `CLAUDE.md` imports `AGENTS.md`
+  (`@AGENTS.md`) for Claude; Codex isn't given lines that only import `AGENTS.md`.
 - **Workspace › Appearance**: Dark, Light or System.
 - **History** (top left, beside the folder): start a new conversation, or
   carry on an earlier one in this folder.
