@@ -501,3 +501,28 @@
          (summary (ai::checkpoint-summary checkpoint)))
     (is equal "waiting for Pending" (getf (third (getf summary :loops)) :waiting-for))
     (is equal "waiting for Pending" (getf (getf summary :step) :waiting-for))))
+
+(define-test artifact-storage-bounds :parent agent-duet
+  (let* ((directory (merge-pathnames (format nil "duet-bounds-~a/" (ai::make-uuid))
+                                    (uiop:temporary-directory)))
+         (ai::*history-directory* directory)
+         (ai::*artifact-byte-limit* 8)
+         (ai::*artifact-count-limit* 2)
+         (source (merge-pathnames "source.txt" directory)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist source)
+           (write-file source "prefix-final123")
+           (let ((path (ai::retain-task-artifact "check" :source source)))
+             (is string= "final123" (uiop:read-file-string path)))
+           (false (ai::retain-task-artifact "reply" :text "oversized reply"))
+           (let ((path (ai::retain-task-artifact "reply" :text "complete")))
+             (is string= "complete" (uiop:read-file-string path))
+             (ai::retain-task-artifact "check" :text "next")
+             (is = 2 (length (directory (merge-pathnames "artifacts/*.txt" directory)))))
+           ;; Expired replies are pruned by the next log write, too.
+           (let ((ai::*artifact-max-age* -1))
+             (let ((path (ai::retain-task-artifact "check" :text "newest")))
+               (is equal (list (pathname path))
+                   (directory (merge-pathnames "artifacts/*.txt" directory))))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

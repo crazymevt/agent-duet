@@ -248,7 +248,7 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
     (true (search task (ai::review-prompt part)))
     (setf (ai::loop-reviewer part) (make-instance 'fake-agent :name "Replacement"))
     (true (search task (ai::review-prompt part)))
-    (true (search "in a few lines" (ai::work-reply-instruction part)))))
+    (false (search "summarize what you changed" (ai::work-reply-instruction part)))))
 
 (define-test review-worktree-stat :parent agent-duet
   (with-git-folder (repo)
@@ -284,3 +284,44 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
         (true (search "Recover me" prompt))
         (true (search "Latest reviewable report" prompt))
         (true (search "F1 [open]" prompt))))))
+
+(define-test correction-preserves-unquoted-findings :parent agent-duet
+  (let* ((author (make-instance 'fake-agent :name "Claude"))
+         (reviewer (make-instance 'fake-agent :name "ChatGPT"))
+         (part (ai::make-review-loop
+                :author author :reviewer reviewer
+                :findings (list (ai::make-finding :id 1 :text "Current issue")
+                                (ai::make-finding :id 2 :text "Older issue")))))
+    (let ((prompt (ai::fix-prompt part (format nil "FINDINGS:~%- F1 [open] Current issue~%VERDICT: CHANGES REQUESTED"))))
+      (is eql (search "Current issue" prompt) (search "Current issue" prompt :from-end t))
+      (true (search "F2 [open] Older issue" prompt)))
+    ;; A changed finding or status must not hide the saved open finding.
+    (dolist (review (list (format nil "FINDINGS:~%- F1 [open] Changed issue")
+                         (format nil "FINDINGS:~%- F1 [fixed] Current issue")
+                         "Malformed reply"))
+      (true (search "F1 [open] Current issue" (ai::fix-prompt part review))))))
+
+(define-test retained-long-reply-and-fallback :parent agent-duet
+  (let* ((directory (merge-pathnames (format nil "duet-artifacts-~a/" (ai::make-uuid))
+                                    (uiop:temporary-directory)))
+         (ai::*history-directory* directory)
+         (ai::*split-reply-limit* 1500)
+         (author (make-instance 'fake-agent :permission :full))
+         (reviewer (make-instance 'fake-agent :permission :full))
+         (workflow (make-instance 'ai:workflow :lead author :partner reviewer))
+         (reply (concatenate 'string (make-string 2000 :initial-element #\x) "END")))
+    (unwind-protect
+         (progn
+           (let* ((text (ai::long-part-reply workflow reply))
+                  (path (subseq text (+ (search "Full reply: " text) 12))))
+             (true (< (length text) (length reply)))
+             (is string= reply (uiop:read-file-string path)))
+           (setf (ai::agent-permission reviewer) :edits)
+           (true (search "cut short" (ai::long-part-reply workflow reply)))
+           (setf (ai::agent-permission reviewer) :full)
+           ;; A file in place of the storage directory forces a write failure.
+           (let ((blocked (merge-pathnames "blocked" directory)))
+             (write-file blocked "file")
+             (let ((ai::*history-directory* (uiop:ensure-directory-pathname blocked)))
+               (true (search "cut short" (ai::long-part-reply workflow reply))))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

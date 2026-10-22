@@ -10,9 +10,10 @@
           (,workflow (make-instance 'ai:workflow :lead ,author :partner ,reviewer :request "Do it"
                                    :check-command ,command)))
      (ensure-directories-exist ,directory)
-     (unwind-protect (progn ,@body)
+     (let ((ai::*history-directory* (merge-pathnames "history/" ,directory)))
+    (unwind-protect (progn ,@body)
        (ai:stop-workflow ,workflow)
-       (uiop:delete-directory-tree ,directory :validate t :if-does-not-exist :ignore))))
+       (uiop:delete-directory-tree ,directory :validate t :if-does-not-exist :ignore)))))
 
 (define-test check-passes :parent agent-duet
   (with-check-workflow (workflow author reviewer directory "printf checked; printf error >&2" (list (says "Done")))
@@ -275,3 +276,45 @@
       (ai::check-in workflow l token "sleep 30" 0 0 "stale passed check" nil)
       (false (fake-prompts reviewer))
       (false (ai::loop-check-report l)))))
+
+(define-test failure-log-retains-full-output :parent agent-duet
+  (let* ((directory (merge-pathnames (format nil "duet-logs-~a/" (ai::make-uuid))
+                                    (uiop:temporary-directory)))
+         (ai::*history-directory* directory)
+         (ai::*check-output-limit* 12)
+         (finished nil) (log-path nil) (tail nil) (code nil))
+    (unwind-protect
+         (progn
+           (ai::run-check "printf 'first evidence then final evidence'; exit 3"
+                          (uiop:temporary-directory) #'funcall
+                          (lambda (status output timeout)
+                            (declare (ignore timeout))
+                            (setf code status tail output finished t))
+                          (lambda (path) (setf log-path path)))
+           (true (wait-until (lambda () finished)))
+           (is eql 3 code)
+           (true (<= (length tail) 12))
+           (true log-path)
+           (when log-path
+             (is string= "first evidence then final evidence"
+                 (uiop:read-file-string log-path))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(define-test cancelled-check-does-not-retain-log :parent agent-duet
+  (let* ((directory (merge-pathnames (format nil "duet-cancel-log-~a/" (ai::make-uuid))
+                                    (uiop:temporary-directory)))
+         (ai::*history-directory* directory)
+         (finished nil) (log-path :unset)
+         (handle (ai::run-check "printf cancelled; sleep 30" (uiop:temporary-directory)
+                                #'funcall
+                                (lambda (&rest ignored)
+                                  (declare (ignore ignored)) (setf finished t))
+                                (lambda (path) (setf log-path path)))))
+    (unwind-protect
+         (progn
+           (ai::kill-check handle)
+           (true (wait-until (lambda () finished)))
+           (false log-path)
+           (false (directory (merge-pathnames "artifacts/*.txt" directory))))
+      (ai::kill-check handle)
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

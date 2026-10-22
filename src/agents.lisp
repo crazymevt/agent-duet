@@ -447,8 +447,10 @@ itself, cut to *SHARED-NOTES-LIMIT*; nil when off, missing or empty."
 request in the same working directory. Prompts may come from the user directly or be relayed from ~a: ~
 they may ask you to implement something, to review ~a's work, or to address its review of yours. ~
 When you review, inspect the files themselves (and `git diff` if the directory is a git repository) ~
-rather than trusting a summary, and don't change files unless asked to. When you implement, finish your ~
-reply with a short summary of what you changed and in which files, since that summary is what ~a sees. ~
+rather than trusting a summary, and don't change files unless asked to. When you hand off to ~a, which ~
+sees only your reply, briefly state ~
+the outcome, changed paths, verification results and unresolved issues, identifying review findings by ID ~
+as applicable (writing guidance, not required fields). ~
 This client does not render inline visualizations. Link generated HTML files with Markdown ~
 using absolute file:// URLs instead of visualization tokens, including in handoffs. ~
 Running a command may need the user's approval; if one is denied, carry on without it and say so.~

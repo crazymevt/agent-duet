@@ -2180,7 +2180,8 @@ tests/fake-claude, its notes pushed onto NOTES."
 
 (define-test split-results-reply-limit :parent agent-duet
   (let* ((ai::*split-reply-limit* 12)
-         (workflow (make-instance 'ai:workflow))
+         (workflow (make-instance 'ai:workflow :lead (make-instance 'fake-agent)
+                                  :partner (make-instance 'fake-agent)))
          (reply "A long written answer that must remain available")
          (part (ai::make-review-loop :label "Part" :tree #p"/tmp/part/" :summary reply)))
     (setf (ai:workflow-loops workflow) (list part))

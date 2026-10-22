@@ -24,6 +24,65 @@
                                   (uiop:ensure-directory-pathname state)
                                   (merge-pathnames ".local/state/" (user-homedir-pathname)))))))))
 
+(defparameter *artifact-byte-limit* (* 4 1024 1024))
+(defparameter *artifact-count-limit* 128)
+(defparameter *artifact-max-age* (* 30 24 60 60))
+(defvar *artifact-lock* (sb-thread:make-mutex :name "retained artifacts"))
+
+(defun prune-task-artifacts (directory keep)
+  "Keep the newest artifacts, including KEEP; delete expired ones on writes."
+  (let* ((cutoff (- (get-universal-time) *artifact-max-age*))
+         (files (remove-if-not
+                 (lambda (path)
+                   (let ((name (pathname-name path)))
+                     (or (uiop:string-prefix-p "check-" name)
+                         (uiop:string-prefix-p "reply-" name))))
+                 (directory (merge-pathnames "*.txt" directory))))
+         (others (remove keep files :test #'equal)))
+    (setf others (sort others #'> :key (lambda (path) (or (file-write-date path) 0))))
+    (loop for path in others for index from 1
+          when (or (>= index *artifact-count-limit*)
+                   (< (or (file-write-date path) 0) cutoff))
+            do (ignore-errors (delete-file path)))))
+
+(defun retain-task-artifact (kind &key text source)
+  "Retain a bounded log tail or complete reply; nil on failure or oversized reply.
+Prune artifacts on writes by age and count, independently of worktree cleanup."
+  (sb-thread:with-mutex (*artifact-lock*)
+    (let ((path nil) (complete nil))
+      (unwind-protect
+           (handler-case
+               (let ((bytes (and text (sb-ext:string-to-octets text :external-format :utf-8))))
+                 ;; Never silently truncate a reply: use the inline fallback instead.
+                 (when (and bytes (> (length bytes) *artifact-byte-limit*))
+                   (return-from retain-task-artifact nil))
+                 (setf path (merge-pathnames (format nil "artifacts/~a-~a.txt" kind (make-uuid))
+                                            (history-directory)))
+                 (ensure-directories-exist path)
+                 (with-open-file (out path :direction :output :if-exists :error
+                                           :element-type '(unsigned-byte 8))
+                   (if source
+                       (with-open-file (in source :element-type '(unsigned-byte 8))
+                         (let ((start (max 0 (- (file-length in) *artifact-byte-limit*)))
+                               (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+                           (file-position in start)
+                           ;; Drop an incomplete leading UTF-8 character from a cut log.
+                           (when (plusp start)
+                             (loop for byte = (read-byte in nil nil)
+                                   while (and byte (= #x80 (logand byte #xc0)))
+                                   finally (when byte (file-position in (1- (file-position in))))))
+                           (loop with remaining = *artifact-byte-limit*
+                                 for end = (read-sequence buffer in :end (min remaining (length buffer)))
+                                 while (plusp end)
+                                 do (write-sequence buffer out :end end)
+                                    (decf remaining end))))
+                       (write-sequence bytes out)))
+                 (setf path (truename path) complete t)
+                 (ignore-errors (prune-task-artifacts (uiop:pathname-directory-pathname path) path))
+                 (namestring (truename path)))
+             (error () nil))
+        (when (and path (not complete)) (ignore-errors (delete-file path)))))))
+
 (defun make-history (directory)
   "A new, unsaved conversation in DIRECTORY."
   (let ((now (get-universal-time)))

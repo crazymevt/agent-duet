@@ -168,3 +168,17 @@
     (false (ai::claude-result-cost agent 1.75d0 6))
     (setf (ai::claude-agent-next-result-index agent) 7)
     (is = 0.25d0 (ai::claude-result-cost agent 2d0 7))))
+
+(define-test prompt-size-stage-metrics :parent agent-duet
+  (let* ((author (make-instance 'fake-agent :id :claude :name "Claude" :replies (list (says "Done"))))
+         (reviewer (make-instance 'fake-agent :id :codex :name "ChatGPT"))
+         (workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Measure prompts"))
+         (step (ai::make-step :agent author :role :work)))
+    (ai::workflow-agent-submit workflow step author "12345" nil)
+    (is = 5 (second (assoc :prompt-characters
+                           (getf (first (ai::task-metric-totals workflow :work)) :values))))
+    (is = 0 (getf (first (ai::task-metric-totals workflow :review)) :turns))
+    (let* ((cp (ai::json-copy (ai:workflow-checkpoint workflow)))
+           (restored (ai:restore-workflow cp :lead author :partner reviewer)))
+      (is equalp (ai::task-metric-totals workflow :work)
+          (ai::task-metric-totals restored :work)))))

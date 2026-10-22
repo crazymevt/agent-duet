@@ -193,14 +193,14 @@ preserve the step for explicit recovery (PAUSE-STEP)."
     (funcall (workflow-on-checkpoint workflow) workflow)))
 
 (defparameter *turn-metric-keys*
-  '(:elapsed-seconds :duration-ms :cost-usd :input-tokens :output-tokens
+  '(:prompt-characters :elapsed-seconds :duration-ms :cost-usd :input-tokens :output-tokens
     :cache-read-tokens :cache-write-tokens :reasoning-tokens :total-tokens))
 
 (defun workflow-agent-submit (workflow step agent prompt callback)
   ;; Persist an unknown entry before dispatch: a crash must not make a
   ;; partially measured task look complete. Retries can publish more than once.
   (let ((pending (make-uuid)))
-    (push (list :id pending :agent (agent-id agent) :role (step-role step) :metrics nil)
+    (push (list :id pending :agent (agent-id agent) :role (step-role step) :metrics (list :prompt-characters (length prompt)))
           (workflow-metrics workflow))
     (checkpoint-changed workflow)
     (agent-submit agent prompt callback nil
@@ -209,14 +209,17 @@ preserve the step for explicit recovery (PAUSE-STEP)."
                       (setf (workflow-metrics workflow)
                             (remove pending (workflow-metrics workflow)
                                     :key (lambda (m) (getf m :id)) :test #'equal))
-                      (push (list :id id :agent (agent-id agent) :role (step-role step) :metrics metrics)
+                      (push (list :id id :agent (agent-id agent) :role (step-role step) :metrics (list* :prompt-characters (length prompt) metrics))
                             (workflow-metrics workflow))
                       (checkpoint-changed workflow))))))
 
-(defun task-metric-totals (workflow)
+(defun task-metric-totals (workflow &optional role)
   "Known sums and their coverage, so partial measurements never look complete."
   (loop for agent in (list (workflow-lead workflow) (workflow-partner workflow))
-        for records = (remove (agent-id agent) (workflow-metrics workflow)
+        for records = (remove (agent-id agent)
+                              (if role (remove role (workflow-metrics workflow)
+                                               :key (lambda (m) (getf m :role)) :test-not #'eq)
+                                  (workflow-metrics workflow))
                               :key (lambda (m) (getf m :agent)) :test-not #'eq)
         collect (list :agent (agent-name agent) :agent-id (agent-id agent) :turns (length records)
                       :incomplete-p (some (lambda (m) (getf (getf m :metrics) :incomplete-p)) records)
@@ -251,19 +254,26 @@ preserve the step for explicit recovery (PAUSE-STEP)."
          (format nil "Open findings: ~d" (getf completion :open-findings 0)))
    (loop for round in (getf completion :rounds)
          collect (format nil "~a: ~d review round~:p" (first round) (second round)))
-   (loop for totals in (getf completion :metrics)
+   (loop for stage in (getf completion :stage-metrics)
+         append (cons (format nil "Stage: ~a" (car stage))
+                      (metric-summary-lines (cdr stage))))
+   (metric-summary-lines (getf completion :metrics))))
+
+(defun metric-summary-lines (metrics)
+  (loop for totals in metrics
          append
-         (list (format nil "~a: ~d submitted turn~:p · ~a · ~a · ~a"
+         (list (format nil "~a: ~d submitted turn~:p · ~a · ~a · ~a · ~a"
                        (getf totals :agent) (getf totals :turns)
                        (summary-metric totals :input-tokens
                                        (if (eq (getf totals :agent-id) :claude)
                                            "Uncached input tokens" "Input tokens (including cache)"))
+                       (summary-metric totals :prompt-characters "Prompt characters")
                        (summary-metric totals :output-tokens "Output tokens")
                        (summary-metric totals :cost-usd "Cost" "$~,4f"))
                (format nil "~a · ~a · ~a"
                        (summary-metric totals :duration-ms "CLI duration (ms)")
                        (summary-metric totals :cache-read-tokens "Cache read tokens")
-                       (summary-metric totals :cache-write-tokens "Cache write tokens"))))))
+                       (summary-metric totals :cache-write-tokens "Cache write tokens")))))
 
 (defun submit-step (workflow step)
   ;; A per-submission generation also rejects callbacks captured before cancellation.
@@ -630,13 +640,23 @@ Cover the whole task's completed changes, including earlier work, not just this 
       (format nil "~a~%~%~a" prompt *commit-suggestion-instruction*)))
 
 (defun work-reply-instruction (loop)
-  (with-commit-suggestion-instruction
-   (if (loop-combined-result loop)
-       "Then provide the full revised combined answer to the overall request, preserving useful results from both parts; a summary of edits alone is not sufficient."
-       "Then summarize what you changed in a few lines.")))
+  (if (loop-combined-result loop)
+      (with-commit-suggestion-instruction
+       "Then provide the full revised combined answer to the overall request, preserving useful results from both parts; a summary of edits alone is not sufficient.")
+      *commit-suggestion-instruction*))
 
 (defun fix-prompt (loop review)
-  (let ((open (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq)))
+  (let* ((quoted (parse-findings review))
+         (open (remove-if
+                (lambda (finding)
+                  (or (not (eq :open (finding-status finding)))
+                      (some (lambda (entry)
+                              (and (eql (finding-id finding) (getf entry :id))
+                                   (eq :open (getf entry :status))
+                                   (equal (finding-location finding) (getf entry :location))
+                                   (equal (finding-text finding) (getf entry :text))))
+                            quoted)))
+                (loop-findings loop))))
     (format nil "~a reviewed your work~:[ and requested changes~;~]:~%~%~a~%~%~
 ~@[These findings are still open:~%~%~a~%~%~]~
 Address the points you agree with, and say briefly why for any you don't. ~a"
@@ -1298,39 +1318,41 @@ ready waits for it in any case."
 (defun check-in (workflow loop token command fixes code output timed-out)
   "Accept only the current check's result, delivered on the workflow thread."
   (when (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
-    (setf (loop-check-handle loop) nil)
-    (let* ((passed (and (not timed-out) (eql code 0)))
-           (status (cond (timed-out
-                          (format nil "Check `~a` failed (exit code ~a; timed out)." command code))
-                         ((null code) (format nil "Check `~a` couldn't run (no exit code)." command))
-                         (t (format nil "Check `~a` ~a (exit code ~a)."
-                                    command (if passed "passed" "failed") code))))
-           (report (format nil "~a~%~%~a" status (check-output-block (check-output-tail output)))))
-      ;; Users see all results, but successful output adds no information
-      ;; to the review. Failures stay explicit even after the fix budget,
-      ;; and the work can't be approved until the check passes.
-      (setf (loop-check-report loop)
-            (if passed status
-                (format nil "The check still fails after ~d fix attempt~:p, so the work can't be approved ~
+    (let ((log-path (second token)))
+      (setf (loop-check-handle loop) nil)
+      (let* ((passed (and (not timed-out) (eql code 0)))
+             (status (cond (timed-out
+                            (format nil "Check `~a` failed (exit code ~a; timed out)." command code))
+                           ((null code) (format nil "Check `~a` couldn't run (no exit code)." command))
+                           (t (format nil "Check `~a` ~a (exit code ~a)."
+                                      command (if passed "passed" "failed") code))))
+             (report (format nil "~a~%~%~a~@[~%Failure log (up to last 4 MiB; subject to read permissions): ~a~]"
+                             status (check-output-block (check-output-tail output)) log-path)))
+        ;; Users see all results, but successful output adds no information
+        ;; to the review. Failures stay explicit even after the fix budget,
+        ;; and the work can't be approved until the check passes.
+        (setf (loop-check-report loop)
+              (if passed status
+                  (format nil "The check still fails after ~d fix attempt~:p, so the work can't be approved ~
 until it passes: request changes, saying what needs fixing.~%~%~a"
-                        fixes report))
-            (loop-check-failed loop) (not passed))
-      (post workflow :system (loop-author loop) report :check)
-      (when (workflow-live-p workflow)
-        (if (or passed (>= fixes *check-fix-attempts*))
-            (loop-checked workflow loop)
-            (progn
-              (update-loop-state workflow loop :working)
-              (submit workflow (loop-author loop)
-                      (format nil "~a~%~%Fix the failing check. ~a" report (work-reply-instruction loop))
-                      (lambda (text error)
-                        (if error
-                            (loop-failed workflow loop (format nil "Check fix failed: ~a" text))
-                            (progn
-                              (setf (loop-summary loop) text)
-                              (post workflow (loop-author loop) (loop-reviewer loop) text :work)
-                              (loop-check workflow loop (1+ fixes)))))
-                      :role :work :loop loop :check-fixes (1+ fixes))))))))
+                          fixes report))
+              (loop-check-failed loop) (not passed))
+        (post workflow :system (loop-author loop) report :check)
+        (when (workflow-live-p workflow)
+          (if (or passed (>= fixes *check-fix-attempts*))
+              (loop-checked workflow loop)
+              (progn
+                (update-loop-state workflow loop :working)
+                (submit workflow (loop-author loop)
+                        (format nil "~a~%~%Fix the failing check. ~a" report (work-reply-instruction loop))
+                        (lambda (text error)
+                          (if error
+                              (loop-failed workflow loop (format nil "Check fix failed: ~a" text))
+                              (progn
+                                (setf (loop-summary loop) text)
+                                (post workflow (loop-author loop) (loop-reviewer loop) text :work)
+                                (loop-check workflow loop (1+ fixes)))))
+                        :role :work :loop loop :check-fixes (1+ fixes)))))))))
 
 (defun loop-check (workflow loop &optional (fixes 0))
   "Check the current work before review; FIXES does not count review rounds."
@@ -1342,7 +1364,7 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
   (let ((command (blank-to-nil (workflow-check-command workflow))))
     (if (null command)
         (loop-checked workflow loop)
-        (let ((token (list nil)))
+        (let ((token (list nil nil)))
           (setf (loop-check-handle loop) token)
           (update-loop-state workflow loop :checking)
           (post workflow :system (loop-author loop)
@@ -1354,7 +1376,8 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
                   (run-check command (or (loop-tree loop) (agent-directory (loop-author loop)))
                              (agent-deliver (loop-author loop))
                              (lambda (code output timed-out)
-                               (check-in workflow loop token command fixes code output timed-out))))
+                               (check-in workflow loop token command fixes code output timed-out))
+                             (lambda (path) (setf (second token) path))))
             ;; Also cover cancellation between launching and storing the handle.
             (unless (and (workflow-live-p workflow) (eq token (loop-check-handle loop)))
               (when (car token) (pushnew (car token) (workflow-stopping-checks workflow)))
@@ -1791,6 +1814,17 @@ conflicts; then the merged result is reviewed."
                        :role :resolve))
               (t (integration-failed workflow files trees))))))))
 
+(defun long-part-reply (workflow reply)
+  "Use a retained reply only when both receiving agents have unrestricted reads."
+  (let ((path (and (every (lambda (agent) (eq :full (agent-permission agent)))
+                          (list (workflow-lead workflow) (workflow-partner workflow)))
+                   (retain-task-artifact "reply" :text reply))))
+    (if path
+        (format nil "Reply excerpt (read the full reply before combining results):~%~a~%Full reply: ~a"
+                (subseq reply 0 (min 1200 (length reply))) path)
+        (format nil "~a~%[Final reply cut short; full reply retained in the part's conversation.]"
+                (subseq reply 0 *split-reply-limit*)))))
+
 (defun split-results-text (workflow)
   "Keep both parts' written results, including parts that changed no files."
   (format nil "~{~a~^~%~%~}"
@@ -1802,8 +1836,7 @@ conflicts; then the merged result is reviewed."
                                   (loop-task part)
                                   (let ((reply (loop-summary part)))
                                     (if (> (length reply) *split-reply-limit*)
-                                        (format nil "~a~%[Final reply cut short; full reply retained in the part's conversation.]"
-                                                (subseq reply 0 *split-reply-limit*))
+                                        (long-part-reply workflow reply)
                                         reply))))))
 
 (defun note-retained-worktrees (workflow)
@@ -1911,6 +1944,10 @@ the worktrees are kept: ~{~a~^, ~}."
                 :elapsed-seconds (and (workflow-started-at workflow)
                                       (max 0 (- (workflow-ended-at workflow) (workflow-started-at workflow))))
                 :metrics (task-metric-totals workflow)
+                :stage-metrics (loop for role in (remove-duplicates
+                                                  (mapcar (lambda (m) (getf m :role))
+                                                          (workflow-metrics workflow)))
+                                     when role collect (cons role (task-metric-totals workflow role)))
                 :rounds (mapcar (lambda (l) (list (or (loop-label l) "Work") (loop-round l))) loops)
                 :open-findings (reduce #'+ loops :key (lambda (l) (count-findings (loop-findings l) :open))
                                        :initial-value 0)

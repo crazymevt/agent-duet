@@ -375,6 +375,31 @@ partial measurements are marked, including interrupted attempts. Claude input
 counts exclude cached input; Codex input counts include it, as their labels say.
 The file preview lists up to ten paths; Changes has the full list. These are CLI
 measurements, not a billing estimate. Recovery preserves the recorded turns.
+The summary also groups measurements by workflow stage (work, review, planning,
+and so on). Prompt characters count the submitted workflow text, excluding
+conversation history, system instructions, attachments, and any full-context
+expansion after a failed resume; they are not token or billing estimates.
+
+Handoffs ask for a concise outcome, changed paths, verification and unresolved
+issues. These are advisory writing guidelines: replies are not rejected for
+missing fields. Correction prompts retain older open findings and omit an extra
+copy only when the latest review repeats the same ID, open status, location and
+text. Because saved finding text remains the original wording, reworded findings
+or omitted locations deliberately retain the extra copy; savings depend on how
+closely reviews repeat findings.
+
+Failed checks retain up to the last 4 MiB of output under the history directory's `artifacts/`
+subdirectory and include its absolute path alongside the bounded excerpt.
+Storage failure leaves the excerpt available. Passing checks still send only
+status to reviewers. Split-part replies longer than 60,000 characters can also
+be retained there, with a 1,200-character excerpt and a path to read before
+combining results. This requires both agents to have Full access; otherwise, or
+if storage fails, the existing 60,000-character inline limit applies. Artifacts
+survive worktree cleanup and restarts. On artifact writes, cleanup keeps at most
+128 logs and replies and removes those older than 30 days. Cancelled checks do
+not save logs; timeouts still do. Replies over 4 MiB use the inline fallback
+rather than saving an incomplete reply. Old artifact paths can expire; the full
+reply remains in the part's conversation.
 
 Before a writing task starts, a folder with uncommitted changes opens a
 commit preview. Choose **Commit and start task**, **Continue without

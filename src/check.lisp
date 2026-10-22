@@ -6,14 +6,14 @@
 (defparameter *check-fix-attempts* 2 "Author fixes allowed per work round before reviewing a failed check.")
 
 (defstruct check-handle
-  process thread cancelled
+  process thread cancelled log-path
   (lock (sb-thread:make-mutex :name "check")))
 
-(defun kill-check (handle)
+(defun kill-check (handle &optional (cancelled t))
   "Cancel HANDLE, including a process that has not yet finished launching."
   (when handle
     (sb-thread:with-mutex ((check-handle-lock handle))
-      (setf (check-handle-cancelled handle) t)
+      (when cancelled (setf (check-handle-cancelled handle) t))
       (when (and (check-handle-process handle)
                  (sb-ext:process-alive-p (check-handle-process handle)))
         ;; SBCL starts children in their own process group. Kill the shell's
@@ -56,14 +56,18 @@
     (let ((fence (make-string (max 3 (1+ longest)) :initial-element #\`)))
       (format nil "~a~%~a~%~a" fence output fence))))
 
-(defun run-check (command directory deliver callback)
+(defun run-check (command directory deliver callback &optional log-reporter)
   "Run /bin/sh -c COMMAND in DIRECTORY off the calling thread.
 Return a cancellable handle. Through DELIVER, call CALLBACK with
 (exit-code output-tail timed-out); launch errors have a nil exit code."
   (let ((handle (make-check-handle))
         ;; Capture dynamic parameters before entering a new thread.
         (timeout *check-timeout*)
-        (output-limit *check-output-limit*))
+        (output-limit *check-output-limit*)
+        (artifact-directory (history-directory))
+        (artifact-byte-limit *artifact-byte-limit*)
+        (artifact-count-limit *artifact-count-limit*)
+        (artifact-max-age *artifact-max-age*))
     (setf (check-handle-thread handle)
           (sb-thread:make-thread
            (lambda ()
@@ -86,15 +90,24 @@ Return a cancellable handle. Through DELIVER, call CALLBACK with
                               (loop while (sb-ext:process-alive-p process)
                                     do (when (>= (get-internal-real-time) deadline)
                                          (setf timed-out t)
-                                         (kill-check handle)
+                                         (kill-check handle nil)
                                          (return))
                                        (sleep 0.02))
                               (sb-ext:process-wait process)
                               (setf code (sb-ext:process-exit-code process)
-                                    output (read-check-output-tail path output-limit))))
+                                    output (read-check-output-tail path output-limit))
+                              (when (and (not (check-handle-cancelled handle))
+                                         (or timed-out (not (eql code 0))))
+                                (setf (check-handle-log-path handle)
+                                      (let ((*history-directory* artifact-directory)
+                                            (*artifact-byte-limit* artifact-byte-limit)
+                                            (*artifact-count-limit* artifact-count-limit)
+                                            (*artifact-max-age* artifact-max-age))
+                                        (retain-task-artifact "check" :source path))))))
                        (when (check-handle-process handle)
                          (sb-ext:process-close (check-handle-process handle)))))
                  (error (e) (setf code nil output (check-output-tail (format nil "Couldn't run check: ~a" e) output-limit))))
+               (when log-reporter (funcall log-reporter (check-handle-log-path handle)))
                (funcall deliver (lambda () (funcall callback code output timed-out)))))
            :name "workflow check"))
     handle))
