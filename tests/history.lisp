@@ -526,3 +526,65 @@
                (is equal (list (pathname path))
                    (directory (merge-pathnames "artifacts/*.txt" directory))))))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(define-test history-background-snapshots
+    :parent agent-duet
+  (with-history-directory
+    (let ((history (ai::make-history "/project/")))
+      (ai::history-add-entry history :user :prompt "first")
+      (setf (ai::history-checkpoint history) (ai::jobj "state" (vector "before")))
+      (ai::queue-history-save history)
+      ;; Mutating a nested container after enqueue must not change the snapshot.
+      (setf (aref (ai::jget (ai::history-checkpoint history) "state") 0) "after")
+      (ai::flush-history-saves)
+      (is string= "before" (aref (ai::jget (ai::history-checkpoint
+                                           (ai::load-history (ai::history-id history))) "state") 0))
+      (loop for n below 40 do
+        (ai::history-add-entry history :claude :text (write-to-string n))
+        (ai::queue-history-save history))
+      (ai::flush-history-saves)
+      (is = 41 (length (ai::history-entries (ai::load-history (ai::history-id history)))))
+      ;; Synchronous saves and deletion must not be overwritten by pending work.
+      (ai::queue-history-save history)
+      (ai::history-add-entry history :claude :text "synchronous")
+      (ai::save-history history)
+      (is = 42 (length (ai::history-entries (ai::load-history (ai::history-id history)))))
+      (ai::queue-history-save history)
+      (ai::delete-history (ai::history-id history))
+      (false (ai::load-history (ai::history-id history))))))
+
+(define-test history-summary-cache
+    :parent agent-duet
+  (with-history-directory
+    (let* ((history (saved-history "/a/" "cached" 10))
+           (loader (symbol-function 'ai::load-history))
+           (loads 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ai::load-history)
+                   (lambda (id) (incf loads) (funcall loader id)))
+             (ai::list-histories)
+             (ai::list-histories)
+             (is = 1 loads)
+             (ai::history-add-entry history :claude :text "new entry")
+             (ai::save-history history)
+             (is = 2 (getf (first (ai::list-histories)) :entry-count))
+             (is = 2 loads)
+             ;; Atomic replacement from another process also invalidates metadata.
+             (let ((file (ai::history-file (ai::history-id history))))
+               (ai::history-add-entry history :claude :text "external")
+               (ai::write-history-json file (ai::history-json history)))
+             (is = 3 (getf (first (ai::list-histories)) :entry-count))
+             (is = 3 loads))
+        (setf (symbol-function 'ai::load-history) loader)))))
+
+(define-test stream-buffer-retains-snapshots
+    :parent agent-duet
+  (let ((agent (make-instance 'ai::claude-agent :id :claude :name "Claude")))
+    (ai::agent-emit agent :delta :text "first")
+    (let ((snapshot (ai::agent-partial-text agent))
+          (buffer (ai::agent-partial-buffer agent)))
+      (loop repeat 1000 do (ai::agent-emit agent :delta :text "λ"))
+      (true (eq buffer (ai::agent-partial-buffer agent)))
+      (is string= "first" snapshot)
+      (is = 1005 (length (ai::agent-partial-text agent))))))

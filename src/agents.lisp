@@ -89,7 +89,7 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
                   :documentation "When the running turn last showed signs of life (CLOCK-SECONDS)")
    (stall-noticed :initform nil :accessor agent-stall-noticed
                   :documentation "True once AGENT-CHECK-STALL has reported this silence")
-   (partial-text :initform "" :accessor agent-partial-text)
+   (partial-text :initform "" :accessor agent-partial-buffer)
    (editing-processes :initform nil :accessor agent-editing-processes)
    (process-record :initform nil :accessor agent-process-record)
    (turn-process-baseline :initform :unknown :accessor agent-turn-process-baseline)
@@ -149,10 +149,27 @@ then :sent; :dropped if cancelled first")))
 (defmethod agent-new-conversation ((agent agent)) (agent-shutdown agent))
 (defmethod agent-conversation-handle ((agent agent)) nil)
 
+(defun agent-partial-text (agent)
+  ;; Callers retain progress snapshots while more deltas may arrive.
+  (copy-seq (agent-partial-buffer agent)))
+
+(defun (setf agent-partial-text) (text agent)
+  (setf (agent-partial-buffer agent) (copy-seq text)))
+
+(defun append-stream-text (buffer text)
+  "Append without copying the accumulated reply on every delta."
+  (unless (and (adjustable-array-p buffer) (array-has-fill-pointer-p buffer))
+    (let ((new (make-array (max 128 (length buffer)) :element-type 'character
+                           :adjustable t :fill-pointer (length buffer))))
+      (replace new buffer)
+      (setf buffer new)))
+  (loop for c across text do (vector-push-extend c buffer))
+  buffer)
+
 (defun agent-emit (agent kind &rest plist)
   (when (and (member kind '(:delta :text)) (stringp (getf plist :text)))
-    (setf (agent-partial-text agent)
-          (concatenate 'string (agent-partial-text agent) (getf plist :text))))
+    (setf (agent-partial-buffer agent)
+          (append-stream-text (agent-partial-buffer agent) (getf plist :text))))
   (agent-touch agent)
   (when (agent-listener agent)
     (apply (agent-listener agent) agent kind plist)))

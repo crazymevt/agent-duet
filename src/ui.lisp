@@ -458,7 +458,7 @@ drop before WIDGET's children, so a text view doesn't take it as text."
   agent stop
   (attachments '())                           ; the paths of the files dropped on its message box
   chips                                       ; the box showing them
-  (stream-box nil) (stream-label nil) (stream-text "")
+  (stream-box nil) (stream-label nil) (stream-text "") (stream-timeout nil)
   (conversation-box nil) (conversation-label nil) (conversation-activity nil)
   (conversation-placeholder-p nil) ; waiting for the first reply text
   (conversation-replies nil) ; completed text/bubble pairs eligible for a handoff
@@ -976,6 +976,7 @@ answer settles it, wherever it was given."
 (defun pane-finish-stream (pane &optional (preserve-pending t))
   "End streamed text, keeping a command-only bubble waiting for its reply.
 Finished text, a new turn and clearing the pane explicitly discard that pending state."
+  (flush-pane-stream pane)
   (unless (and preserve-pending
                (agent-pane-conversation-label pane)
                (agent-pane-conversation-placeholder-p pane))
@@ -984,6 +985,18 @@ Finished text, a new turn and clearing the pane explicitly discard that pending 
           (agent-pane-conversation-label pane) nil
           (agent-pane-conversation-placeholder-p pane) nil))
   (setf (agent-pane-stream-box pane) nil (agent-pane-stream-label pane) nil (agent-pane-stream-text pane) ""))
+
+(defun flush-pane-stream (pane)
+  "Publish pending deltas before their stream is retired."
+  (when (agent-pane-stream-timeout pane)
+    (glib:source-remove (agent-pane-stream-timeout pane))
+    (setf (agent-pane-stream-timeout pane) nil)
+    (when (agent-pane-stream-label pane)
+      (gtk:label-set-text (agent-pane-stream-label pane) (agent-pane-stream-text pane))
+      (when (agent-pane-conversation-label pane)
+        (gtk:label-set-text (agent-pane-conversation-label pane) (agent-pane-stream-text pane))
+        (pane-scroll-to-end *middle*))
+      (pane-scroll-to-end pane))))
 
 (defun pane-delta (pane text)
   (when (zerop (length text)) (return-from pane-delta))
@@ -995,17 +1008,22 @@ Finished text, a new turn and clearing the pane explicitly discard that pending 
       (setf (agent-pane-stream-box pane) (pane-append pane box)
             (agent-pane-stream-label pane) label
             (agent-pane-stream-text pane) "")))
-  (setf (agent-pane-stream-text pane) (concatenate 'string (agent-pane-stream-text pane) text))
-  ;; Streaming intentionally stays literal; completed replies decode directives.
-  (gtk:label-set-text (agent-pane-stream-label pane) (agent-pane-stream-text pane))
+  (setf (agent-pane-stream-text pane) (append-stream-text (agent-pane-stream-text pane) text))
   (when (agent-pane-conversation-label pane)
-    (setf (agent-pane-conversation-placeholder-p pane) nil)
-    (gtk:label-set-text (agent-pane-conversation-label pane) (agent-pane-stream-text pane))
-    (pane-scroll-to-end *middle*))
-  (pane-scroll-to-end pane))
+    (setf (agent-pane-conversation-placeholder-p pane) nil))
+  ;; Bound GTK layout work to twenty updates per second. Completion renders
+  ;; the full reply directly and cancels this source in PANE-FINISH-STREAM.
+  (unless (agent-pane-stream-timeout pane)
+    (setf (agent-pane-stream-timeout pane)
+          (glib:timeout-add glib:+priority-default+ 50
+            (lambda ()
+              (flush-pane-stream pane)
+              nil)))))
 
 (defun pane-text (pane text)
   "A finished block of a reply: rendered in place of what was streamed."
+  ;; Flush before replacing either label; finishing must not touch removed widgets.
+  (flush-pane-stream pane)
   (let ((*image-directory* (or *image-directory*
                               (agent-directory (agent-pane-agent pane))
                               *directory*)))
@@ -1156,12 +1174,13 @@ few such prompts made resizing take a large part of a second.")
         (:turn-done
          ;; A turn that streamed but never finished its block.
          (when (agent-pane-stream-box pane)
-           (pane-text pane (agent-pane-stream-text pane)))
+           (pane-text pane (copy-seq (agent-pane-stream-text pane))))
          (clear-conversation-placeholder pane)
          (retire-conversation-activity pane)
          (when error (pane-note pane (or text "The turn failed.") "error")))))))
 
 (defun clear-agent-pane (pane)
+  (flush-pane-stream pane)
   (setf (agent-pane-activity-labels pane)
         (remove (agent-pane-conversation-activity pane) (agent-pane-activity-labels pane))
         (agent-pane-conversation-activity pane) nil
@@ -1230,16 +1249,16 @@ comes without one (a turn stopped as the folder changes) isn't kept."
       (:turn-done
        ;; A reply that streamed but never finished its block.
        (when (agent-pane-stream-box pane)
-         (record who :text (agent-pane-stream-text pane)))
+         (record who :text (copy-seq (agent-pane-stream-text pane))))
        (when error (record who :error (if (plusp (length text)) text "The turn failed.")))
        (save-current-history)))))
 
-(defun save-current-history ()
+(defun save-current-history (&key synchronous)
   "Save the history, with what resumes each agent's conversation."
   (when *history*
     (dolist (agent (list *claude* *codex*))
       (setf (history-handle *history* (agent-id agent)) (agent-conversation-handle agent)))
-    (save-history *history*)))
+    (if synchronous (save-history *history*) (queue-history-save *history*))))
 
 (defun finish-history ()
   "Save the history; what is said next starts another."
@@ -1325,7 +1344,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun open-history (id)
   "Show conversation ID again; the agents carry it on from their next message."
   ;; It may be this one, with entries not yet saved.
-  (save-current-history)
+  (save-current-history :synchronous t)
   (let ((history (load-history id)))
     (cond
      ((not (agents-idle-p))
@@ -2194,7 +2213,8 @@ history, saved at once, so a restart finds where the task had got to."
     (unless *history* (setf *history* (make-history *directory*)))
     (handler-case
         (progn (record-history-checkpoint *history* (workflow-checkpoint workflow))
-               (save-current-history))
+               ;; Dispatch relies on this checkpoint already being durable.
+               (save-current-history :synchronous t))
       (error (e)
         (unless (eq *checkpoint-failed* workflow)
           (setf *checkpoint-failed* workflow)
@@ -3923,6 +3943,7 @@ this task's turns cheaper."
                          (ignore-errors (agent-cancel agent))
                          (ignore-errors (agent-shutdown agent)))
                        (ignore-errors (finish-history))
+                       (ignore-errors (flush-history-saves))
                        (ignore-errors (kill-all-terminals))
                        (ignore-errors (close-documents))
                        nil))

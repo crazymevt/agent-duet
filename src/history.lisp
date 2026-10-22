@@ -475,20 +475,69 @@ the PLAN waiting for approval again, or carries on the INTEGRATION."
                                collect (jobj "who" (getf entry :who) "kind" (getf entry :kind)
                                              "text" (getf entry :text) "time" (getf entry :time))) 'vector)))
 
-(defun save-history (history)
-  "Atomically save HISTORY; ignore disk errors and empty conversations."
+(defvar *history-save-lock* (sb-thread:make-mutex :name "history saves"))
+(defvar *history-save-worker* nil)
+(defvar *history-save-queue* nil)
+(defvar *history-summary-cache* (make-hash-table :test #'equal))
+
+(defun copy-history-json (value)
+  "Detach mutable JSON containers and strings before crossing threads."
+  (typecase value
+    (cons (cons (copy-history-json (car value)) (copy-history-json (cdr value))))
+    (string (copy-seq value))
+    (vector (map 'vector #'copy-history-json value))
+    (t value)))
+
+(defun write-history-json (file json)
+  "Atomically replace FILE. Preserve the existing best-effort disk policy."
+  (ignore-errors
+    (let ((temp (merge-pathnames (format nil ".~a-~a.tmp" (pathname-name file) (make-uuid)) file)))
+      (ensure-directories-exist file)
+      (unwind-protect
+           (progn
+             (with-open-file (out temp :direction :output :if-exists :error :external-format :utf-8)
+               (write-string (json-string json) out)
+               (terpri out))
+             (uiop:rename-file-overwriting-target temp file))
+        (when (probe-file temp) (delete-file temp))))))
+
+(defun flush-history-saves ()
+  "Wait until all queued snapshots have reached the writer."
+  (loop for worker = (sb-thread:with-mutex (*history-save-lock*) *history-save-worker*)
+        while worker do (sb-thread:join-thread worker)))
+
+(defun queue-history-save (history)
+  "Queue an immutable snapshot; coalesce pending saves of the same file.
+A single writer orders replacements. Call FLUSH-HISTORY-SAVES before exit
+or before a synchronous read or destructive operation that needs durability."
   (when (history-entries history)
-    (ignore-errors
-      (let* ((file (history-file (history-id history)))
-             (temp (merge-pathnames (format nil ".~a-~a.tmp" (history-id history) (make-uuid)) file)))
-        (ensure-directories-exist file)
-        (unwind-protect
-             (progn
-               (with-open-file (out temp :direction :output :if-exists :error :external-format :utf-8)
-                 (write-string (json-string (history-json history)) out)
-                 (terpri out))
-               (uiop:rename-file-overwriting-target temp file))
-          (when (probe-file temp) (delete-file temp)))))))
+    (let ((file (history-file (history-id history)))
+          (json (copy-history-json (history-json history))))
+      (remhash file *history-summary-cache*)
+      (sb-thread:with-mutex (*history-save-lock*)
+        (setf *history-save-queue*
+              (nconc (remove file *history-save-queue* :key #'car :test #'equal)
+                     (list (cons file json))))
+        (unless *history-save-worker*
+          (setf *history-save-worker*
+                (sb-thread:make-thread
+                 (lambda ()
+                   (loop
+                     (let ((job (sb-thread:with-mutex (*history-save-lock*)
+                                  (unless *history-save-queue*
+                                    (setf *history-save-worker* nil)
+                                    (return))
+                                  (pop *history-save-queue*))))
+                       (write-history-json (car job) (cdr job)))))
+                 :name "history writer")))))))
+
+(defun save-history (history)
+  "Synchronously save HISTORY after earlier queued writes."
+  (flush-history-saves)
+  (when (history-entries history)
+    (let ((file (history-file (history-id history))))
+      (remhash file *history-summary-cache*)
+      (write-history-json file (history-json history)))))
 
 (defun history-keyword (value choices)
   (or (and (stringp value)
@@ -525,29 +574,54 @@ the PLAN waiting for approval again, or carries on the INTEGRATION."
                                       :kind (history-keyword (jget entry "kind") '(:prompt :text :tool :note :error :activity :activity-error))
                                       :text (jget entry "text") :time (jget entry "time"))))))))
 
+(defun history-file-signature (file)
+  (ignore-errors
+    (let ((stat (sb-posix:stat file)))
+      (list (sb-posix:stat-ino stat) (sb-posix:stat-size stat)
+            (sb-posix:stat-mtime stat) (sb-posix:stat-ctime stat)))))
+
+(defun cached-history-summary (file)
+  (let* ((signature (history-file-signature file))
+         (cached (gethash file *history-summary-cache*)))
+    (if (and cached (equal signature (car cached)))
+        (cdr cached)
+        (let* ((history (load-history (pathname-name file)))
+               (summary (when history
+                          (list :id (history-id history) :title (history-title history)
+                                :directory (history-directory history) :updated (history-updated history)
+                                :entry-count (length (history-entries history))
+                                :interrupted (history-interrupted-p history)))))
+          (setf (gethash file *history-summary-cache*) (cons signature summary))
+          summary))))
+
 (defun list-histories (&key directory (limit 50))
-  "Newest summaries: plists with :id, :title, :directory, :updated, :entry-count,
-and :interrupted, true for a task that stopped without being stopped."
+  "Newest summaries. Parse only files whose metadata changed since last listing."
+  (flush-history-saves)
   (let* ((folder (and directory (namestring (uiop:ensure-directory-pathname directory))))
+         (files (ignore-errors (uiop:directory-files (history-directory) "*.json")))
          (summaries
-           (loop for file in (ignore-errors (uiop:directory-files (history-directory) "*.json"))
-                 for history = (load-history (pathname-name file))
-                 when (and history (or (null folder)
+           (loop for file in files
+                 for summary = (cached-history-summary file)
+                 when (and summary (or (null folder)
                                        (equal folder (namestring (uiop:ensure-directory-pathname
-                                                                 (history-directory history))))))
-                   collect (list :id (history-id history) :title (history-title history)
-                                 :directory (history-directory history) :updated (history-updated history)
-                                 :entry-count (length (history-entries history))
-                                 :interrupted (history-interrupted-p history)))))
+                                                                 (getf summary :directory))))))
+                   collect (copy-list summary))))
+    ;; Bound cache retention when histories or storage directories disappear.
+    (maphash (lambda (file value) (declare (ignore value))
+               (unless (member file files :test #'equal) (remhash file *history-summary-cache*)))
+             *history-summary-cache*)
     (setf summaries (stable-sort summaries #'> :key (lambda (summary) (getf summary :updated))))
     (if limit (subseq summaries 0 (min (max 0 limit) (length summaries))) summaries)))
 
 (defun delete-history (id)
   "Delete a saved conversation, ignoring missing files and disk errors."
+  (flush-history-saves)
+  (remhash (history-file id) *history-summary-cache*)
   (ignore-errors (delete-file (history-file id))))
 
 (defun prune-histories (&key (keep 200))
   "Delete the oldest files beyond KEEP; use file dates for corrupt histories."
+  (flush-history-saves)
   (let ((files (loop for file in (ignore-errors (uiop:directory-files (history-directory) "*.json"))
                      for history = (load-history (pathname-name file))
                      collect (cons file (or (and history (history-updated history))
