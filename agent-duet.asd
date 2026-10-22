@@ -25,6 +25,7 @@
                (:file "read-only")
                (:file "agents")
                (:file "check")
+               (:file "task-records")
                (:file "workflow")
                (:file "workflow-presentation")))
 
@@ -62,5 +63,6 @@
                              (:file "snapshot")
                              (:file "read-only")
                              (:file "workflow-presentation")
-                             (:file "task-summary"))))
+                             (:file "task-summary")
+                             (:file "task-records"))))
   :perform (test-op (op c) (uiop:symbol-call :parachute :test :agent-duet/tests)))
