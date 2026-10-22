@@ -150,8 +150,6 @@ with **To both agents**);
 lead, rounds and whether the settings are expanded are remembered.
 **Stop collaboration** ends the task.
 
-
-
 - **Review only.** Choose uncommitted changes (including untracked files), a
   branch, or the last N commits along the first-parent history. Branch review
   compares from the merge base with the base branch (HEAD by default); **Branch (compare tips)** compares
@@ -171,8 +169,9 @@ lead, rounds and whether the settings are expanded are remembered.
   first, a card offers **Continue** for more rounds: the author picks up
   from the last review.
 - **Split the work.** The lead splits the request into its part and the
-  other's (parts that don't touch the same files). Both work at once; then each
-  reviews the other's part, and each part goes round its own review loop.
+  other's. Independent parts work at once; dependent parts can run lead first
+  or partner first. Each agent reviews the other's part, and each part goes
+  round its own review loop.
 - **Compare proposals.** Both propose an approach on their own, without
   seeing each other's. The lead compares the two, settles on one (saying
   where they differed and what it chose), and splits the work as in *Split
@@ -184,7 +183,13 @@ collaboration** stops both.
 **Approve plan** (for *Split the work* and *Compare proposals*) holds the
 lead's plan for you before any work starts. A card shows each agent's part:
 edit either one, then **Start**, or **Stop**. Leave a part empty and the other
-agent does its own part alone.
+agent does its own part alone. The order menu chooses **Independently**,
+**Claude's part first** or **ChatGPT's part first**. A dependent part waits
+for its prerequisite and receives its report; with worktrees, its changes are
+merged into the dependent worktree before work starts. If a prerequisite is
+redone after its dependent has started, the dependent stops and revalidates its
+work against the new result. When no part can go on, a pause card offers
+**Revise the order** or **Run independently**.
 
 **Own worktrees** (also for those two modes) gives each agent its own git
 worktree for its part, so the parts can't get in each other's way:
@@ -208,8 +213,8 @@ worktree for its part, so the parts can't get in each other's way:
   kept, and the conversation says where.
 
 **Check** (next to the mode controls) is a shell command for this folder,
-such as `make test` or `npm test`, remembered per folder; leave it empty for
-none. After each round of work, before the reviewer is asked, it runs in the
+such as `make test-parallel` or `npm test`, remembered per folder; leave it
+empty for none. After each round of work, before the reviewer is asked, it runs in the
 author's folder (its worktree, with *Own worktrees*; the main folder for the
 merged result), and the conversation shows whether it passed, with the end
 of its output. If it fails, the author is given the command, its exit code
@@ -226,9 +231,9 @@ Each review lists its findings in a checklist, `F1`, `F2`, … with the file
 and line where there is one. The next review marks each finding fixed,
 dismissed (the author's reasons convinced the reviewer) or still open, so an
 unresolved finding stays in view from one round to the next. A reviewer that
-approves with findings still open is asked once to settle them; if it
-leaves them open again, the part isn't approved, and **Continue** has the
-author pick them up. Review prompts already say that an approval leaves no
+approves with blockers still open is asked once to settle them; if it
+leaves those blockers open again, the part isn't approved, and **Continue**
+has the author pick them up. Review prompts already say that an approval leaves no
 blocker open, so this extra turn should be rare.
 
 A finding is a blocker unless the reviewer marks it `[suggestion]`
@@ -297,9 +302,9 @@ A step pauses, rather than failing the task, when its agent runs out of
 usage, when its turn fails, or when you pause that agent: during a task, the
 **Stop** button in an agent's pane is **Pause**, and pauses only that
 agent's part. Independent parts carry on; checks and reviews wait for their
-required result. The split-plan UI does not yet support declaring dependencies
-between parts. **Stop collaboration** stops both agents, but the task can still
-be carried on. A card in the conversation offers:
+required result. A failed prerequisite holds its dependent part while
+independent work carries on. **Stop collaboration** stops both agents, but
+the task can still be carried on. A card in the conversation offers:
 
 - **Wait until 3:05 PM** (out of usage, when the reset time is known): it's
   sent to the same agent again a minute after its usage resets. Leave the
@@ -440,8 +445,8 @@ latest 50.
 
 **Workspace › Changes** opens a window with what the latest task changed:
 the files on the left (A added, M modified, D deleted, R renamed; type to
-filter), and the one you pick's diff on the right. While a task runs, it
-shows the changes so far. It's for viewing only. The comparison is of the
+filter), and the one you pick's diff on the right, with colored additions,
+deletions and hunk headers. While a task runs, it shows the changes so far. It's for viewing only. The comparison is of the
 folder's contents, so edits you made in the folder while the task ran are in
 it too.
 
@@ -617,8 +622,8 @@ that workflow run's artifacts. After merging a release, create and push a
 tag matching the version in `agent-duet.asd` to publish a GitHub Release:
 
 ```sh
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 A mismatched tag fails the build, and publication waits for all three
@@ -672,6 +677,8 @@ libraries used to build them.
 - `src/usage.lisp`: both accounts' usage windows, and recognizing a turn that
   failed because one ran out.
 - `src/check.lisp`: running a folder's check command in the background.
+- `src/task-records.lisp`: questions, evidence, decisions and efficiency records,
+  including their parsing and checkpoint serialization. No GTK.
 - `src/workflow.lisp`: the ways of working together. No GTK.
 - `src/workflow-presentation.lisp`: what a task and each agent are doing,
   as the progress line, its stages and the agents' panels show it. No GTK.

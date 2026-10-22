@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Each agent's status shows its latest reported context usage, including in
+  workflow status headers. **Clear context** and `/clear` start a new agent
+  conversation while keeping saved history; active tasks must be stopped first.
+- Mode and lead selectors sit beside the recipient, shown only for **To both
+  agents**. Composer actions sit below their inputs, with Send on the right.
+  Commit previews color additions, deletions and diff hunk headers.
+- Agent prompts use focused reads and a quiet command wrapper for noisy jobs,
+  preferring a wrapper named in user or project instructions. Shared project
+  notes omit instructions the receiving CLI already reads, and follow-up turns
+  use compact commit-message reminders.
+- Review correction prompts avoid duplicate unchanged open findings. Long
+  split-worktree reports can be retained as files with short excerpts when both
+  agents have Full access; inline replies remain the fallback. Failed checks
+  retain logs and show bounded diagnostic excerpts. Retained logs and replies
+  are limited to 128 artifacts and 30 days, with a 4 MiB limit per artifact.
+
 - Agents can ask each other questions between turns. A work handoff's
   `QUESTIONS` section marks each question blocking or non-blocking. Questions are
   numbered for the task and reach the other agent with its next prompt; its
@@ -27,7 +43,7 @@
   and later reviews in the same reviewer conversation get only the changes
   since the last review, with a full-review fallback. Work prompts say the check
   command runs automatically, and passing results discourage reruns. Review
-  prompts say approval leaves no finding open. The rare settle-findings turn
+  prompts say approval leaves no blocker open. The rare settle-findings turn
   runs ChatGPT at low effort when an effort is chosen in the app, restoring it after. Before a task,
   a context at least half full is offered a new conversation. The task contract
   and handoff lines are shorter, and agents may use a command wrapper from their
