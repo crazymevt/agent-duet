@@ -45,16 +45,16 @@ thread; tool calls and thinking are compact disclosures to expand. The colors
 follow the light or dark theme, and text on them keeps at least 4.5:1
 contrast in both.
 
-**Workspace › Layout** (top right) arranges them:
+The workspace sidebar is open by default. **Workspace › Layout** (top right) arranges the agent panels:
 
-- **Agents on right** (the default): the conversation is the large pane on
+- **Agents on right**: the conversation is the large pane on
   the left, with both agents' panels stacked in a resizable sidebar on the
   right.
 - **Agents on left**: the same, mirrored: the agents' panels stacked on the
   left, the conversation on the right.
 - **Three panes**: Claude on the left, the conversation in the middle,
   ChatGPT on the right.
-- **Conversation only**: the agents' panels are hidden, and the conversation
+- **Conversation only** (the default): the agents' panels are hidden, and the conversation
   has a line saying what each agent is doing, its CLI's readiness and its
   remaining usage.
 

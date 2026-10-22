@@ -364,6 +364,11 @@
 (let ((*controls* nil) (*settings* nil) (*checklist* nil) (*checklist-findings* nil)
       (*checklist-boxes* nil))
   (make-checklist-panel)
+  (assert (gtk:widget-get-visible (control :checklist-panel)))
+  ;; The summary checks below exercise an explicitly hidden sidebar.
+  (setf (setting :checklist-visible) nil)
+  (make-checklist-panel)
+  (assert (not (gtk:widget-get-visible (control :checklist-panel))))
   (let ((summary (make-checklist-summary))
         (toggle (make-instance 'gtk:check-button))
         (part (make-review-loop :author (make-instance 'claude-agent :id :claude :name "Claude")

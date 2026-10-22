@@ -1446,7 +1446,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 (defun refresh-checklist-summary ()
   (let ((button (control :checklist-summary)))
     (when button
-      (gtk:widget-set-visible button (and *checklist-boxes* (not (setting :checklist-visible nil))))
+      (gtk:widget-set-visible button (and *checklist-boxes* (not (setting :checklist-visible t))))
       (gtk:label-set-text (gtk:button-get-child button)
                           (if *checklist-boxes*
                               (checklist-summary (mapcar (lambda (entry) (getf (cdr entry) :data))
@@ -1588,7 +1588,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
                            (gtk:separator :visible (not embedded))
                            scroller))))
       (setf (getf *controls* :checklist-panel) panel)
-      (gtk:widget-set-visible panel (setting :checklist-visible nil))
+      (gtk:widget-set-visible panel (setting :checklist-visible t))
       panel)))
 
 (defun middle-check (text)
@@ -3726,7 +3726,7 @@ this task's turns cheaper."
                                       :tooltip-text "Toggle agents"))
          (sidebar-toggle (make-instance 'gtk:toggle-button :child (make-panel-icon :sidebar)
                                         :css-classes '("image-button")
-                                        :active (setting :checklist-visible nil)
+                                        :active (setting :checklist-visible t)
                                         :tooltip-text "Toggle sidebar"))
          (terminal-shortcut (make-instance 'gtk:button :label ">_"
                                            :css-classes '("duet-terminal-shortcut" "monospace")
@@ -3752,7 +3752,7 @@ this task's turns cheaper."
       (let ((terminal (make-instance 'gtk:toggle-button :label "Terminal"
                                      :tooltip-text "Show or hide the terminal"))
             (checklist (make-instance 'gtk:check-button :label "Sidebar"
-                                      :active (setting :checklist-visible nil)
+                                      :active (setting :checklist-visible t)
                                       :tooltip-text "Show or hide the sidebar"))
             (notes (make-instance 'gtk:check-button :label "Share project instructions" :active *shared-notes*
                                   :tooltip-text "Give each agent the other agent's project instructions too.")))
@@ -3968,10 +3968,10 @@ this task's turns cheaper."
       ;; actual minimum widths without forcing all options onto one row.
       (let* ((middle (make-middle-pane))
              (inner (make-instance 'gtk:paned :orientation :horizontal
-                                   :position (if (setting :checklist-visible nil) 470 600)
+                                   :position (if (setting :checklist-visible t) 470 600)
                                    :shrink-start-child nil :shrink-end-child nil))
              (outer (make-instance 'gtk:paned :orientation :horizontal
-                                   :position (if (setting :checklist-visible nil) 336 420)
+                                   :position (if (setting :checklist-visible t) 336 420)
                                    :shrink-start-child nil :shrink-end-child nil)))
         (gtk:paned-set-start-child inner middle)
         (gtk:paned-set-end-child inner codex-widget)
@@ -3990,7 +3990,7 @@ this task's turns cheaper."
           (arrange-conversation *view*)
           (gtk:paned-set-start-child content outer)
           (gtk:paned-set-end-child content (make-workspace-sidebar))
-          (when (setting :checklist-visible nil)
+          (when (setting :checklist-visible t)
             (setf (getf *controls* :restore-checklist-width)
                   (or (saved-checklist-width) 300)))
           ;; The Terminal panel below the panes, hidden until asked for.

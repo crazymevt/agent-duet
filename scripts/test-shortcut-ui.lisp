@@ -64,7 +64,10 @@
   (dolist (key '(:agent-toggle :sidebar-toggle))
     (assert (typep (gtk:button-get-child (control key)) 'gtk:drawing-area)))
   (assert (search "Toggle agents" (gtk:widget-get-tooltip-text (control :agent-toggle))))
-  (assert (not (gtk:toggle-button-get-active (control :sidebar-toggle))))
+  (assert (gtk:toggle-button-get-active (control :sidebar-toggle)))
+  (assert (gtk:check-button-get-active (control :checklist-toggle)))
+  (gtk:toggle-button-set-active (control :sidebar-toggle) nil)
+  (assert (not (setting :checklist-visible)))
   (gtk:toggle-button-set-active (control :sidebar-toggle) t)
   (assert (setting :checklist-visible))
   (assert (gtk:check-button-get-active (control :checklist-toggle)))
@@ -76,7 +79,7 @@
 ;; key events, so the signal is emitted without one and the handler compares
 ;; the keyval and modifiers itself; the window shortcuts are in the capture
 ;; phase, so focus in a pane or the Terminal doesn't change what they see.
-(let* ((*settings* (list :equal-agent-panels-version 2 :last-agent-view :agents-left
+(let* ((*settings* (list :checklist-visible nil :equal-agent-panels-version 2 :last-agent-view :agents-left
                          :agents-shortcut "Alt+F5" :checklist-shortcut "Super+F6"
                          :terminal-shortcut "Ctrl+Shift+F7"))
        (*controls* nil) (*panes* nil) (*workflow* nil) (*history* nil)

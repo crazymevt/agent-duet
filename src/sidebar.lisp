@@ -156,5 +156,5 @@
       (lambda (notebook page index)
         (declare (ignore notebook page))
         (when (plusp index) (funcall (nth (1- index) reloaders)))))
-    (gtk:widget-set-visible book (setting :checklist-visible nil))
+    (gtk:widget-set-visible book (setting :checklist-visible t))
     book))
