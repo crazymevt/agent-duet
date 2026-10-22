@@ -70,7 +70,7 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
    (busy :initform nil :accessor agent-busy)
    (queue :initform '() :accessor agent-queue :documentation "Waiting (prompt callback attachments)s, oldest first")
    (context-fallback :initform nil :accessor agent-context-fallback
-                     :documentation "Latest compact prompt and its full version for lost history")
+                     :documentation "Recent (compact . full) prompts, newest first, for lost history")
    (callback :initform nil :accessor agent-callback :documentation "The running turn's")
    (turn-images :initform '() :accessor agent-turn-images
                 :documentation "The images (paths) to show the agent with the running turn's prompt")
@@ -496,17 +496,14 @@ by its own. Lines of the other file that only import AGENT's own are left out."
 (defun collaboration-instructions (agent)
   (let ((partner (agent-partner-name agent))
         (notes (shared-notes agent)))
-    (format nil "You are ~a, one of two coding agents (the other is ~a) working together on the user's ~
-request in the same working directory. Prompts may come from the user directly or be relayed from ~a: ~
-they may ask you to implement something, to review ~a's work, or to address its review of yours. ~
-When you review, inspect the files themselves (and `git diff` if the directory is a git repository) ~
-rather than trusting a summary, and don't change files unless asked to. When you hand off to ~a, which ~
-sees only your reply, briefly state ~
-the outcome, changed paths, verification results and unresolved issues, identifying review findings by ID ~
-as applicable (writing guidance, not required fields). ~
-This client does not render inline visualizations. Link generated HTML files with Markdown ~
-using absolute file:// URLs instead of visualization tokens, including in handoffs. ~
-Running a command may need the user's approval; if one is denied, carry on without it and say so.~
+    (format nil "You are ~a, working with ~a (another coding agent) on the user's request in the same ~
+directory. Prompts come from the user or are relayed from ~a: to implement something, review ~a's work, ~
+or address its review of yours. When reviewing, inspect the files (and `git diff` in a git repository) ~
+rather than trusting a summary, and change nothing unless asked. ~a sees only your reply: when handing off, ~
+briefly give the outcome, changed paths, verification results and unresolved issues, citing review findings ~
+by ID where applicable. Inline visualizations aren't rendered: link generated HTML files as Markdown with ~
+absolute file:// URLs, including in handoffs. If a command needing approval is denied, carry on without it ~
+and say so.~
 ~@[~%~%The project's notes for coding agents, from its `~a` (written for ~a, but they apply to you too):~
 ~%~%~a~]"
             (agent-name agent) partner partner partner partner
@@ -849,10 +846,25 @@ unless that turn is over by then."
       (when (eq token (agent-turn-token agent))
         (agent-turn-finished agent why t)))))
 
+(defparameter *context-fallback-limit* 4 "How many compact prompts an agent keeps the full versions of.")
+
+(defun remember-context-fallback (agent compact full)
+  "Keep FULL to send instead of COMPACT if AGENT's conversation is lost."
+  (let ((kept (remove compact (agent-context-fallback agent) :key #'car :test #'equal)))
+    (setf (agent-context-fallback agent)
+          (cons (cons compact full) (subseq kept 0 (min (length kept) (1- *context-fallback-limit*)))))))
+
 (defun prompt-without-history (agent prompt)
-  "Expand the latest compact prompt if its conversation could not be resumed."
+  "Expand a recent compact prompt if its conversation could not be resumed,
+also one a recovery or follow-up wraps in more text."
   (let ((fallback (agent-context-fallback agent)))
-    (if (and fallback (equal prompt (car fallback))) (cdr fallback) prompt)))
+    (or (cdr (assoc prompt fallback :test #'equal))
+        (let ((entry (find-if (lambda (entry) (search (car entry) prompt)) fallback)))
+          (if entry
+              (let ((at (search (car entry) prompt)))
+                (concatenate 'string (subseq prompt 0 at) (cdr entry)
+                             (subseq prompt (+ at (length (car entry))))))
+              prompt)))))
 
 (defmethod agent-begin-turn ((agent claude-agent) prompt)
   (let ((images (agent-turn-images agent)))

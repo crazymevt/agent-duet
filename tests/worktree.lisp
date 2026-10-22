@@ -162,7 +162,7 @@
     (declare (ignore messages reviewer))
     (is eq :finished (ai:workflow-state workflow))
     (true (search "Suggested commit:" (first (fake-prompts author))))
-    (true (search "actual completed changes" (first (fake-prompts author))))
+    (true (search "whole task's completed changes" (first (fake-prompts author))))
     (is string= "Color workflow stages" (ai::default-commit-message workflow))))
 
 (define-test commit-suggestion-correction-prompts :parent agent-duet

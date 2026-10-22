@@ -280,6 +280,44 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
     (true (search task (ai::review-prompt part)))
     (false (search "summarize what you changed" (ai::work-reply-instruction part)))))
 
+(define-test compact-commit-suggestion :parent agent-duet
+  (let* ((author (make-instance 'fake-agent :name "Claude"))
+         (reviewer (make-instance 'fake-agent :name "ChatGPT"))
+         (part (ai::make-review-loop :author author :reviewer reviewer :task "Implement colors"))
+         (instruction ai::*commit-suggestion-instruction*)
+         (reminder ai::*commit-suggestion-reminder*))
+    ;; A new conversation gets the instruction.
+    (let ((prompt (ai::author-work-prompt part "Implement colors")))
+      (true (search instruction prompt))
+      (false (search reminder prompt)))
+    ;; The same one, having reported, only a reminder; lost, the full prompt.
+    (ai::work-done part "Implemented colors.")
+    (let ((prompt (ai::author-work-prompt part (ai::fix-prompt part "Changes requested"))))
+      (false (search instruction prompt))
+      (true (search reminder prompt))
+      (let ((full (ai::prompt-without-history author prompt)))
+        (true (search instruction full))
+        (false (search reminder full)))
+      ;; A takeover or restored step gets the instruction back, once.
+      (let ((takeover (ai::with-commit-suggestion-instruction (ai::takeover-prompt author prompt))))
+        (true (search instruction takeover))
+        (false (search reminder takeover))
+        (is eql (search "Suggested commit:" takeover) (search "Suggested commit:" takeover :from-end t)))
+      (is string= (ai::prompt-without-history author prompt) (ai::expand-commit-suggestion prompt))
+      ;; Wrapped by a recovery or follow-up, it is still expanded.
+      (let ((wrapped (format nil "Recover this:~%~%~a~%~%Then go on." prompt)))
+        (is string= (format nil "Recover this:~%~%~a~%~%Then go on." (ai::expand-commit-suggestion prompt))
+            (ai::prompt-without-history author wrapped)))
+      (let* ((workflow (make-instance 'ai:workflow :lead author :partner reviewer :request "Implement colors"))
+             (step (ai::make-step :agent author :prompt prompt :role :work :loop part :reason :disconnected))
+             (recovery (ai::recovery-progress-prompt workflow step "{}")))
+        (true (search instruction recovery))
+        (false (search reminder recovery))))
+    (setf (fake-handle author) "new-conversation")
+    (true (search instruction (ai::author-work-prompt part "Fix it")))
+    (setf (fake-handle author) nil)
+    (true (search instruction (ai::author-work-prompt part "Fix it")))))
+
 (define-test review-worktree-stat :parent agent-duet
   (with-git-folder (repo)
     (let* ((author (make-instance 'fake-agent :name "Claude"))

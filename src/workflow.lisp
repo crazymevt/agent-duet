@@ -146,6 +146,7 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   label                                 ; how to name it in notes: nil, or "Claude's part"
   (summary "")                          ; the author's latest report
   (review-history nil)                 ; (reviewer conversation) from its last reply
+  (work-history nil)                    ; (author conversation) from its last report
   (last-review nil)                     ; the reviewer's latest review
   (findings '())                        ; the review checklist: FINDINGs, by id
   (combined-result nil)                ; replies must remain full combined answers
@@ -597,7 +598,7 @@ Or FINDINGS: NONE. End with exactly VERDICT: APPROVED or VERDICT: CHANGES REQUES
                         (if (loop-tree loop) (worktree-note loop) "")
                         (loop-check-report loop) (findings-lines (loop-findings loop))
                         (next-finding-id (loop-findings loop)))))
-          (setf (agent-context-fallback reviewer) (cons prompt complete))
+          (remember-context-fallback reviewer prompt complete)
           prompt)
         complete)))
 
@@ -630,14 +631,46 @@ Diff stat:~%~a~%~%"
 
 (defparameter *commit-suggestion-instruction*
   "If files changed during this task, end your report with one line:
-Suggested commit: <a short imperative commit subject describing the actual completed changes, at most 72 characters>
-Cover the whole task's completed changes, including earlier work, not just this correction or the original request. This is a suggestion only, not an instruction to commit.")
+Suggested commit: <a short imperative subject for the whole task's completed changes, including earlier work; at most 72 characters>
+This is only a suggestion, not an instruction to commit.")
+
+(defparameter *commit-suggestion-reminder*
+  "If files changed, end with the Suggested commit line as before, for the whole task."
+  "What replaces the instruction for an author whose conversation already has it.")
+
+(defun replace-once (text old new)
+  (let ((at (search old text)))
+    (if at (concatenate 'string (subseq text 0 at) new (subseq text (+ at (length old)))) text)))
+
+(defun expand-commit-suggestion (prompt)
+  "PROMPT with a reminder of the instruction replaced by the instruction."
+  (if (stringp prompt) (replace-once prompt *commit-suggestion-reminder* *commit-suggestion-instruction*) prompt))
 
 (defun with-commit-suggestion-instruction (prompt)
   "Add the reply instruction once, including when a takeover reuses a prompt."
-  (if (search *commit-suggestion-instruction* prompt)
-      prompt
-      (format nil "~a~%~%~a" prompt *commit-suggestion-instruction*)))
+  (let ((prompt (expand-commit-suggestion prompt)))
+    (if (search *commit-suggestion-instruction* prompt)
+        prompt
+        (format nil "~a~%~%~a" prompt *commit-suggestion-instruction*))))
+
+(defun author-work-prompt (loop prompt)
+  "PROMPT for LOOP's author, with the instruction; only a reminder of it while
+the author's conversation, which had it, goes on. The full prompt is kept for
+a conversation that can't be resumed."
+  (let* ((full (with-commit-suggestion-instruction prompt))
+         (author (loop-author loop))
+         (handle (agent-conversation-handle author)))
+    (if (and handle (equal (loop-work-history loop) (list author handle)))
+        (let ((compact (replace-once full *commit-suggestion-instruction* *commit-suggestion-reminder*)))
+          (remember-context-fallback author compact full)
+          compact)
+        full)))
+
+(defun work-done (loop text)
+  "Take the author's report TEXT; its conversation now has the instruction."
+  (setf (loop-summary loop) text
+        (loop-work-history loop)
+        (list (loop-author loop) (agent-conversation-handle (loop-author loop)))))
 
 (defun work-reply-instruction (loop)
   (if (loop-combined-result loop)
@@ -1289,14 +1322,14 @@ ready waits for it in any case."
   (setf (loop-check-report loop) nil
         (loop-check-failed loop) nil)
   (update-loop-state workflow loop :working)
-  (let* ((prompt (with-commit-suggestion-instruction prompt))
+  (let* ((prompt (author-work-prompt loop prompt))
          (step (make-step :agent (loop-author loop) :prompt prompt :role :work :loop loop
                          :then (lambda (text error)
                                  (cond (error
                                         (loop-failed workflow loop (format nil "~a's turn failed: ~a"
                                                                            (agent-name (loop-author loop)) text)))
                                        (t
-                                        (setf (loop-summary loop) text)
+                                        (work-done loop text)
                                         (post workflow (loop-author loop) (loop-reviewer loop) text :work)
                                         (loop-check workflow loop)))))))
     (if (and prepare (loop-dependencies loop) (loop-prerequisites-ready-p loop))
@@ -1344,12 +1377,13 @@ until it passes: request changes, saying what needs fixing.~%~%~a"
               (progn
                 (update-loop-state workflow loop :working)
                 (submit workflow (loop-author loop)
-                        (format nil "~a~%~%Fix the failing check. ~a" report (work-reply-instruction loop))
+                        (author-work-prompt
+                         loop (format nil "~a~%~%Fix the failing check. ~a" report (work-reply-instruction loop)))
                         (lambda (text error)
                           (if error
                               (loop-failed workflow loop (format nil "Check fix failed: ~a" text))
                               (progn
-                                (setf (loop-summary loop) text)
+                                (work-done loop text)
                                 (post workflow (loop-author loop) (loop-reviewer loop) text :work)
                                 (loop-check workflow loop (1+ fixes)))))
                         :role :work :loop loop :check-fixes (1+ fixes)))))))))
@@ -2529,6 +2563,9 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
           (when (and (eq (step-state step) :paused)
                      (eq (step-role step) :review) (step-loop step))
             (setf (step-prompt step) (review-prompt (step-loop step) :full t)))
+          ;; Likewise an author's reminder of the commit line.
+          (setf (step-prompt step) (expand-commit-suggestion (step-prompt step)))
+          (setf (step-original-prompt step) (expand-commit-suggestion (step-original-prompt step)))
           (setf (step-then step) (restored-step-continuation workflow step))
           (push step (workflow-steps workflow))
           (when (eq (step-state step) :paused) (push step (workflow-paused workflow)))))
@@ -2632,7 +2669,10 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
 
 (defun recovery-progress-prompt (workflow step &optional inspection)
   (format nil "Explicit recovery of an interrupted ~a step. Inspect existing files and partial work before editing; preserve useful work.~%~%Original assignment:~%~a~%~%Reason: ~a~%Available turn progress:~%~a~%~%Written result:~%~a~%Last review:~%~a~%~%Current repository inspection:~%~a"
-          (step-role step) (or (step-original-prompt step) (step-prompt step)) (step-reason step) (or (step-progress step) "No final reply.")
+          (step-role step)
+          ;; Recovery may be in a new conversation: the whole commit-line instruction.
+          (expand-commit-suggestion (or (step-original-prompt step) (step-prompt step)))
+          (step-reason step) (or (step-progress step) "No final reply.")
           (if (step-loop step) (loop-summary (step-loop step)) "")
           (if (step-loop step) (or (loop-last-review (step-loop step)) "") "")
           (json-string (or inspection (inspect-workflow-recovery workflow)))))
