@@ -315,6 +315,31 @@ a plan waiting for approval, a pause for usage. If the agent speaks up while
 the card is open, the card says so and goes away. The time is
 `:stall-minutes` in the settings file (`0` turns it off).
 
+## Agent command efficiency
+
+Both agents are instructed to search for filenames and matching lines before
+reading relevant sections, and to keep searches, file reads and diffs focused.
+For noisy builds, tests, installs and batch jobs, project command-wrapper
+instructions take precedence.
+
+With Full access, unless the agent is read-only, Agent Duet also provides a
+portable `quiet-command.sh` helper in its history directory and gives the agent
+its full path. When no project wrapper is specified, agents are told to use:
+
+```sh
+/bin/sh /path/to/helpers/quiet-command.sh -- <command> [args...]
+/bin/sh /path/to/helpers/quiet-command.sh -- sh -c '<pipeline or script>'
+```
+
+The helper preserves the command's exit status, saves full output in a temporary
+log, and reports the status and log path. On failure, it also shows bounded
+diagnostic excerpts. Agents are told to inspect relevant log excerpts even after
+a successful exit when needed, report verification failures, and retain required
+evidence in their answers. Temporary logs follow the operating system's
+temporary-file lifecycle. If the helper is unavailable, or access is restricted,
+agents are told to use a permitted project wrapper or bounded tool output and
+respect read-only restrictions.
+
 ## Folder, models and look
 
 - **Folder** (top left): where both agents work. Its menu lists recent folders
@@ -570,12 +595,9 @@ The parallel target compiles the suite once before starting workers, then splits
 the registered tests evenly across processes. Each worker has its own temporary
 directory; output is grouped by worker, and any worker failure fails the target.
 
-Agents are instructed to search before reading and keep command output focused.
-Project command wrappers take precedence. With Full access, Agent Duet also
-provides a portable quiet-command helper for noisy jobs: it preserves exit
-status, saves the full output in a temporary log, and shows bounded failure
-excerpts. Read-only agents use permitted targeted reads instead. Temporary
-command logs follow the operating system's temporary-file lifecycle.
+See [Agent command efficiency](#agent-command-efficiency) for the output and
+command-wrapper instructions given to agents.
+
 Failed workflow checks include the first detected failure, preceding context and nearby lines
 plus the final output within the existing 4,000-character budget when possible;
 otherwise they use the tail. Detection is heuristic; retained logs remain the
