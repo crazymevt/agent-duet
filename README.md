@@ -559,3 +559,15 @@ The fake CLIs and review enforcement use Lisp; Python is not required.
 The parallel target compiles the suite once before starting workers, then splits
 the registered tests evenly across processes. Each worker has its own temporary
 directory; output is grouped by worker, and any worker failure fails the target.
+
+Agents are instructed to search before reading and keep command output focused.
+Project command wrappers take precedence. With Full access, Agent Duet also
+provides a portable quiet-command helper for noisy jobs: it preserves exit
+status, saves the full output in a temporary log, and shows bounded failure
+excerpts. Read-only agents use permitted targeted reads instead. Temporary
+command logs follow the operating system's temporary-file lifecycle.
+Failed workflow checks include the first detected failure, preceding context and nearby lines
+plus the final output within the existing 4,000-character budget when possible;
+otherwise they use the tail. Detection is heuristic; retained logs remain the
+source for further diagnosis. File-backed handoffs fall back to the complete
+inline reply up to 60,000 characters when storage or access is unavailable.

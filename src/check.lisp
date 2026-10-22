@@ -46,6 +46,56 @@
                                      :external-format '(:utf-8 :replacement #\?))
              limit))))))
 
+(defun check-diagnostic-line-p (line)
+  "Recognize diagnostic words, excluding filenames and zero-failure summaries."
+  (loop with previous = nil
+        for word in (uiop:split-string (string-downcase line)
+                                       :separator '(#\Space #\Tab #\Return #\: #\[ #\] #\( #\)))
+        unless (zerop (length word))
+          do (when (and (member word '("error" "errors" "fatal" "fail" "failed"
+                                       "failure" "failures" "exception") :test #'string=)
+                        (not (member previous '("0" "no" "without") :test #'equal)))
+               (return t))
+             (setf previous word)))
+
+(defun read-check-output-excerpt (path &optional (limit *check-output-limit*))
+  "First failure with two preceding lines and nearby output, plus the tail.
+Bound both the result and buffered lines, even for unusually long lines."
+  (let ((tail (read-check-output-tail path limit))
+        (budget (floor limit 2)) (diagnostic nil) (remaining 0) (previous nil))
+    (when (plusp budget)
+      (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
+        (loop with line = (make-string-output-stream)
+              with size = 0
+              for char = (read-char in nil nil)
+              do (cond
+                   ((or (null char) (char= char #\Newline))
+                    (let ((text (get-output-stream-string line)))
+                      (when (and (null diagnostic) (check-diagnostic-line-p text))
+                        ;; A diagnostic already in the tail needs no extra copy.
+                        (when (search text tail) (return))
+                        (setf diagnostic (format nil "~{~a~%~}" (reverse previous))
+                              remaining 6))
+                      (when diagnostic
+                        (let ((piece (concatenate 'string text (string #\Newline))))
+                          (setf diagnostic
+                                (concatenate 'string diagnostic
+                                             (subseq piece 0 (min (length piece)
+                                                                  (- budget (length diagnostic)))))))
+                        (when (or (zerop (decf remaining)) (>= (length diagnostic) budget))
+                          (return)))
+                      ;; At most one quarter of the diagnostic budget is context.
+                      (push (subseq text 0 (min (length text) (max 0 (1- (floor budget 8))))) previous)
+                      (setf previous (subseq previous 0 (min 2 (length previous)))
+                            size 0)))
+                   ((< size budget) (write-char char line) (incf size)))
+              while char)))
+    (let ((marker (format nil "~%[… final output …]~%")))
+      (if (and diagnostic (> limit (+ (length marker) (length diagnostic))))
+          (concatenate 'string diagnostic marker
+                       (read-check-output-tail path (- limit (length diagnostic) (length marker))))
+          tail))))
+
 (defun check-output-block (output)
   "Fence OUTPUT without allowing embedded backticks to close the block."
   (let ((longest 0) (run 0))
@@ -95,7 +145,9 @@ Return a cancellable handle. Through DELIVER, call CALLBACK with
                                        (sleep 0.02))
                               (sb-ext:process-wait process)
                               (setf code (sb-ext:process-exit-code process)
-                                    output (read-check-output-tail path output-limit))
+                                    output (if (and (eql code 0) (not timed-out))
+                                               (read-check-output-tail path output-limit)
+                                               (read-check-output-excerpt path output-limit)))
                               (when (and (not (check-handle-cancelled handle))
                                          (or timed-out (not (eql code 0))))
                                 (setf (check-handle-log-path handle)

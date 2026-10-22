@@ -493,6 +493,39 @@ by its own. Lines of the other file that only import AGENT's own are left out."
                   (subseq text 0 *shared-notes-limit*) (length text))
           text))))
 
+;; This read-time embedding is retained in saved applications. After editing
+;; scripts/quiet-command.sh, force recompilation of agent-duet/core (ASDF's
+;; :static-file timestamp alone may not invalidate this compiled file):
+;; (asdf:compile-system "agent-duet/core" :force t), then rebuild the application.
+(defparameter *quiet-command-script*
+  #.(uiop:read-file-string
+     (asdf:system-relative-pathname "agent-duet/core" "scripts/quiet-command.sh"))
+  "Embedded at compile time so saved applications need no source checkout.")
+
+(defun quiet-command-instruction (agent)
+  "Offer the log-writing helper only with unrestricted filesystem access."
+  (let ((path (and (eq :full (agent-permission agent))
+                   (not (agent-read-only-p agent))
+                   (ignore-errors
+                     (let ((path (merge-pathnames "helpers/quiet-command.sh" (history-directory))))
+                       (ensure-directories-exist path)
+                       (unless (and (probe-file path)
+                                    (string= *quiet-command-script* (uiop:read-file-string path)))
+                         (with-open-file (out path :direction :output :if-exists :supersede
+                                                  :external-format :utf-8)
+                           (write-string *quiet-command-script* out)))
+                       (namestring (truename path)))))))
+    (format nil "Keep tool output focused: search for filenames and matching lines first, then read relevant sections. ~
+Use bounded searches and file reads; avoid dumping whole files or broad diffs when a targeted read suffices. ~
+Follow project command-wrapper instructions when present. ~a ~
+Inspect relevant log excerpts when needed; a successful exit alone may not provide the requested results. ~
+Preserve exit status and report verification failures. Never discard substantive answers or required evidence."
+            (if path
+                (format nil "For noisy builds, tests, installs and batch jobs without a project wrapper, use `/bin/sh ~a -- <command> [args...]`; ~
+for pipelines, pass `sh -c '<script>'` as the command. It returns status and a full-log path, with bounded failure excerpts."
+                        (shell-quote path))
+                "For noisy commands, use an available permitted project wrapper or bounded output supported by the tool; respect read-only restrictions."))))
+
 (defun collaboration-instructions (agent)
   (let ((partner (agent-partner-name agent))
         (notes (shared-notes agent)))
@@ -503,10 +536,11 @@ rather than trusting a summary, and change nothing unless asked. ~a sees only yo
 briefly give the outcome, changed paths, verification results and unresolved issues, citing review findings ~
 by ID where applicable. Inline visualizations aren't rendered: link generated HTML files as Markdown with ~
 absolute file:// URLs, including in handoffs. If a command needing approval is denied, carry on without it ~
-and say so.~
+and say so. ~a~
 ~@[~%~%The project's notes for coding agents, from its `~a` (written for ~a, but they apply to you too):~
 ~%~%~a~]"
             (agent-name agent) partner partner partner partner
+            (quiet-command-instruction agent)
             (and notes (shared-notes-file agent)) partner notes)))
 
 ;;; Claude

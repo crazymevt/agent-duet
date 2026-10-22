@@ -393,3 +393,21 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
              (let ((ai::*history-directory* (uiop:ensure-directory-pathname blocked)))
                (true (search "cut short" (ai::long-part-reply workflow reply))))))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(define-test medium-reply-falls-back-without-loss :parent agent-duet
+  (let* ((workflow (make-instance 'ai:workflow :lead (make-instance 'fake-agent :permission :edits)
+                                  :partner (make-instance 'fake-agent :permission :edits)))
+         (reply (make-string 9000 :initial-element #\x)))
+    (is string= reply (ai::long-part-reply workflow reply))))
+
+(define-test medium-reply-stays-inline :parent agent-duet
+  (with-temp-folder (directory)
+    (let* ((ai::*history-directory* directory)
+           (workflow (make-instance 'ai:workflow
+                                   :lead (make-instance 'fake-agent :permission :full)
+                                   :partner (make-instance 'fake-agent :permission :full)))
+           (reply (make-string 9000 :initial-element #\x))
+           (part (ai::make-review-loop :label "Part" :tree directory :summary reply)))
+      (setf (ai:workflow-loops workflow) (list part))
+      (true (search reply (ai::split-results-text workflow)))
+      (false (directory (merge-pathnames "artifacts/*.txt" directory))))))

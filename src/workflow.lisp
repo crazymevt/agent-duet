@@ -1856,8 +1856,10 @@ conflicts; then the merged result is reviewed."
     (if path
         (format nil "Reply excerpt (read the full reply before combining results):~%~a~%Full reply: ~a"
                 (subseq reply 0 (min 1200 (length reply))) path)
-        (format nil "~a~%[Final reply cut short; full reply retained in the part's conversation.]"
-                (subseq reply 0 *split-reply-limit*)))))
+        (if (<= (length reply) *split-reply-limit*)
+            reply
+            (format nil "~a~%[Final reply cut short; full reply retained in the part's conversation.]"
+                    (subseq reply 0 *split-reply-limit*))))))
 
 (defun split-results-text (workflow)
   "Keep both parts' written results, including parts that changed no files."

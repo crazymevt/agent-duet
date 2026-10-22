@@ -8,7 +8,8 @@
   :depends-on ("uiop" "sb-posix")
   :pathname "src/"
   :serial t
-  :components ((:file "package")
+  :components ((:static-file "../scripts/quiet-command.sh")
+               (:file "package")
                (:file "json")
                (:file "markdown")
                (:file "cli-process")

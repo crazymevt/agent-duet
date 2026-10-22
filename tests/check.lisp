@@ -318,3 +318,56 @@
            (false (directory (merge-pathnames "artifacts/*.txt" directory))))
       (ai::kill-check handle)
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(define-test check-excerpt-keeps-early-failure :parent agent-duet
+  (uiop:with-temporary-file (:pathname path :stream out)
+    (format out "running file.lisp~%running test-case~%ERROR: first cause~%helpful context~%")
+    (dotimes (i 300) (format out "noise ~d~%" i))
+    (format out "final summary")
+    (finish-output out)
+    (let ((excerpt (ai::read-check-output-excerpt path 500)))
+      (true (<= (length excerpt) 500))
+      (true (search "running file.lisp" excerpt))
+      (true (search "running test-case" excerpt))
+      (true (search "ERROR: first cause" excerpt))
+      (true (search "helpful context" excerpt))
+      (true (search "final summary" excerpt)))))
+
+(define-test quiet-command-preserves-status-and-log :parent agent-duet
+  (let* ((directory (merge-pathnames (format nil "duet-helper-~a/" (ai::make-uuid))
+                                    (uiop:temporary-directory)))
+         (ai::*history-directory* directory)
+         (agent (make-instance 'ai:claude-agent :permission :full)))
+    (unwind-protect
+         (progn
+           (true (search "For noisy builds" (ai::collaboration-instructions agent)))
+           (let ((helper (merge-pathnames "helpers/quiet-command.sh" directory)))
+             (multiple-value-bind (output err code)
+                 (uiop:run-program (list "/bin/sh" (namestring helper) "--" "/bin/sh" "-c"
+                                        "printf 'ERROR: evidence'; exit 7")
+                                   :output :string :error-output :string :ignore-error-status t)
+               (declare (ignore err))
+               (is = 7 code)
+               (true (search "ERROR: evidence" output))
+               (let* ((start (+ (search "Full log: " output) 10))
+                      (path (subseq output start (position #\Newline output :start start))))
+                 (unwind-protect
+                      (is string= "ERROR: evidence" (uiop:read-file-string path))
+                   (delete-file path)))))
+           (setf (ai::agent-read-only-p agent) t)
+           (false (search "/bin/sh" (ai::quiet-command-instruction agent))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(define-test check-diagnostic-avoids-harmless-lines :parent agent-duet
+  (dolist (line '("0 failures" "0 errors" "no failures" "without error"
+                  "compiling error-handler.lisp" "tests/failure.lisp" "failover ready"))
+    (false (ai::check-diagnostic-line-p line)))
+  (dolist (line '("ERROR: broken" "file.lisp: error: broken" "test FAILED" "2 failures"))
+    (true (ai::check-diagnostic-line-p line)))
+  (uiop:with-temporary-file (:pathname path :stream out)
+    (format out "0 failures~%compiling error-handler.lisp~%")
+    (dotimes (i 100) (format out "noise ~d~%" i))
+    (format out "ERROR: final cause~%final summary")
+    (finish-output out)
+    (is string= (ai::read-check-output-tail path 500)
+        (ai::read-check-output-excerpt path 500))))
