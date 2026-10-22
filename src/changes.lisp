@@ -1,6 +1,27 @@
 ;;;; Read-only per-file snapshot diffs.
 (in-package #:agent-duet)
 
+(defun add-diff-tags (buffer)
+  "Add the diff line tags to BUFFER. Translucent backgrounds retain the theme's text color in both modes."
+  (preview-tag buffer "diff-add" :paragraph-background "rgba(46,160,67,0.22)")
+  (preview-tag buffer "diff-remove" :paragraph-background "rgba(230,65,65,0.22)")
+  (preview-tag buffer "diff-hunk" :paragraph-background "rgba(70,140,230,0.22)" :weight 700))
+
+(defun set-diff-text (buffer diff)
+  "Replace BUFFER's text with DIFF, tagging hunk headers and added and removed lines.
+BUFFER needs the tags from ADD-DIFF-TAGS. DIFF may span several files."
+  (gtk:text-buffer-set-text buffer diff -1)
+  (let ((offset 0) (in-hunk nil))
+    (dolist (line (uiop:split-string diff :separator '(#\Newline)))
+      (let ((tag (cond ((uiop:string-prefix-p "diff " line) (setf in-hunk nil))
+                       ((uiop:string-prefix-p "@@" line) (setf in-hunk t) "diff-hunk")
+                       ((and in-hunk (uiop:string-prefix-p "+" line)) "diff-add")
+                       ((and in-hunk (uiop:string-prefix-p "-" line)) "diff-remove"))))
+        (when tag
+          (gtk:text-buffer-apply-tag-by-name buffer tag (iter-at buffer offset)
+                                            (iter-at buffer (+ offset (length line)))))
+        (incf offset (1+ (length line)))))))
+
 (defun show-changes-window (directory start end &key (title "Task changes") on-close)
   "Present a new, read-only window comparing START and END snapshots. Return its GTK window.
 END may instead be a function returning a snapshot, or nil and why. Git runs off the
@@ -21,10 +42,7 @@ once the window has closed."
          (view (make-instance 'gtk:text-view :editable nil :cursor-visible nil :monospace t
                               :wrap-mode :none :left-margin 16 :right-margin 16 :top-margin 16 :bottom-margin 16))
          (buffer (gtk:text-view-get-buffer view)))
-    ;; Translucent backgrounds retain the theme's text color in both modes.
-    (preview-tag buffer "diff-add" :paragraph-background "rgba(46,160,67,0.22)")
-    (preview-tag buffer "diff-remove" :paragraph-background "rgba(230,65,65,0.22)")
-    (preview-tag buffer "diff-hunk" :paragraph-background "rgba(70,140,230,0.22)" :weight 700)
+    (add-diff-tags buffer)
     (labels ((show-text (text) (gtk:text-buffer-set-text buffer text -1))
              (show-diff (change)
                (setf selected change)
@@ -43,18 +61,7 @@ once the window has closed."
                                         (when (and (not closed) (eq change selected))
                                           (insert-diff diff))))))
                          :name "changes diff"))))
-             (insert-diff (diff)
-               (show-text diff)
-               (let ((offset 0) (in-hunk nil))
-                 (dolist (line (uiop:split-string diff :separator '(#\Newline)))
-                   (let ((tag (cond ((uiop:string-prefix-p "@@" line)
-                                     (setf in-hunk t) "diff-hunk")
-                                    ((and in-hunk (uiop:string-prefix-p "+" line)) "diff-add")
-                                    ((and in-hunk (uiop:string-prefix-p "-" line)) "diff-remove"))))
-                     (when tag
-                       (gtk:text-buffer-apply-tag-by-name buffer tag (iter-at buffer offset)
-                                                         (iter-at buffer (+ offset (length line)))))
-                     (incf offset (1+ (length line)))))))
+             (insert-diff (diff) (set-diff-text buffer diff))
              (refill ()
                (let ((query (gtk:editable-get-text filter)))
                  ;; Clear before removing rows: GTK emits selection changes.
@@ -162,7 +169,7 @@ once the window has closed."
                                    (push (cons path check) rows)
                                    (gtk:box-append files check)
                                    (gobject:connect check :toggled (lambda (w) (declare (ignore w)) (refresh))))))
-                             (gtk:text-buffer-set-text (gtk:text-view-get-buffer view) (getf result :diff) -1)
+                             (set-diff-text (gtk:text-view-get-buffer view) (getf result :diff))
                              (say (format nil "~d file~:p selected. Existing staging is preserved for unselected files."
                                           (length (getf result :paths))))
                              (gtk:widget-set-sensitive commit (and (getf result :paths) (plusp (length (getf result :diff))) (not busy) t)))))))))
@@ -170,6 +177,7 @@ once the window has closed."
                (dolist (row rows)
                  (gtk:check-button-set-active (cdr row) (and (member (car row) paths :test #'equal) t)))
                (refresh)))
+      (add-diff-tags (gtk:text-view-get-buffer view))
       (gtk:box-append body (make-instance 'gtk:label :xalign 0.0 :wrap t
         :label (if on-continue
                    "This folder has uncommitted changes. Commit them before starting, continue with them, or cancel."
