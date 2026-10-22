@@ -1547,6 +1547,10 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun set-checklist-visible (visible)
   "Keep the checklist at a useful width, preserving the wide conversation layout."
+  (when (and (control :sidebar-toggle)
+             (not (eql (not (null visible))
+                       (gtk:toggle-button-get-active (control :sidebar-toggle)))))
+    (gtk:toggle-button-set-active (control :sidebar-toggle) (not (null visible))))
   (let ((panel (control :checklist-panel))
         (content (control :checklist-split)))
     (when (and panel content (not (eql (not (null visible)) (gtk:widget-get-visible panel))))
@@ -1762,7 +1766,7 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 ;;; Conversation with a sidebar, the original three panes, or conversation alone
 
-(defvar *view* :sidebar
+(defvar *view* :conversation
   ":sidebar places stacked agents to the right; :agents-left places them to the left.
 :panes retains the original layout.
 :conversation
@@ -1874,8 +1878,9 @@ and a line saying what each is doing.")
 (defun update-agent-toggle ()
   "Keep the header shortcut and layout selector in sync with the current view."
   (when (control :agent-toggle)
-    (gtk:button-set-label (control :agent-toggle)
-                          (if (eq *view* :conversation) "Show agents" "Hide agents")))
+    (if (eq *view* :conversation)
+        (gtk:widget-remove-css-class (control :agent-toggle) "suggested-action")
+        (gtk:widget-add-css-class (control :agent-toggle) "suggested-action")))
   (when (control :view)
     (let ((selected (position *view* *views* :key #'first)))
       (unless (= selected (gtk:drop-down-get-selected (control :view)))
@@ -3557,8 +3562,9 @@ this task's turns cheaper."
     (if (eq (parse-panel-shortcut text) :disabled) "Disabled" text)))
 
 (defun update-shortcut-tooltips ()
-  (dolist (spec '((:agent-toggle :agents-shortcut "Show or hide agents")
+  (dolist (spec '((:agent-toggle :agents-shortcut "togge agents")
                   (:checklist-toggle :checklist-shortcut "Show or hide the checklist")
+                  (:sidebar-toggle :checklist-shortcut "Toggle sidebar")
                   (:terminal :terminal-shortcut "Show or hide the terminal")
                   (:terminal-button :terminal-shortcut "Show or hide the terminal")))
     (destructuring-bind (control-name shortcut title) spec
@@ -3658,8 +3664,11 @@ this task's turns cheaper."
          (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
          (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*)))
          (view (gtk:drop-down-new-from-strings (mapcar #'second *views*)))
-         (agent-toggle (make-instance 'gtk:button
-                                      :tooltip-text "Show or hide agents"))
+         (agent-toggle (make-instance 'gtk:button :icon-name "system-users-symbolic"
+                                      :tooltip-text "togge agents"))
+         (sidebar-toggle (make-instance 'gtk:toggle-button :icon-name "sidebar-show-symbolic"
+                                        :active (setting :checklist-visible nil)
+                                        :tooltip-text "Toggle sidebar"))
          (terminal-shortcut (make-instance 'gtk:button :label ">_"
                                            :css-classes '("duet-terminal-shortcut" "monospace")
                                            :tooltip-text "Show or hide the terminal"))
@@ -3670,7 +3679,7 @@ this task's turns cheaper."
     (gtk:widget-set-tooltip-text folder "Choose a workspace folder or reopen a recent folder")
     (gtk:menu-button-set-popover tools popover)
     (setf *controls* (list* :folder folder :folder-label folder-label :permission permission
-                                 :view view :agent-toggle agent-toggle :terminal-button terminal-shortcut *controls*))
+                                 :view view :agent-toggle agent-toggle :sidebar-toggle sidebar-toggle :terminal-button terminal-shortcut *controls*))
     (flet ((row (label widget)
              (gtk:box-append box
                              (gtk:build (gtk:box :spacing 8
@@ -3744,6 +3753,11 @@ this task's turns cheaper."
                      (lambda (button) (declare (ignore button)) (toggle-terminal)))
     (gtk:header-bar-pack-end header tools)
     (gtk:header-bar-pack-end header terminal-shortcut)
+    (gobject:connect sidebar-toggle :toggled
+                     (lambda (button)
+                       (gtk:check-button-set-active (control :checklist-toggle)
+                                                    (gtk:toggle-button-get-active button))))
+    (gtk:header-bar-pack-end header sidebar-toggle)
     (gtk:header-bar-pack-end header agent-toggle)
     header))
 
@@ -3936,7 +3950,7 @@ this task's turns cheaper."
   (setf *controls* '()
         *permission* (or (setting :permission) :ask)
         *shared-notes* (setting :shared-notes t)
-        *view* (if (assoc (setting :view) *views*) (setting :view) :sidebar)
+        *view* (if (assoc (setting :view) *views*) (setting :view) :conversation)
         *view-only* '())
   (let ((window (destructuring-bind (width height) (saved-window-size)
                   (make-instance 'gtk:application-window

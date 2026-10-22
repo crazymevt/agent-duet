@@ -57,6 +57,19 @@
     (gobject:emit cancel :clicked)
     (assert (equal "Alt+F1" (setting :agents-shortcut))))
   (gtk:window-destroy *window*))
+;; The sidebar shortcut shares the existing checklist visibility control.
+(let ((*settings* nil) (*controls* nil))
+  (make-header)
+  (assert (string= "system-users-symbolic"
+                   (gtk:button-get-icon-name (control :agent-toggle))))
+  (assert (search "togge agents" (gtk:widget-get-tooltip-text (control :agent-toggle))))
+  (assert (not (gtk:toggle-button-get-active (control :sidebar-toggle))))
+  (gtk:toggle-button-set-active (control :sidebar-toggle) t)
+  (assert (setting :checklist-visible))
+  (assert (gtk:check-button-get-active (control :checklist-toggle)))
+  (gtk:check-button-set-active (control :checklist-toggle) nil)
+  (assert (not (setting :checklist-visible)))
+  (assert (not (gtk:toggle-button-get-active (control :sidebar-toggle)))))
 (format t "~&Shortcut settings UI checks passed.~%")
 ;; Drive the real window controller over the real layout. GDK can't build
 ;; key events, so the signal is emitted without one and the handler compares
