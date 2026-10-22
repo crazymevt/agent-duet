@@ -1,3 +1,9 @@
+# Command output
+
+Run commands that may produce a lot of output through
+`~/.local/bin/quiet-run.sh` to show only relevant information.
+For example: `~/.local/bin/quiet-run.sh -- make test-parallel`.
+
 # Project test preference
 
 When running the full test suite, use `make test-parallel` instead of `make test`.
