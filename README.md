@@ -143,7 +143,9 @@ in its request.
 With **To both agents** chosen, type a request in the box under the
 conversation and press Return or **Start collaboration**. A line above it sums
 up how they'll work (`Write & review · Claude leads · 3 rounds`).
-**Workflow settings** expands to the mode, lead and *Rounds*, *Approve plan*,
+The mode and lead dropdowns sit beside the recipient dropdown (shown only
+with **To both agents**);
+**Workflow settings** expands to *Rounds*, *Approve plan*,
 *Own worktrees*, the check command and the review-only choices. The mode,
 lead, rounds and whether the settings are expanded are remembered.
 **Stop collaboration** ends the task.

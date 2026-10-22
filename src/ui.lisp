@@ -1681,6 +1681,11 @@ comes without one (a turn stopped as the folder changes) isn't kept."
       (dolist (name '(:approve-plan :worktrees))
         (gtk:widget-set-sensitive (control name) (and (not running) (member (selected-mode) '(:divide :compare)))))
       (gtk:widget-set-visible (control :review-options) (eq (selected-mode) :review-only))
+      ;; Mode and lead only matter when the message goes to both agents.
+      (dolist (name '(:mode :lead))
+        (let ((widget (control name)))
+          (gtk:widget-set-visible (or (gtk:widget-get-parent widget) widget)
+                                  (eq (composer-recipient) :both))))
       (let ((branch (member (gtk:drop-down-get-selected (control :review-target)) '(1 2))))
         (dolist (name '(:review-base :review-branch))
           (gtk:widget-set-sensitive (control name) (and (not running) branch)))
@@ -3270,12 +3275,12 @@ and summary, with Changes and, when the work can be committed, Commit changes."
                 (make-workflow-settings
                  (gtk:build
                   (gtk:box :orientation :vertical :spacing 8
-                           (wrapping-controls mode lead
+                           (wrapping-controls
                             (gtk:build (gtk:box :spacing 6 (gtk:label :label "Rounds") rounds)))
                            (wrapping-controls approve-plan worktrees)
                            (wrapping-controls (make-instance 'gtk:label :label "Check command") check)
                            review-options)))
-                (wrapping-controls recipient)
+                (wrapping-controls recipient mode lead)
                 (let ((note (make-instance 'gtk:label :xalign 0.0 :wrap t
                                             :margin-start 12 :margin-end 12 :css-classes '("dim-label" "caption"))))
                   (setf (getf *controls* :routing-note) note)
