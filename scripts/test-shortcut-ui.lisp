@@ -60,9 +60,10 @@
 ;; The sidebar shortcut shares the existing checklist visibility control.
 (let ((*settings* nil) (*controls* nil))
   (make-header)
-  (assert (string= "system-users-symbolic"
-                   (gtk:button-get-icon-name (control :agent-toggle))))
-  (assert (search "togge agents" (gtk:widget-get-tooltip-text (control :agent-toggle))))
+  ;; Both icons are drawn locally, so missing system icon themes cannot break them.
+  (dolist (key '(:agent-toggle :sidebar-toggle))
+    (assert (typep (gtk:button-get-child (control key)) 'gtk:drawing-area)))
+  (assert (search "Toggle agents" (gtk:widget-get-tooltip-text (control :agent-toggle))))
   (assert (not (gtk:toggle-button-get-active (control :sidebar-toggle))))
   (gtk:toggle-button-set-active (control :sidebar-toggle) t)
   (assert (setting :checklist-visible))

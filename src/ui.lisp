@@ -3562,7 +3562,7 @@ this task's turns cheaper."
     (if (eq (parse-panel-shortcut text) :disabled) "Disabled" text)))
 
 (defun update-shortcut-tooltips ()
-  (dolist (spec '((:agent-toggle :agents-shortcut "togge agents")
+  (dolist (spec '((:agent-toggle :agents-shortcut "Toggle agents")
                   (:checklist-toggle :checklist-shortcut "Show or hide the checklist")
                   (:sidebar-toggle :checklist-shortcut "Toggle sidebar")
                   (:terminal :terminal-shortcut "Show or hide the terminal")
@@ -3656,6 +3656,38 @@ this task's turns cheaper."
             :exact)
            (t :none)))))
 
+(defun make-panel-icon (kind)
+  "Draw a theme-colored vector icon without relying on installed icon themes."
+  (let ((icon (make-instance 'gtk:drawing-area
+                             :content-width 16 :content-height 16
+                             :halign :center :valign :center)))
+    (gtk:drawing-area-set-draw-func
+     icon
+     (lambda (area cr width height)
+       (cairo:save cr)
+       (cairo:scale cr (/ width 16.0d0) (/ height 16.0d0))
+       (gdk:cairo-set-source-rgba cr (gtk:widget-get-color area))
+       (cairo:set-line-width cr 1.5d0)
+       (ecase kind
+         (:agents
+          ;; Two heads and shoulders, readable at the header's 16px size.
+          (dolist (x '(5.0d0 11.0d0))
+            (cairo:new-sub-path cr)
+            (cairo:arc cr x 4.5d0 2.0d0 0.0d0 (* 2.0d0 pi)))
+          (cairo:stroke cr)
+          (dolist (x '(5.0d0 11.0d0))
+            (cairo:new-sub-path cr)
+            (cairo:arc cr x 12.5d0 3.25d0 pi (* 2.0d0 pi)))
+          (cairo:stroke cr))
+         (:sidebar
+          ;; A window frame with a filled right-hand sidebar.
+          (cairo:rectangle cr 1.75d0 2.75d0 12.5d0 10.5d0)
+          (cairo:stroke cr)
+          (cairo:rectangle cr 9.5d0 3.0d0 4.5d0 10.0d0)
+          (cairo:fill cr)))
+       (cairo:restore cr)))
+    icon))
+
 (defun make-header ()
   (let* ((header (make-instance 'gtk:header-bar))
          (folder-label (make-instance 'gtk:label :ellipsize :start :max-width-chars 24))
@@ -3664,9 +3696,11 @@ this task's turns cheaper."
          (permission (gtk:drop-down-new-from-strings (mapcar #'second *permission-choices*)))
          (theme (gtk:drop-down-new-from-strings (mapcar #'second *themes*)))
          (view (gtk:drop-down-new-from-strings (mapcar #'second *views*)))
-         (agent-toggle (make-instance 'gtk:button :icon-name "system-users-symbolic"
-                                      :tooltip-text "togge agents"))
-         (sidebar-toggle (make-instance 'gtk:toggle-button :icon-name "sidebar-show-symbolic"
+         (agent-toggle (make-instance 'gtk:button :child (make-panel-icon :agents)
+                                      :css-classes '("image-button")
+                                      :tooltip-text "Toggle agents"))
+         (sidebar-toggle (make-instance 'gtk:toggle-button :child (make-panel-icon :sidebar)
+                                        :css-classes '("image-button")
                                         :active (setting :checklist-visible nil)
                                         :tooltip-text "Toggle sidebar"))
          (terminal-shortcut (make-instance 'gtk:button :label ">_"
