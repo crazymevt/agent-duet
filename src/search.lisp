@@ -2,6 +2,31 @@
 (in-package #:agent-duet)
 
 (defvar *pane-search-window* nil)
+(defvar *pane-search-highlight* nil "Highlighted label and its original explicit attributes.")
+
+(defun clear-pane-search-highlight ()
+  (when *pane-search-highlight*
+    (destructuring-bind (label attributes) *pane-search-highlight*
+      (gtk:label-set-attributes label attributes))
+    (setf *pane-search-highlight* nil)))
+
+(defun highlight-pane-search-match (label start end)
+  "Paint the exact match independently of keyboard focus; preserve label styling."
+  (clear-pane-search-highlight)
+  (let* ((original (gtk:label-get-attributes label))
+         (saved (and original (pango:attr-list-copy original)))
+         (attributes (if original (pango:attr-list-copy original) (pango:attr-list-new)))
+         (text (gtk:label-get-text label))
+         (byte-start (length (sb-ext:string-to-octets text :external-format :utf-8 :end start)))
+         (byte-end (length (sb-ext:string-to-octets text :external-format :utf-8 :end end))))
+    (dolist (attribute (list (pango:attr-background-new 65535 55255 16448)
+                             (pango:attr-foreground-new 7710 6425 2570)))
+      (setf (pango:attribute-start-index attribute) byte-start
+            (pango:attribute-end-index attribute) byte-end)
+      (pango:attr-list-insert attributes attribute))
+    (setf *pane-search-highlight* (list label saved))
+    (gtk:label-select-region label 0 0)
+    (gtk:label-set-attributes label attributes)))
 
 (defun pane-search-matches (pane query)
   "Return (label start end expanders) for each literal, case-insensitive match.
@@ -34,7 +59,7 @@ Walk rendered labels, including collapsed details, without searching composers."
           while parent
           when (typep parent 'gtk:expander) do (gtk:expander-set-expanded parent t))
     (gtk:label-set-selectable label t)
-    (gtk:label-select-region label start end)
+    (highlight-pane-search-match label start end)
     (glib:timeout-add glib:+priority-default+ 80
                    (lambda ()
                      (multiple-value-bind (ok x y)
@@ -98,6 +123,7 @@ Walk rendered labels, including collapsed details, without searching composers."
                    (scroll-adjustment-to-end (gtk:scrolled-window-get-vadjustment scroller)))))
              (pane () (nth (gtk:drop-down-get-selected selector) panes))
              (clear-selection ()
+               (clear-pane-search-highlight)
                (when selected
                  (gtk:label-select-region (first selected) 0 0)
                  (setf selected nil)))

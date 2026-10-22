@@ -424,7 +424,7 @@ transcripts, checklist and findings. On macOS, Ctrl+F remains available to the
 Terminal; on other platforms Ctrl+F opens Find only outside the Terminal.
 Configured panel shortcuts take priority over Find. Matching is literal and case-insensitive.
 Use **Next** / **Previous** or Enter / Shift+Enter to navigate; Escape closes
-Find. Navigation selects the match, opens containing details and pauses that
+Find. Navigation highlights the exact match in yellow, opens containing details and pauses that
 pane's automatic scrolling after navigation. Clearing the query, changing panes
 or closing Find resumes following at the end. Matches stay within individual
 rendered text labels; phrases split by Markdown formatting may not match.

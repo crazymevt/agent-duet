@@ -953,6 +953,7 @@
       (assert (null *pane-search-scroller*))
       (assert (string= "2 matches" (gtk:label-get-text count)))
       (gobject:emit next :clicked)
+      (assert *pane-search-highlight*)
       (assert (eq scroller *pane-search-scroller*))
       (assert (string= "1 of 2" (gtk:label-get-text count)))
       (assert (gtk:expander-get-expanded detail))
@@ -960,12 +961,14 @@
       (assert (string= "2 of 2" (gtk:label-get-text count)))
       (gtk:editable-set-text entry "missing")
       (assert (null *pane-search-scroller*))
+      (assert (null *pane-search-highlight*))
       (assert (string= "No matches" (gtk:label-get-text count)))
       (assert (not (gtk:widget-get-sensitive next)))
       (gtk:editable-set-text entry "alpha")
       (gobject:emit next :clicked)
       (assert *pane-search-scroller*)
       (gtk:window-close window)
+      (assert (null *pane-search-highlight*))
       (assert (null *pane-search-scroller*)))))
 
 ;; Finding an early match must visibly scroll away from the bottom; transcript
@@ -1031,3 +1034,29 @@
           (symbol-function 'show-pane-search) original-find
           (symbol-function 'event-panel-shortcut) original-event)
     (gtk:window-destroy window)))
+
+;; Search highlighting uses text attributes, not the focus-dependent selection.
+;; Byte ranges must account for Unicode; restoring must preserve existing styling.
+(let* ((label (make-instance 'gtk:label :selectable t))
+       (attributes (pango:attr-list-new)))
+  (gtk:label-set-markup label "<b>λ Alpha alpha</b>")
+  (pango:attr-list-insert attributes (pango:attr-foreground-new 50000 10000 10000))
+  (gtk:label-set-attributes label attributes)
+  (let ((original (pango:attr-list-to-string (gtk:label-get-attributes label))))
+    (unwind-protect
+         (progn
+           (highlight-pane-search-match label 2 7)
+           (let ((highlight (pango:attr-list-to-string (gtk:label-get-attributes label))))
+             (assert (search "3 8 background" highlight))
+             (assert (search "3 8 foreground" highlight)))
+           (highlight-pane-search-match label 8 13)
+           (let ((highlight (pango:attr-list-to-string (gtk:label-get-attributes label))))
+             (assert (search "9 14 background" highlight))
+             (assert (not (search "3 8 background" highlight))))
+           (clear-pane-search-highlight)
+           (assert (string= original (pango:attr-list-to-string (gtk:label-get-attributes label)))))
+      (clear-pane-search-highlight))))
+(let ((label (make-instance 'gtk:label :label "plain")))
+  (highlight-pane-search-match label 0 5)
+  (clear-pane-search-highlight)
+  (assert (null (gtk:label-get-attributes label))))

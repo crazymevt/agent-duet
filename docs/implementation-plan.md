@@ -458,9 +458,10 @@ message-entry checks. GTK emitted frame-timing warnings during layout checks.
 
 Implemented for review: Cmd+F / Ctrl+F or **Find in pane…** opens a pane
 selector and literal, case-insensitive search with occurrence counts,
-Previous/Next, Enter/Shift+Enter, and Escape to close. Navigation selects the
-matching rendered text and expands containing details. History filters titles
-and saved message text within the current folder, across all saved conversations
+Previous/Next, Enter/Shift+Enter, and Escape to close. Navigation highlights the
+matching rendered text in yellow even while Find has focus and expands containing
+details. History filters titles and saved message text within the current folder,
+across all saved conversations
 rather than only the recent 30. Pane search matches within individual rendered
 labels; it does not span separate Markdown blocks or formatting labels.
 

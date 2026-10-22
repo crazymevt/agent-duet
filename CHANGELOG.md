@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Find highlights the active text match in yellow even while the Find window
+  has focus, and clears the highlight when the query changes or Find closes.
+
 - Find text in conversation and agent panes with Cmd+F / Ctrl+F or **Find in
   pane…**, with next/previous matches and a pane selector. History searches
   saved titles and message text in the current folder. Terminal Ctrl+F and
