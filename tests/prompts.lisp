@@ -218,3 +218,69 @@ until RECEIVED-LINES releases it, then copies it to the file OUT."
         (true (search "first" (first lines)))
         (true (search "interrupt" (second lines)))
         (false (find-if (lambda (l) (or (search "second" l) (search "third" l))) lines))))))
+
+(define-test compact-review-prompts :parent agent-duet
+  (let* ((author (make-instance 'fake-agent :name "Claude"))
+         (reviewer (make-instance 'fake-agent :name "ChatGPT"))
+         (task (make-string 4000 :initial-element #\x))
+         (part (ai::make-review-loop
+                :author author :reviewer reviewer :task task :summary "Latest report"
+                :check-report "Checks passed"
+                :findings (list (ai::make-finding :id 1 :text "Fix this")))))
+    ;; Round one and unknown history always carry the complete assignment.
+    (true (search task (ai::review-prompt part)))
+    (setf (ai::loop-round part) 1)
+    (true (search task (ai::review-prompt part)))
+    (setf (ai::loop-review-history part) (list reviewer (fake-handle reviewer)))
+    (let ((short (ai::review-prompt part)))
+      (false (search task short))
+      (true (< (length short) 1200))
+      (dolist (text '("Latest report" "Checks passed" "F1 [open]" "[fixed]" "[dismissed]"
+                      "FINDINGS: NONE" "VERDICT: APPROVED" "VERDICT: CHANGES REQUESTED"))
+        (true (search text short)))
+      ;; Failed resume expands the exact prompt being replayed.
+      (true (search task (ai::prompt-without-history reviewer short)))
+      (is string= "Unrelated" (ai::prompt-without-history reviewer "Unrelated")))
+    (true (search task (ai::review-prompt part :full t)))
+    (setf (fake-handle reviewer) "new-conversation")
+    (true (search task (ai::review-prompt part)))
+    (setf (fake-handle reviewer) nil)
+    (true (search task (ai::review-prompt part)))
+    (setf (ai::loop-reviewer part) (make-instance 'fake-agent :name "Replacement"))
+    (true (search task (ai::review-prompt part)))
+    (true (search "in a few lines" (ai::work-reply-instruction part)))))
+
+(define-test review-worktree-stat :parent agent-duet
+  (with-git-folder (repo)
+    (let* ((author (make-instance 'fake-agent :name "Claude"))
+           (base (ai::worktree-git-line repo "rev-parse" "HEAD"))
+           (part (ai::make-review-loop :author author :tree repo)))
+      (ai::worktree-git repo "config"
+                        (ai::worktree-base-key (ai::worktree-branch repo)) base)
+      (write-file (merge-pathnames "review-added.txt" repo) "Unique diff contents")
+      (let ((note (ai::worktree-note part)))
+        (true (search (namestring repo) note))
+        (true (search base note))
+        (true (search "git diff --cached" note))
+        (true (search "review-added.txt" note))
+        (false (search "Unique diff contents" note))))))
+
+(define-test recovered-review-restores-full-prompt :parent agent-duet
+  (multiple-value-bind (workflow lead partner) (recovery-fixture)
+    (let* ((step (first (ai::workflow-steps workflow)))
+           (part (first (ai:workflow-loops workflow))))
+      (setf (ai::loop-summary part) "Latest reviewable report"
+            (ai::loop-round part) 1
+            (ai::loop-findings part) (list (ai::make-finding :id 1 :text "Pending"))
+            (ai::loop-review-history part) (list partner (fake-handle partner))
+            (ai::loop-state part) :reviewing
+            (ai::step-agent step) partner
+            (ai::step-role step) :review
+            (ai::step-prompt step) (ai::review-prompt part))
+      (false (search "Recover me" (ai::step-prompt step)))
+      (let* ((checkpoint (ai::json-copy (ai:workflow-checkpoint workflow)))
+             (restored (ai:restore-workflow checkpoint :lead lead :partner partner))
+             (prompt (ai::step-prompt (first (ai::workflow-paused restored)))))
+        (true (search "Recover me" prompt))
+        (true (search "Latest reviewable report" prompt))
+        (true (search "F1 [open]" prompt))))))

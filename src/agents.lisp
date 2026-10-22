@@ -69,6 +69,8 @@ AGENT-READ-ONLY-P overrides all three while it is set (see below).")
    (listener :initarg :listener :initform nil :accessor agent-listener)
    (busy :initform nil :accessor agent-busy)
    (queue :initform '() :accessor agent-queue :documentation "Waiting (prompt callback attachments)s, oldest first")
+   (context-fallback :initform nil :accessor agent-context-fallback
+                     :documentation "Latest compact prompt and its full version for lost history")
    (callback :initform nil :accessor agent-callback :documentation "The running turn's")
    (turn-images :initform '() :accessor agent-turn-images
                 :documentation "The images (paths) to show the agent with the running turn's prompt")
@@ -664,7 +666,7 @@ folder): carry on the turn in a new conversation."
             ;; The prompt, then what was sent while it ran, in order.
             (t (handler-case (let ((new (claude-agent-ensure-process agent)))
                                (loop for (prompt . images) in prompts
-                                     do (claude-agent-send agent new prompt images
+                                     do (claude-agent-send agent new (prompt-without-history agent prompt) images
                                                            :on-error (turn-failure agent))))
                  (error (e) (agent-turn-finished agent (princ-to-string e) t))))))))
 
@@ -792,10 +794,19 @@ unless that turn is over by then."
       (when (eq token (agent-turn-token agent))
         (agent-turn-finished agent why t)))))
 
+(defun prompt-without-history (agent prompt)
+  "Expand the latest compact prompt if its conversation could not be resumed."
+  (let ((fallback (agent-context-fallback agent)))
+    (if (and fallback (equal prompt (car fallback))) (cdr fallback) prompt)))
+
 (defmethod agent-begin-turn ((agent claude-agent) prompt)
   (let ((images (agent-turn-images agent)))
     (setf (claude-agent-prompts agent) (list (cons prompt images)))
-    (let ((cp (claude-agent-ensure-process agent)))
+    (let* ((history (agent-conversation-handle agent))
+           (cp (claude-agent-ensure-process agent)))
+      (unless (equal history (agent-conversation-handle agent))
+        (setf prompt (prompt-without-history agent prompt)
+              (claude-agent-prompts agent) (list (cons prompt images))))
       (setf (claude-agent-turn-result-start agent) (claude-agent-next-result-index agent))
       (capture-agent-process-baseline agent)
       (claude-agent-send agent cp prompt images :on-error (turn-failure agent)))))
@@ -1023,7 +1034,8 @@ rather than using a server with no thread."
         (sandbox (codex-agent-sandbox agent))
         (policy (codex-agent-approval-policy agent))
         (images (agent-turn-images agent))
-        (token (agent-turn-token agent)))
+        (token (agent-turn-token agent))
+        (history (agent-conversation-handle agent)))
     ;; Starting the app-server and the turn wait for replies: not on the GUI
     ;; thread. A Stop meanwhile finds no turn to interrupt, so the token is
     ;; checked before the turn starts, and again after, in case Stop came
@@ -1038,7 +1050,9 @@ rather than using a server with no thread."
                (when (eq token (agent-turn-token agent)) (capture-agent-process-baseline agent))
                (if (not (car token))
                    (stopped)
-                   (let ((turn-id (jget (codex-start-turn server prompt :model model :effort effort
+                   (let ((turn-id (jget (codex-start-turn server
+                                        (if (equal history (agent-conversation-handle agent)) prompt
+                                            (prompt-without-history agent prompt)) :model model :effort effort
                                                           :approval-policy policy :images images)
                                         "turn" "id")))
                      (unless (car token)

@@ -145,6 +145,7 @@ while the workflow's baseline is that older one, and the paused steps whose own 
   task                                  ; what the author was asked to do
   label                                 ; how to name it in notes: nil, or "Claude's part"
   (summary "")                          ; the author's latest report
+  (review-history nil)                 ; (reviewer conversation) from its last reply
   (last-review nil)                     ; the reviewer's latest review
   (findings '())                        ; the review checklist: FINDINGs, by id
   (combined-result nil)                ; replies must remain full combined answers
@@ -540,7 +541,7 @@ does then goes unreviewed, since the one that would review it is out."
 (defun work-prompt (reviewer task)
   (format nil "~a~%~%(When you finish, ~a will review your work.)" task (agent-name reviewer)))
 
-(defun review-prompt (loop)
+(defun full-review-prompt (loop)
   (let ((author (agent-name (loop-author loop)))
         (findings (loop-findings loop)))
     (format nil "~a was asked to do this:~%~%~a~%~%~a reports:~%~%~a~%~%~
@@ -551,7 +552,7 @@ anything risky or needlessly complicated.~%~%~
 ~:[~*~;Your earlier findings:~%~%~a~%~%Repeat each of them in your FINDINGS, its status brought up to date: ~
 [fixed] once it has been dealt with, [dismissed] if the reasons given for leaving it convince you, ~
 [open] if it still stands. ~]~
-Explain what you found as fully as you need, then list ~:[~;any new ~]issues in a FINDINGS section, ~
+Be brief; put the substance in the FINDINGS lines. List ~:[~;any new ~]issues in a FINDINGS section, ~
 most important first, one line each, in this form (the location is optional):~%~%~
 FINDINGS:~%~
 - F~d [open] `path/to/file:line` What is wrong, and what to do about it~%~%~
@@ -567,6 +568,29 @@ VERDICT: CHANGES REQUESTED"
             findings (findings-lines findings) findings
             (next-finding-id findings))))
 
+(defun review-prompt (loop &key full)
+  "Use a compact follow-up only while the same reviewer retains its history."
+  (let* ((reviewer (loop-reviewer loop))
+         (handle (agent-conversation-handle reviewer))
+         (complete (full-review-prompt loop)))
+    (if (and (not full) (plusp (loop-round loop)) (loop-findings loop) handle
+             (equal (loop-review-history loop) (list reviewer handle)))
+        (let ((prompt
+                (format nil "~a reports:~%~%~a~%~%~a~@[~a~%~%~]~
+Review the work again; read the changed files and git diff. Don't change files.~%~
+Earlier findings:~%~a~%~
+Repeat each finding with its updated status: [fixed] if dealt with, [dismissed] if the reasons convince you, [open] if it still stands. Keep existing IDs.~%~
+Be brief; put the substance in the FINDINGS lines.~%~
+FINDINGS:~%- F~d [open] `path/to/file:line` Issue and remedy~%~
+Or FINDINGS: NONE. End with exactly VERDICT: APPROVED or VERDICT: CHANGES REQUESTED on its own line."
+                        (agent-name (loop-author loop)) (loop-summary loop)
+                        (if (loop-tree loop) (worktree-note loop) "")
+                        (loop-check-report loop) (findings-lines (loop-findings loop))
+                        (next-finding-id (loop-findings loop)))))
+          (setf (agent-context-fallback reviewer) (cons prompt complete))
+          prompt)
+        complete)))
+
 (defun confirm-prompt (loop)
   (format nil "You approved, but these findings of yours are still open:~%~%~a~%~%~
 Settle each of them in a FINDINGS section: [fixed] if it has been dealt with, [dismissed] if it needn't be. ~
@@ -576,18 +600,23 @@ VERDICT: APPROVED~%~
 VERDICT: CHANGES REQUESTED"
           (findings-lines (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq))))
 
-(defparameter *review-diff-limit* 60000 "The most of a worktree's diff put in a review prompt, in characters.")
+(defparameter *split-reply-limit* 60000 "Maximum inline part reply length in combined results.")
 
 (defun worktree-note (loop)
-  "For the reviewer of LOOP's part, done in a worktree: where it is, and its diff."
+  "Give the reviewer the worktree and a summary against its saved starting revision."
   (let* ((tree (loop-tree loop))
-         (diff (handler-case (worktree-diff tree)
-                 (error (e) (format nil "(The diff couldn't be read: ~a)" e)))))
+         (base nil)
+         (stat (handler-case
+                   (progn
+                     (setf base (worktree-git-line tree "config"
+                                                  (worktree-base-key (worktree-branch tree))))
+                     (worktree-git tree "add" "-A")
+                     (worktree-git tree "diff" "--cached" "--stat" base "--"))
+                 (error (e) (format nil "(The diff summary couldn't be read: ~a)" e)))))
     (format nil "~a worked in its own git worktree, ~a, so its changes aren't in your folder. ~
-Read the files there; here is everything it changed, against where it started~:[~;, cut short~]:~%~%~
-```diff~%~a~%```~%~%"
-            (agent-name (loop-author loop)) (namestring tree)
-            (> (length diff) *review-diff-limit*) (subseq diff 0 (min (length diff) *review-diff-limit*)))))
+Read the files there and run `git diff --cached ~a --` there yourself to review all changes against where this part started.~%~%~
+Diff stat:~%~a~%~%"
+            (agent-name (loop-author loop)) (namestring tree) (or base "<saved base>") stat)))
 
 (defparameter *commit-suggestion-instruction*
   "If files changed during this task, end your report with one line:
@@ -604,7 +633,7 @@ Cover the whole task's completed changes, including earlier work, not just this 
   (with-commit-suggestion-instruction
    (if (loop-combined-result loop)
        "Then provide the full revised combined answer to the overall request, preserving useful results from both parts; a summary of edits alone is not sufficient."
-       "Then summarize what you changed.")))
+       "Then summarize what you changed in a few lines.")))
 
 (defun fix-prompt (loop review)
   (let ((open (remove :open (loop-findings loop) :key #'finding-status :test-not #'eq)))
@@ -1352,7 +1381,9 @@ still open, and is asked once to settle them (that's no new round)."
 
 (defun review-in (workflow loop text confirming)
   (unless confirming (incf (loop-round loop)))
-  (setf (loop-last-review loop) text)
+  (setf (loop-review-history loop)
+        (list (loop-reviewer loop) (agent-conversation-handle (loop-reviewer loop)))
+        (loop-last-review loop) text)
   (post workflow (loop-reviewer loop) (loop-author loop) text :review)
   (take-findings workflow loop text)
   (let ((open (count-findings (loop-findings loop) :open)))
@@ -1770,9 +1801,9 @@ conflicts; then the merged result is reviewed."
                                   (if (loop-file-changes part) "file changes" "no file changes")
                                   (loop-task part)
                                   (let ((reply (loop-summary part)))
-                                    (if (> (length reply) *review-diff-limit*)
+                                    (if (> (length reply) *split-reply-limit*)
                                         (format nil "~a~%[Final reply cut short; full reply retained in the part's conversation.]"
-                                                (subseq reply 0 *review-diff-limit*))
+                                                (subseq reply 0 *split-reply-limit*))
                                         reply))))))
 
 (defun note-retained-worktrees (workflow)
@@ -2456,6 +2487,11 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
                                 :state (if (member state '(:running :new :paused)) :paused state)
                                 :reason (or (recovery-keyword (jget data "reason")) :restart)
                                 :progress (recovery-null (jget data "progress")))))
+          ;; Checkpoints may contain a compact prompt, but restored sessions can
+          ;; fail to resume. Rebuild reviews with the complete assignment.
+          (when (and (eq (step-state step) :paused)
+                     (eq (step-role step) :review) (step-loop step))
+            (setf (step-prompt step) (review-prompt (step-loop step) :full t)))
           (setf (step-then step) (restored-step-continuation workflow step))
           (push step (workflow-steps workflow))
           (when (eq (step-state step) :paused) (push step (workflow-paused workflow)))))
@@ -2476,7 +2512,7 @@ Keys: :OUTCOME, :SUMMARY, :REVIEW-STATUS, :CHECK-STATUS, :REPOSITORY,
           (let* ((reviewing (eq (loop-state l) :reviewing))
                  (s (make-step :agent (if reviewing (loop-reviewer l) (loop-author l))
                                :role (if reviewing :review :work) :loop l :state :paused :reason :restart
-                               :prompt (cond (reviewing (review-prompt l))
+                               :prompt (cond (reviewing (review-prompt l :full t))
                                              ((loop-last-review l) (fix-prompt l (loop-last-review l)))
                                              (t (loop-task l))))))
             (setf (step-then s) (restored-step-continuation workflow s))

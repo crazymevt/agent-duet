@@ -1870,9 +1870,13 @@ tests/fake-claude, its notes pushed onto NOTES."
         (let ((part (find "Your part" (fake-prompts claude) :test #'search)))
           (true (search "own git worktree" part))
           (true (search "agent-duet/claude-" part)))
-        ;; Each reviewer was shown the other's diff.
-        (true (find "from ChatGPT" (fake-prompts claude) :test #'search))
-        (true (find "from Claude" (fake-prompts codex) :test #'search))
+        ;; Reviewers get a stat and instructions to inspect the diff themselves.
+        (dolist (prompts (list (fake-prompts claude) (fake-prompts codex)))
+          (let ((review (find "Diff stat:" prompts :test #'search)))
+            (true review)
+            (true (search "git diff --cached" review))
+            (false (search "from ChatGPT" review))
+            (false (search "from Claude" review))))
         ;; Both parts are in the folder, merged; the worktrees are gone.
         (is string= "from Claude" (read-file-text repo "a.txt"))
         (is string= "from ChatGPT" (read-file-text repo "b.txt"))
@@ -2175,7 +2179,7 @@ tests/fake-claude, its notes pushed onto NOTES."
 
 
 (define-test split-results-reply-limit :parent agent-duet
-  (let* ((ai::*review-diff-limit* 12)
+  (let* ((ai::*split-reply-limit* 12)
          (workflow (make-instance 'ai:workflow))
          (reply "A long written answer that must remain available")
          (part (ai::make-review-loop :label "Part" :tree #p"/tmp/part/" :summary reply)))
