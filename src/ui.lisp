@@ -21,7 +21,7 @@
 (defvar *middle* nil "The conversation's PANE.")
 (defvar *checklist* nil "The task checklist panel's PANE.")
 (defvar *checklist-findings* nil "The consolidated findings pane.")
-(defvar *checklist-boxes* nil "Checklist heading → assignment/findings Markdown boxes, one pair per loop.")
+(defvar *checklist-boxes* nil "Snapshot heading → card widgets and presentation data, one entry per loop.")
 (defvar *workflow* nil "The running or last workflow.")
 (defvar *controls* nil "A plist of the middle pane's widgets.")
 (defvar *directory* nil "Where the agents work.")
@@ -1442,53 +1442,85 @@ comes without one (a turn stopped as the folder changes) isn't kept."
     (:review "review")
     (t nil)))
 
+(defun refresh-checklist-summary ()
+  (let ((button (control :checklist-summary)))
+    (when button
+      (gtk:widget-set-visible button (and *checklist-boxes* (not (setting :checklist-visible nil))))
+      (gtk:label-set-text (gtk:button-get-child button)
+                          (if *checklist-boxes*
+                              (checklist-summary (mapcar (lambda (entry) (getf (cdr entry) :data))
+                                                        (reverse *checklist-boxes*)))
+                              "")))))
+
+(defun make-checklist-summary ()
+  (let ((button (make-instance 'gtk:button :visible nil :css-classes '("flat")
+                               :margin-start 12 :margin-end 12 :margin-bottom 6
+                               :tooltip-text "Open task cards and review findings"
+                               :child (make-instance 'gtk:label :wrap t :xalign 0.0))))
+    (setf (getf *controls* :checklist-summary) button)
+    (gobject:connect button :clicked
+                     (lambda (widget) (declare (ignore widget))
+                       (gtk:check-button-set-active (control :checklist-toggle) t)))
+    button))
+
 (defun clear-checklist ()
-  "Reset the checklist when changing conversations or folders."
+  "Reset the cards and summary when changing conversations or folders."
   (setf *checklist-boxes* nil)
-  (when *checklist-findings*
-    (clear-box (pane-messages *checklist-findings*))
-    (setf (getf *controls* :findings-placeholder)
-          (pane-note *checklist-findings* "No findings yet" "dim-label")))
   (when *checklist*
     (clear-box (pane-messages *checklist*))
-    (pane-note *checklist* "Each task will appear here once it's assigned, with its progress and review findings." "dim-label")))
+    (pane-note *checklist* "Tasks will appear here once assigned." "dim-label"))
+  (refresh-checklist-summary))
+
+(defun render-checklist-card (box data &optional request-expanded resolved-expanded)
+  (clear-box box)
+  (if (getf data :legacy)
+      (render-markdown box (getf data :legacy))
+      (progn
+        (gtk:box-append box (make-instance 'gtk:label :label (getf data :title) :wrap t :xalign 0.0
+                                          :css-classes '("heading")))
+        (gtk:box-append box (make-instance 'gtk:label :label (format nil "Assigned to ~a" (getf data :author))
+                                          :wrap t :xalign 0.0 :css-classes '("dim-label")))
+        (gtk:box-append box (make-instance 'gtk:label :label (getf data :state) :wrap t :xalign 0.0
+                                          :halign :start
+                                          :css-classes (list "duet-pill" (format nil "duet-pill-~a" (getf data :tone)))))
+        (let ((request (make-instance 'gtk:expander :label "Show request" :expanded request-expanded
+                                      :child (markdown-box (getf data :request)))))
+          (gtk:box-append box request)
+          (when (getf data :open)
+            (gtk:box-append box (markdown-box (getf data :open))))
+          (let* ((count (+ (getf data :fixed-count) (getf data :dismissed-count)))
+                 (resolved (when (plusp count)
+                             (make-instance 'gtk:expander :expanded resolved-expanded
+                                            :label (format nil "~d fixed · ~d dismissed"
+                                                           (getf data :fixed-count) (getf data :dismissed-count))
+                                            :child (markdown-box (format nil "~a~%~%~a"
+                                                                         (or (getf data :fixed) "")
+                                                                         (or (getf data :dismissed) "")))))))
+            (when resolved (gtk:box-append box resolved))
+            (values request resolved))))))
 
 (defun show-checklist (text &key (notify t))
-  "Replace this loop's checklist snapshot in place, including when replaying history."
+  "Update a task card in place, preserving expanded details and the reader's position."
+  (declare (ignore notify))
   (when *checklist*
-    ;; Only the bold heading identifies the loop. Progress and counts after
-    ;; its closing ** change between snapshots and must not become part of the key.
-    (let* ((heading-end (and (uiop:string-prefix-p "**" text) (search "**" text :start2 2)))
-           (heading (subseq text 0 (if heading-end (+ heading-end 2)
-                                      (or (position #\Newline text) (length text)))))
-           (box (cdr (assoc heading *checklist-boxes* :test #'string=))))
-      (multiple-value-bind (task findings) (checklist-sections text)
-        (if box
-            (progn
-              (clear-box (car box)) (render-markdown (car box) task)
-              (pane-scroll-to-end *checklist*))
-            (progn
-              (unless *checklist-boxes* (clear-box (pane-messages *checklist*)))
-              (setf box (cons (markdown-box task "duet-checklist") nil))
-              (push (cons heading box) *checklist-boxes*)
-              (pane-append *checklist* (car box))
-              (when (and notify (not (gtk:widget-get-visible (control :checklist-panel))))
-                (pane-note *middle* "Checklist updated. Open Workspace › Checklist to see the tasks' progress and findings."
-                           "dim-label" "duet-note"))))
-        (when *checklist-findings*
-          (cond
-            ((plusp (length findings))
-             (if (cdr box)
-                 (progn (clear-box (cdr box)) (render-markdown (cdr box) findings))
-                 (progn
-                   (setf (cdr box) (markdown-box findings "duet-checklist"))
-                   (pane-append *checklist-findings* (cdr box)))))
-            ((cdr box)
-             (gtk:box-remove (pane-messages *checklist-findings*) (cdr box))
-             (setf (cdr box) nil)))
-          (gtk:widget-set-visible
-           (control :findings-placeholder)
-           (notany (lambda (entry) (cdr (cdr entry))) *checklist-boxes*)))))))
+    (let* ((data (checklist-card-data text))
+           (key (getf data :key))
+           (entry (assoc key *checklist-boxes* :test #'string=))
+           (old (cdr entry))
+           (box (or (getf old :box) (make-instance 'gtk:box :orientation :vertical :spacing 8
+                                                               :css-classes '("duet-checklist")))))
+      (multiple-value-bind (request resolved)
+          (render-checklist-card box data
+                                 (and (getf old :request) (gtk:expander-get-expanded (getf old :request)))
+                                 (and (getf old :resolved) (gtk:expander-get-expanded (getf old :resolved))))
+        (let ((value (list :box box :data data :request request :resolved resolved)))
+          (if entry
+              (setf (cdr entry) value)
+              (progn
+                (unless *checklist-boxes* (clear-box (pane-messages *checklist*)))
+                (push (cons key value) *checklist-boxes*)
+                (pane-append *checklist* box)))))
+      (refresh-checklist-summary))))
 
 (defun remember-checklist-width ()
   "Persist only a visible, allocated checklist after restoration has finished."
@@ -1540,23 +1572,19 @@ comes without one (a turn stopped as the folder changes) isn't kept."
 
 (defun make-checklist-panel ()
   (multiple-value-bind (messages scroller) (make-message-list)
-    (multiple-value-bind (findings findings-scroller) (make-message-list)
-      (setf *checklist* (make-pane :messages messages :scroller scroller)
-            *checklist-findings* (make-pane :messages findings :scroller findings-scroller))
-      (clear-checklist)
-      (let ((panel (gtk:build
-                    (gtk:box :orientation :vertical :width-request 260
-                             (gtk:label :label "Assigned tasks" :xalign 0.0
-                                        :margin-start 12 :margin-top 8 :margin-bottom 8
-                                        :css-classes '("title-4"))
-                             (gtk:separator)
-                             scroller
-                             (gtk:separator)
-                             (gtk:expander :label "Findings" :expanded t
-                                           :child findings-scroller)))))
-        (setf (getf *controls* :checklist-panel) panel)
-        (gtk:widget-set-visible panel (setting :checklist-visible nil))
-        panel))))
+    (setf *checklist* (make-pane :messages messages :scroller scroller)
+          *checklist-findings* nil)
+    (clear-checklist)
+    (let ((panel (gtk:build
+                  (gtk:box :orientation :vertical :width-request 260
+                           (gtk:label :label "Tasks" :xalign 0.0
+                                      :margin-start 12 :margin-top 8 :margin-bottom 8
+                                      :css-classes '("title-4"))
+                           (gtk:separator)
+                           scroller))))
+      (setf (getf *controls* :checklist-panel) panel)
+      (gtk:widget-set-visible panel (setting :checklist-visible nil))
+      panel)))
 
 (defun middle-check (text)
   "The check command's progress or result, in the conversation."
@@ -3388,6 +3416,7 @@ this task's turns cheaper."
                                                 :margin-start 12 :margin-end 12 :margin-bottom 6)))
                   (setf (getf *controls* :progress) progress)
                   progress)
+                (make-checklist-summary)
                 (make-progress-details)
                 (make-activity-strip)
                 (gtk:separator)
@@ -3670,7 +3699,8 @@ this task's turns cheaper."
                          (lambda (b)
                            (let ((visible (gtk:check-button-get-active b)))
                              (setf (setting :checklist-visible) visible)
-                             (set-checklist-visible visible))))
+                             (set-checklist-visible visible)
+                             (refresh-checklist-summary))))
         (gobject:connect notes :toggled
                          (lambda (b) (setf *shared-notes* (gtk:check-button-get-active b)
                                            (setting :shared-notes) *shared-notes*)))

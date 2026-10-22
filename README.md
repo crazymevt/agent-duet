@@ -102,6 +102,14 @@ also enlarge the window to fit its controls; GTK may keep that larger window
 width after it closes. Resize the window to make it smaller again. Short
 transcripts scroll to keep attention controls reachable.
 
+Workspace › Checklist opens task cards with the assigned agent and a colored
+state label. Blue marks review/checking, green approval, amber paused or done
+without review, purple stopped, and red failed or not approved. Each card keeps
+its open findings visible; expand “Show request” for the original assignment
+or the fixed/dismissed count for resolved findings. When the panel is closed,
+a summary above the conversation shows the states and total open findings;
+click it to open the cards.
+
 Below the conversation, one box talks to the agents. Its menu chooses who
 gets the message:
 

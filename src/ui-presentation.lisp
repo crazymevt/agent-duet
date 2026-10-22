@@ -107,6 +107,8 @@
      :color "mix(@view_fg_color, #22c55e, 0.45)" :border-color "alpha(#22c55e, 0.6)")
     (".duet-pill-attention" :background-color "alpha(#f59e0b, 0.2)"
      :color "mix(@view_fg_color, #f59e0b, 0.45)" :border-color "alpha(#f59e0b, 0.7)")
+    (".duet-pill-stopped" :background-color "alpha(#a78bfa, 0.18)"
+     :color "mix(@view_fg_color, #a78bfa, 0.50)" :border-color "alpha(#a78bfa, 0.65)")
     (".duet-pill-error" :background-color "alpha(#ef4444, 0.18)"
      :color "mix(@view_fg_color, #ef4444, 0.55)" :border-color "alpha(#ef4444, 0.7)")))
 
