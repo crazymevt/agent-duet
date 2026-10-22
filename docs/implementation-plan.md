@@ -454,23 +454,16 @@ message-entry checks. GTK emitted frame-timing warnings during layout checks.
 - [x] Verify dirty repositories, untracked files, text-only results, failed
   checks, worktree integrations, and changes made after task completion.
 
-## Milestone 4: undo a task
+## Milestone 4: search and task export
 
-- [ ] Build a preview from the reverse start-to-end task snapshot diff.
-- [ ] Allow excluding files; explain that user edits made during the task
-  are included in that snapshot diff too.
-- [ ] Apply with three-way reconciliation against the current tree to keep
-  later edits. List conflicting files and leave them untouched.
-- [ ] Test tracked/untracked files, adds/deletes/renames, later edits,
-  conflicts, and interrupted application before exposing the action.
+- [ ] Search within transcripts and the conversation/history list.
+- [ ] Export a task as Markdown, including request, plans, reviews, checklist,
+  and the combined written result for text-only tasks.
 
 ## Remaining backlog
 
 These scopes are recorded in `TODO.md`; the order below is provisional.
 
-- [ ] Search within transcripts and the conversation/history list.
-- [ ] Export a task as Markdown, including request, plans, reviews, checklist,
-  and the combined written result for text-only tasks.
 - [ ] Artifact discovery and cards: local output paths and metadata, creator,
   type, status, previews, external open/save/export, and cross-agent review.
   Preserve links/files across restart, handoff, and worktree cleanup. Isolate
@@ -480,6 +473,20 @@ These scopes are recorded in `TODO.md`; the order below is provisional.
   pane focus, checklist, and terminal.
 - [ ] GTK UI smoke coverage for layouts and attention/recovery card flows,
   on machines where GTK is available.
+
+### Deferred: undo a task
+
+- [ ] Build a preview from the reverse start-to-end task snapshot diff.
+- [ ] Allow excluding files; explain that user edits made during the task
+  are included in that snapshot diff too.
+- [ ] Apply with three-way reconciliation against the current tree to keep
+  later edits. List conflicting files and leave them untouched.
+- [ ] Test tracked/untracked files, adds/deletes/renames, later edits,
+  conflicts, and interrupted application before exposing the action.
+
+Undo is deferred until repeated use shows a need beyond task commits and Git
+reverts. It has no scheduled milestone; the scope above is retained for later
+reassessment.
 
 A third agent remains outside the current plan.
 
