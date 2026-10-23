@@ -4,7 +4,7 @@
   :description "Claude Code and Codex driven through their CLIs, and the workflows that have them work together. No GTK."
   :author "Jessie Hughart"
   :license "MIT"
-  :version "1.2.0"
+  :version "1.3.0"
   :depends-on ("uiop" "sb-posix")
   :pathname "src/"
   :serial t
@@ -33,7 +33,7 @@
   :description "Agent Duet: Claude and ChatGPT (Codex) side by side, writing and reviewing each other's code."
   :author "Jessie Hughart"
   :license "MIT"
-  :version "1.2.0"
+  :version "1.3.0"
   :depends-on ("agent-duet/core" "gtk4" "gtk4-adwaita" "cffi" "sb-posix")
   :pathname "src/"
   :serial t

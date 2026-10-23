@@ -655,8 +655,8 @@ that workflow run's artifacts. After merging a release, create and push a
 tag matching the version in `agent-duet.asd` to publish a GitHub Release:
 
 ```sh
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 A mismatched tag fails the build, and publication waits for all three

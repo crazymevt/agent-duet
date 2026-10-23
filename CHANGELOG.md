@@ -1,7 +1,21 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 - 2026-10-22
 
+- A resizable workspace sidebar, open by default, has **Tasks**, **Changes**,
+  **Files** and **Artifacts** tabs. Changes shows the latest task's per-file
+  snapshot diffs; Files and Artifacts list project paths, open them in the
+  document preview or the default app, and **+** attaches a path to the next
+  message. The panel shortcut **L** and a header-bar icon toggle the sidebar.
+- **Conversation only** is the default layout. The agents toggle is an icon
+  button, and the app ships built-in agent and sidebar icons.
+- Checklist tasks appear as cards with the assigned agent and a colored state
+  label, keeping open findings visible. When the panel is closed, a summary
+  above the conversation shows task states and total open findings.
+- Find can optionally highlight all matches in the selected pane.
+- Streaming updates are batched, and history listing and saves do less work.
+  Startup repository snapshots run off the UI thread, commit previews no longer
+  stall the window, and retry workers are bounded.
 - Sidebar file filters reuse rows, report truncated inventories, and attach
   literal native paths. Tasks avoids a duplicate heading, and Changes refreshes
   when a task starts or its final snapshot is recorded.
